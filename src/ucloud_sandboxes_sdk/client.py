@@ -733,11 +733,13 @@ class SandboxClient:
         image: Image,
         *,
         upload_context: bool = True,
+        timeout_seconds: float | None = None,
     ) -> JsonObject:
         return self._request_json(
             "POST",
             "/v1/images/build",
             payload=_image_build_payload(image, upload_context=upload_context),
+            timeout_seconds=timeout_seconds,
         )
 
     def pull_image(self, image: Image, *, image_id: str | None = None) -> JsonObject:
@@ -770,6 +772,7 @@ class SandboxClient:
         payload: JsonObject | None = None,
         body: bytes | None = None,
         content_type: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> JsonObject:
         raw_body = json.dumps(payload).encode("utf-8") if payload is not None else body
         headers = dict(self.headers)
@@ -783,8 +786,9 @@ class SandboxClient:
             method=method,
             headers=headers,
         )
+        timeout = self.timeout_seconds if timeout_seconds is None else timeout_seconds
         try:
-            with request.urlopen(req, timeout=self.timeout_seconds) as response:
+            with request.urlopen(req, timeout=timeout) as response:
                 raw = response.read().decode("utf-8")
                 decoded = json.loads(raw) if raw else {}
         except error.HTTPError as exc:
@@ -1017,10 +1021,12 @@ class AsyncSandboxClient:
         self,
         base_url: str,
         *,
+        timeout_seconds: float = 30.0,
         session: Any | None = None,
         headers: Mapping[str, str] | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
+        self.timeout_seconds = timeout_seconds
         self._session = session
         self._owned_session: Any | None = None
         self.headers = dict(headers or {})
@@ -1328,11 +1334,13 @@ class AsyncSandboxClient:
         image: Image,
         *,
         upload_context: bool = True,
+        timeout_seconds: float | None = None,
     ) -> JsonObject:
         return await self._request_json(
             "POST",
             "/v1/images/build",
             payload=_image_build_payload(image, upload_context=upload_context),
+            timeout_seconds=timeout_seconds,
         )
 
     async def pull_image(self, image: Image, *, image_id: str | None = None) -> JsonObject:
@@ -1379,17 +1387,22 @@ class AsyncSandboxClient:
         payload: JsonObject | None = None,
         body: bytes | None = None,
         content_type: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> JsonObject:
         headers = dict(self.headers)
         if content_type is not None and payload is None:
             headers["Content-Type"] = content_type
         client = await self._client()
+        timeout = _aiohttp_timeout(
+            self.timeout_seconds if timeout_seconds is None else timeout_seconds
+        )
         async with client.request(
             method,
             self.base_url + path,
             json=payload,
             data=body,
             headers=headers,
+            timeout=timeout,
         ) as response:
             raw = await response.text()
             try:
@@ -1412,6 +1425,7 @@ class AsyncSandboxClient:
             method,
             self.base_url + path,
             headers=dict(self.headers),
+            timeout=_aiohttp_timeout(self.timeout_seconds),
         ) as response:
             raw = await response.read()
             if response.status >= 400:
@@ -1510,6 +1524,16 @@ def _attach_build_context_archive(payload: JsonObject) -> None:
     ).decode("ascii")
     payload["context_archive_format"] = "tar.gz"
     payload["context_path"] = "."
+
+
+def _aiohttp_timeout(timeout_seconds: float | None) -> object:
+    if timeout_seconds is None:
+        return None
+    try:
+        from aiohttp import ClientTimeout
+    except ImportError:
+        return timeout_seconds
+    return ClientTimeout(total=timeout_seconds)
 
 
 def _tar_gz_directory(path: Path) -> bytes:

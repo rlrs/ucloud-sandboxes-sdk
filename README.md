@@ -205,7 +205,7 @@ registry, use the registry's private-network host in the tag and set
 ```python
 image = Image.from_dockerfile(
     name="python-base",
-    tag="gateway-private-host:5000/ucloud/python-base:latest",
+    tag="ucloud-sandbox-registry:5000/ucloud/python-base:latest",
     context_path="./docker/python-base",
     push=True,
 )
@@ -229,24 +229,27 @@ the gateway or builder VM, pass `upload_context=False`:
 client.build_image(
     Image.from_dockerfile(
         name="preloaded-context",
-        tag="gateway-private-host:5000/ucloud/preloaded-context:latest",
+        tag="ucloud-sandbox-registry:5000/ucloud/preloaded-context:latest",
         context_path="/work/ucloud-sandboxes/build-contexts/preloaded-context",
         push=True,
     ),
     upload_context=False,
+    timeout_seconds=3000,
 )
 ```
 
 Use `push=True` with a registry tag for any image that sandbox nodes should run.
 The builder/control-plane Docker daemon and sandbox-node Docker daemons are
 different machines. The registry tag is the durable handoff.
+For large Docker builds, pass `timeout_seconds` to `build_image()` or construct
+the client with a larger request timeout than the 30s default.
 
 After a pushed build, sandbox creation can use either the registry tag or the
 recorded image id:
 
 ```python
 client.create_sandbox(
-    image=Image.from_registry("gateway-private-host:5000/ucloud/python-base:latest"),
+    image=Image.from_registry("ucloud-sandbox-registry:5000/ucloud/python-base:latest"),
     cpus=1,
     memory_mb=2048,
     disk_mb=10240,
@@ -265,7 +268,7 @@ id:
 
 ```python
 client.pull_image(
-    Image.from_registry("gateway-private-host:5000/ucloud/python-base:latest"),
+    Image.from_registry("ucloud-sandbox-registry:5000/ucloud/python-base:latest"),
     image_id="python-base",
 )
 

@@ -54,7 +54,7 @@ The gateway owns placement and may return `503` while nodes are scaling up.
 ```json
 {
   "id": "python-base",
-  "tag": "gateway-private-host:5000/ucloud/python-base:latest",
+  "tag": "ucloud-sandbox-registry:5000/ucloud/python-base:latest",
   "context_path": ".",
   "context_archive_base64": "<tar.gz bytes encoded as base64>",
   "context_archive_format": "tar.gz",
@@ -69,6 +69,8 @@ The SDK attaches `context_archive_base64` by default when
 `Image.from_dockerfile(...).build_spec.context_path` points at a local
 directory. Pass `upload_context=False` to `build_image()` when `context_path`
 already exists on the gateway or builder VM.
+Large builds can exceed the client's default request timeout; pass
+`timeout_seconds` to `build_image()` for long-running Docker builds.
 
 Builds intended for sandbox nodes should set `push: true` and use a registry
 tag. The gateway records the pushed tag under the image id, so a later sandbox
@@ -80,7 +82,7 @@ builder/control-plane Docker daemon and should not be treated as portable.
 
 ```json
 {
-  "image": "gateway-private-host:5000/ucloud/python-base:latest",
+  "image": "ucloud-sandbox-registry:5000/ucloud/python-base:latest",
   "id": "python-base"
 }
 ```
@@ -89,7 +91,7 @@ builder/control-plane Docker daemon and should not be treated as portable.
 
 ```json
 {
-  "image": "gateway-private-host:5000/ucloud/snapshot:latest",
+  "image": "ucloud-sandbox-registry:5000/ucloud/snapshot:latest",
   "id": "snapshot"
 }
 ```

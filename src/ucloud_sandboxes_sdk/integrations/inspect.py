@@ -496,7 +496,10 @@ async def _build_image_with_wait(
         "builder node",
         timeout_seconds=settings.build_timeout_seconds,
         retry_interval_seconds=settings.retry_interval_seconds,
-        operation=lambda: client.build_image(image),
+        operation=lambda: client.build_image(
+            image,
+            timeout_seconds=settings.build_timeout_seconds,
+        ),
     )
 
 

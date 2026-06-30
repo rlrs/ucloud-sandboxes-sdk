@@ -10,8 +10,10 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Lock, Thread
 import unittest
+from unittest.mock import patch
 from urllib.parse import parse_qs, unquote, urlparse
 
+import ucloud_sandboxes_sdk.client as client_module
 from ucloud_sandboxes_sdk import (
     AsyncSandboxClient,
     Image,
@@ -128,6 +130,36 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(built["received_context_path"], ".")
         self.assertGreater(built["received_archive_bytes"], 0)
 
+    def test_sync_build_image_accepts_per_call_timeout(self) -> None:
+        class FakeResponse:
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"image": {"id": "slow-build"}}'
+
+        captured_timeouts: list[object] = []
+
+        def fake_urlopen(req: object, timeout: object = None) -> FakeResponse:
+            captured_timeouts.append(timeout)
+            return FakeResponse()
+
+        client = SandboxClient("http://gateway.invalid", timeout_seconds=11)
+        with patch.object(client_module.request, "urlopen", fake_urlopen):
+            client.build_image(
+                Image.from_dockerfile(
+                    name="slow-build",
+                    tag="registry.invalid/slow-build:latest",
+                    context_path="/tmp/context",
+                ),
+                timeout_seconds=123,
+            )
+
+        self.assertEqual(captured_timeouts, [123])
+
     def test_sync_client_surfaces_api_errors(self) -> None:
         with running_gateway() as gateway:
             client = SandboxClient(gateway.base_url)
@@ -231,6 +263,52 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertIn("stdout", streams)
         self.assertEqual(size, 12)
         self.assertEqual(downloaded, b"async bytes\n")
+
+    def test_async_build_image_accepts_per_call_timeout(self) -> None:
+        class FakeResponse:
+            status = 200
+
+            async def __aenter__(self) -> "FakeResponse":
+                return self
+
+            async def __aexit__(self, *args: object) -> None:
+                return None
+
+            async def text(self) -> str:
+                return '{"image": {"id": "slow-build"}}'
+
+        class FakeSession:
+            def __init__(self) -> None:
+                self.timeouts: list[object] = []
+
+            def request(self, *_args: object, **kwargs: object) -> FakeResponse:
+                self.timeouts.append(kwargs.get("timeout"))
+                return FakeResponse()
+
+        async def scenario() -> list[object]:
+            session = FakeSession()
+            client = AsyncSandboxClient(
+                "http://gateway.invalid",
+                session=session,
+                timeout_seconds=11,
+            )
+            await client.build_image(
+                Image.from_dockerfile(
+                    name="slow-build",
+                    tag="registry.invalid/slow-build:latest",
+                    context_path="/tmp/context",
+                ),
+                timeout_seconds=123,
+            )
+            return session.timeouts
+
+        timeouts = asyncio.run(scenario())
+
+        self.assertEqual([_timeout_total(timeout) for timeout in timeouts], [123])
+
+
+def _timeout_total(timeout: object) -> object:
+    return getattr(timeout, "total", timeout)
 
 
 @contextmanager
