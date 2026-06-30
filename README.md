@@ -109,6 +109,54 @@ The helper sets `OPENAI_BASE_URL` to
 `https://relay.example.org/rollouts/run-001/v1`, plus `OPENAI_API_KEY` and
 `VF_RELAY_ROLLOUT_ID`.
 
+Run a worker near the model endpoint with `RelayWorkerClient`. Polling leases a
+request to one worker; renew the lease while a long local inference call is
+running, then respond with the OpenAI-compatible JSON body:
+
+```python
+import threading
+from ucloud_sandboxes_sdk import RelayWorkerClient
+
+relay = RelayWorkerClient(
+    "https://relay.example.org",
+    worker_token="<worker-relay-token>",
+)
+
+relay.register_rollout("run-001")
+poll = relay.poll(
+    "run-001",
+    worker_id="lumi-worker-1",
+    timeout_seconds=30,
+    limit=8,
+    lease_seconds=600,
+)
+
+for request in poll.requests:
+    stop = threading.Event()
+
+    def renew_loop() -> None:
+        while not stop.wait(60):
+            relay.renew_request(
+                request,
+                worker_id="lumi-worker-1",
+                lease_seconds=600,
+            )
+
+    renewer = threading.Thread(target=renew_loop, daemon=True)
+    renewer.start()
+    try:
+        response = call_local_openai_compatible_model(request.body)
+        relay.respond_to(request, response)
+    except Exception as exc:
+        relay.error_request(request, str(exc))
+    finally:
+        stop.set()
+        renewer.join(timeout=1)
+```
+
+Use `AsyncRelayWorkerClient` for async workers; it exposes the same methods with
+`await`.
+
 ## Prepared Capacity
 
 If a runner knows it will soon need a burst of sandboxes, it can send a

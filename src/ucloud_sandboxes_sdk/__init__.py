@@ -15,12 +15,21 @@ from .client import (
     SandboxSshSpec,
     SandboxSshTarget,
 )
-from .relay import ModelRelayConfig, model_relay_env
+from .relay import (
+    AsyncRelayWorkerClient,
+    ModelRelayConfig,
+    RelayApiError,
+    RelayPollResult,
+    RelayRequest,
+    RelayWorkerClient,
+    model_relay_env,
+)
 
 __version__ = "0.1.0"
 
 __all__ = [
     "AsyncExecHandle",
+    "AsyncRelayWorkerClient",
     "AsyncSandboxClient",
     "AsyncSandboxHandle",
     "ImageBuildSpec",
@@ -34,6 +43,10 @@ __all__ = [
     "SandboxSshSpec",
     "SandboxSshTarget",
     "ModelRelayConfig",
+    "RelayApiError",
+    "RelayPollResult",
+    "RelayRequest",
+    "RelayWorkerClient",
     "__version__",
     "model_relay_env",
 ]
