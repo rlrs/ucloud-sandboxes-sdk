@@ -23,7 +23,7 @@ ucloud`.
 Pass the gateway bearer token as an HTTP `Authorization` header:
 
 ```python
-from ucloud_sandboxes_sdk import SandboxClient
+from ucloud_sandboxes_sdk import Image, SandboxClient
 
 client = SandboxClient(
     "https://app-sandboxes.cloud.sdu.dk",
@@ -34,7 +34,7 @@ client = SandboxClient(
 ## Sandboxes
 
 ```python
-from ucloud_sandboxes_sdk import SandboxClient
+from ucloud_sandboxes_sdk import Image, SandboxClient
 
 client = SandboxClient(
     "https://app-sandboxes.cloud.sdu.dk",
@@ -43,7 +43,7 @@ client = SandboxClient(
 
 sandbox = client.create_sandbox(
     id="example",
-    image="python:3.12-slim",
+    image=Image.from_registry("python:3.12-slim"),
     command=["sleep", "300"],
     cpus=1,
     memory_mb=2048,
@@ -86,7 +86,7 @@ When the sandbox needs to call a model endpoint that is only reachable from a
 separate worker environment, point OpenAI-compatible clients at a public relay:
 
 ```python
-from ucloud_sandboxes_sdk import SandboxClient, model_relay_env
+from ucloud_sandboxes_sdk import Image, SandboxClient, model_relay_env
 
 relay_env = model_relay_env(
     "https://relay.example.org",
@@ -95,7 +95,7 @@ relay_env = model_relay_env(
 )
 
 sandbox = client.create_sandbox(
-    image="registry.example.org/swebench/task:latest",
+    image=Image.from_registry("registry.example.org/swebench/task:latest"),
     cpus=1,
     memory_mb=2048,
     disk_mb=10240,
@@ -173,45 +173,117 @@ client.prepare_capacity(
 )
 ```
 
-The signal contributes `count * resources` to gateway demand until its TTL
-expires. Cancel it early when a run is abandoned:
+The signal contributes `count * resources` to gateway demand until the
+executing autoscaler reacts and consumes it. The TTL is a cleanup bound for
+missed cycles or a stopped autoscaler. Cancel it early when a run is abandoned:
 
 ```python
 client.delete_prepared_capacity("mbpp-run")
 ```
 
+If the same run will need Docker builds before sandbox creation, request builder
+capacity separately:
+
+```python
+client.prepare_builder(
+    prepare_id="mbpp-builds",
+    count=1,
+    ttl_seconds=900,
+)
+```
+
+Builder prepare signals prewarm build-capable VM capacity only. They do not
+reserve a builder, upload a context, or transfer images to sandbox nodes.
+
 ## Images
 
 Build images through the gateway and use registry tags as the durable cache
-between build-capable machines and sandbox nodes.
+between build-capable machines and sandbox nodes. With a control-plane-managed
+registry, use the registry's private-network host in the tag and set
+`push=True`.
 
 ```python
-client.build_image(
-    id="python-base",
-    tag="registry.example.org/ucloud/python-base:latest",
+image = Image.from_dockerfile(
+    name="python-base",
+    tag="gateway-private-host:5000/ucloud/python-base:latest",
     context_path="./docker/python-base",
     push=True,
 )
+client.build_image(image)
 
+sandbox = client.create_sandbox(
+    image=Image.from_name("python-base"),
+    command=["python", "--version"],
+    cpus=1,
+    memory_mb=2048,
+    disk_mb=10240,
+)
+```
+
+`Image.from_dockerfile(...)` describes a Docker build. `client.build_image(...)`
+uploads `context_path` as a compressed tarball by default, so callers can point
+at a normal local Docker build directory. If the build context already exists on
+the gateway or builder VM, pass `upload_context=False`:
+
+```python
+client.build_image(
+    Image.from_dockerfile(
+        name="preloaded-context",
+        tag="gateway-private-host:5000/ucloud/preloaded-context:latest",
+        context_path="/work/ucloud-sandboxes/build-contexts/preloaded-context",
+        push=True,
+    ),
+    upload_context=False,
+)
+```
+
+Use `push=True` with a registry tag for any image that sandbox nodes should run.
+The builder/control-plane Docker daemon and sandbox-node Docker daemons are
+different machines. The registry tag is the durable handoff.
+
+After a pushed build, sandbox creation can use either the registry tag or the
+recorded image id:
+
+```python
+client.create_sandbox(
+    image=Image.from_registry("gateway-private-host:5000/ucloud/python-base:latest"),
+    cpus=1,
+    memory_mb=2048,
+    disk_mb=10240,
+)
+
+client.create_sandbox(
+    image=Image.from_name("python-base"),
+    cpus=1,
+    memory_mb=2048,
+    disk_mb=10240,
+)
+```
+
+You can also explicitly pull/cache a shared registry image under a gateway image
+id:
+
+```python
 client.pull_image(
-    "registry.example.org/ucloud/python-base:latest",
+    Image.from_registry("gateway-private-host:5000/ucloud/python-base:latest"),
     image_id="python-base",
 )
 
 client.snapshot_sandbox(
     "example",
-    "registry.example.org/ucloud/example-snapshot:latest",
+    Image.from_registry("registry.example.org/ucloud/example-snapshot:latest"),
 )
 ```
 
-When `context_path` points to a local directory, the SDK sends a compressed
-build context in the JSON request. Pass `upload_context=False` when the path
-already exists on the gateway machine.
+Snapshots should also target a registry tag if another node will need to run the
+image later. Images built or snapshotted without `push=True` are local to the
+builder/control-plane Docker daemon and are not available after a builder VM
+scales down.
 
 ## Async Client
 
 ```python
-from ucloud_sandboxes_sdk import AsyncSandboxClient
+from ucloud_sandboxes_sdk import AsyncSandboxClient, Image
 
 async with AsyncSandboxClient(
     "https://app-sandboxes.cloud.sdu.dk",
@@ -219,7 +291,7 @@ async with AsyncSandboxClient(
 ) as client:
     sandbox = await client.create_sandbox(
         id="async-example",
-        image="busybox:latest",
+        image=Image.from_registry("busybox:latest"),
         cpus=0.5,
         memory_mb=256,
         disk_mb=1024,

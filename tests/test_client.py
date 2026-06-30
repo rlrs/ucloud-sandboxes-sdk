@@ -12,7 +12,13 @@ from threading import Lock, Thread
 import unittest
 from urllib.parse import parse_qs, unquote, urlparse
 
-from ucloud_sandboxes_sdk import AsyncSandboxClient, SandboxApiError, SandboxClient
+from ucloud_sandboxes_sdk import (
+    AsyncSandboxClient,
+    Image,
+    SandboxApiError,
+    SandboxClient,
+    SandboxSpec,
+)
 
 
 class SandboxSdkTests(unittest.TestCase):
@@ -23,7 +29,7 @@ class SandboxSdkTests(unittest.TestCase):
             health = client.health()
             handle = client.create_sandbox(
                 id="sdk-one",
-                image="busybox",
+                image=Image.from_registry("busybox"),
                 command=["sleep", "300"],
                 memory_mb=128,
                 cpus=0.25,
@@ -56,26 +62,51 @@ class SandboxSdkTests(unittest.TestCase):
             client = SandboxClient(gateway.base_url)
 
             built = client.build_image(
-                id="python-base",
-                tag="local/python-base:latest",
-                context_path="/tmp/context",
+                Image.from_dockerfile(
+                    name="python-base",
+                    tag="gateway-private-host:5000/python-base:latest",
+                    context_path="/tmp/context",
+                )
             )
-            pulled = client.pull_image("busybox:latest", image_id="busybox")
+            pulled = client.pull_image(Image.from_registry("busybox:latest"), image_id="busybox")
             sandbox = client.create_sandbox(
                 id="snapshot-src",
-                image="busybox",
+                image=Image.from_registry("busybox"),
                 memory_mb=128,
             )
-            snapshot = sandbox.snapshot("local/snapshot-src:latest", image_id="snap-one")
+            snapshot = sandbox.snapshot(
+                Image.from_registry("local/snapshot-src:latest"),
+                image_id="snap-one",
+            )
             images = client.list_images()
 
         self.assertEqual(built["image"]["id"], "python-base")
+        self.assertTrue(built["received_push"])
         self.assertEqual(pulled["image"]["id"], "busybox")
         self.assertEqual(snapshot["image"]["id"], "snap-one")
         self.assertEqual(
             [image["id"] for image in images],
             ["busybox", "python-base", "snap-one"],
         )
+
+    def test_sync_client_accepts_sandbox_spec_with_image_helper(self) -> None:
+        with running_gateway() as gateway:
+            client = SandboxClient(gateway.base_url)
+
+            sandbox = client.create_sandbox(
+                SandboxSpec(
+                    id="spec-one",
+                    image=Image.from_registry("busybox"),
+                    command=["sleep", "60"],
+                    memory_mb=128,
+                    cpus=0.25,
+                    disk_mb=64,
+                )
+            )
+            deleted = sandbox.delete()
+
+        self.assertEqual(sandbox.id, "spec-one")
+        self.assertEqual(deleted["deleted"]["spec"]["image"], "busybox")
 
     def test_sync_client_uploads_local_build_context(self) -> None:
         with TemporaryDirectory() as raw_dir:
@@ -86,9 +117,11 @@ class SandboxSdkTests(unittest.TestCase):
                 client = SandboxClient(gateway.base_url)
 
                 built = client.build_image(
-                    id="local-context",
-                    tag="local/context:latest",
-                    context_path=str(context),
+                    Image.from_dockerfile(
+                        name="local-context",
+                        tag="local/context:latest",
+                        context_path=str(context),
+                    )
                 )
 
         self.assertEqual(built["image"]["id"], "local-context")
@@ -101,14 +134,33 @@ class SandboxSdkTests(unittest.TestCase):
 
             with self.assertRaises(SandboxApiError) as raised:
                 client.build_image(
-                    id="denied",
-                    tag="local/denied:latest",
-                    context_path="/tmp/context",
-                    deny=True,
+                    Image.from_dockerfile(
+                        name="denied",
+                        tag="local/denied:latest",
+                        context_path="/tmp/context",
+                    )
                 )
 
         self.assertEqual(raised.exception.status_code, 403)
         self.assertEqual(raised.exception.body, {"error": "image builds disabled"})
+
+    def test_sync_client_rejects_legacy_image_patterns(self) -> None:
+        client = SandboxClient("http://gateway.invalid")
+
+        with self.assertRaises(TypeError):
+            client.create_sandbox(
+                id="legacy",
+                image="busybox",
+                memory_mb=128,
+            )
+        with self.assertRaises(TypeError):
+            client.build_image(
+                {
+                    "id": "legacy",
+                    "tag": "registry.invalid/legacy:latest",
+                    "context_path": "/tmp/context",
+                }
+            )
 
     def test_sync_client_prepares_capacity(self) -> None:
         with running_gateway() as gateway:
@@ -131,12 +183,31 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(deleted["deleted"]["prepare_id"], "sdk-prep")
         self.assertEqual(deleted["demand"]["prepared_resources"]["vcpu"], 0.0)
 
+    def test_sync_client_prepares_builder_capacity(self) -> None:
+        with running_gateway() as gateway:
+            client = SandboxClient(gateway.base_url)
+
+            prepared = client.prepare_builder(
+                prepare_id="sdk-builder-prep",
+                count=2,
+                ttl_seconds=600,
+            )
+            listed = client.list_prepared_builders()
+            deleted = client.delete_prepared_builder("sdk-builder-prep")
+
+        self.assertEqual(prepared["prepare"]["prepare_id"], "sdk-builder-prep")
+        self.assertEqual(prepared["demand"]["prepared_builder_count"], 2)
+        self.assertEqual(prepared["demand"]["desired_builders"], 2)
+        self.assertEqual(listed["prepared_builders"][0]["count"], 2)
+        self.assertEqual(deleted["deleted"]["prepare_id"], "sdk-builder-prep")
+        self.assertEqual(deleted["demand"]["prepared_builder_count"], 0)
+
     def test_async_client_lifecycle_and_exec(self) -> None:
         async def scenario(base_url: str) -> tuple[str, int | None, list[str], int, bytes]:
             async with AsyncSandboxClient(base_url) as client:
                 handle = await client.create_sandbox(
                     id="async-one",
-                    image="busybox",
+                    image=Image.from_registry("busybox"),
                     memory_mb=128,
                 )
                 result = await handle.exec(["true"], timeout_seconds=2)
@@ -195,6 +266,7 @@ class FakeGatewayState:
         self.exec_sessions: dict[str, dict] = {}
         self.exec_events: dict[str, list[dict]] = {}
         self.prepared: dict[str, dict] = {}
+        self.prepared_builders: dict[str, dict] = {}
         self.files: dict[tuple[str, str], bytes] = {}
         self.exec_counter = 0
 
@@ -234,6 +306,16 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
             with self.state.lock:
                 prepared = list(self.state.prepared.values())
             self._write_json({"prepared": prepared, "demand": self._demand()})
+            return
+        if path == "/v1/builders/prepare":
+            with self.state.lock:
+                prepared_builders = list(self.state.prepared_builders.values())
+            self._write_json(
+                {
+                    "prepared_builders": prepared_builders,
+                    "demand": self._demand(),
+                }
+            )
             return
         sandbox_id = _sandbox_id_from_path(path)
         if sandbox_id is not None and path.endswith("/files"):
@@ -294,7 +376,7 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
             self._write_json({"sandbox": record}, status=HTTPStatus.CREATED)
             return
         if path == "/v1/images/build":
-            if payload.get("deny"):
+            if payload.get("id") == "denied":
                 self._write_json(
                     {"error": "image builds disabled"},
                     status=HTTPStatus.FORBIDDEN,
@@ -312,6 +394,7 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
                     "image": image,
                     "received_context_path": payload.get("context_path"),
                     "received_archive_bytes": len(archive or ""),
+                    "received_push": bool(payload.get("push")),
                 }
             )
             return
@@ -334,6 +417,20 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
             }
             with self.state.lock:
                 self.state.prepared[prepare_id] = item
+            self._write_json(
+                {"prepare": item, "demand": self._demand()},
+                status=HTTPStatus.CREATED,
+            )
+            return
+        if path == "/v1/builders/prepare":
+            prepare_id = str(payload.get("id") or "builder-prep-1")
+            count = int(payload.get("count") or 1)
+            item = {
+                "prepare_id": prepare_id,
+                "count": count,
+            }
+            with self.state.lock:
+                self.state.prepared_builders[prepare_id] = item
             self._write_json(
                 {"prepare": item, "demand": self._demand()},
                 status=HTTPStatus.CREATED,
@@ -425,6 +522,14 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
                 {"ok": True, "deleted": deleted, "demand": self._demand()}
             )
             return
+        builder_prepare_id = _builder_prepare_id_from_path(path)
+        if builder_prepare_id is not None:
+            with self.state.lock:
+                deleted = self.state.prepared_builders.pop(builder_prepare_id, None)
+            self._write_json(
+                {"ok": True, "deleted": deleted, "demand": self._demand()}
+            )
+            return
         self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
     def _read_json(self) -> dict:
@@ -472,14 +577,20 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
     def _demand(self) -> dict:
         with self.state.lock:
             prepared = list(self.state.prepared.values())
+            prepared_builders = list(self.state.prepared_builders.values())
         total = {"vcpu": 0.0, "memory_mb": 0, "disk_mb": 0}
         for item in prepared:
             total = _add_resources(total, item["total_resources"])
+        prepared_builder_count = sum(int(item.get("count") or 0) for item in prepared_builders)
         return {
             "pending_resources": {"vcpu": 0.0, "memory_mb": 0, "disk_mb": 0},
             "prepared_resources": total,
             "desired_resources": total,
             "oldest_pending_seconds": 0,
+            "pending_image_builds": 0,
+            "prepared_builder_count": prepared_builder_count,
+            "desired_builders": prepared_builder_count,
+            "prepared_builders": prepared_builders,
         }
 
 
@@ -505,6 +616,16 @@ def _exec_id_from_path(path: str) -> str | None:
 
 def _prepare_id_from_path(path: str) -> str | None:
     prefix = "/v1/capacity/prepare/"
+    if not path.startswith(prefix):
+        return None
+    rest = path[len(prefix):]
+    if not rest:
+        return None
+    return unquote(rest.split("/", 1)[0])
+
+
+def _builder_prepare_id_from_path(path: str) -> str | None:
+    prefix = "/v1/builders/prepare/"
     if not path.startswith(prefix):
         return None
     rest = path[len(prefix):]

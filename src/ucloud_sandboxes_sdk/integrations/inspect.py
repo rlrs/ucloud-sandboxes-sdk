@@ -28,7 +28,13 @@ from inspect_ai.util import (
 )
 from inspect_ai.util._sandbox.environment import SandboxConnection
 
-from ucloud_sandboxes_sdk import AsyncSandboxClient, AsyncSandboxHandle, SandboxApiError
+from ucloud_sandboxes_sdk import (
+    AsyncSandboxClient,
+    AsyncSandboxHandle,
+    Image,
+    SandboxApiError,
+    SandboxSpec,
+)
 
 
 DEFAULT_INSPECT_IMAGE = "python:3.12-slim"
@@ -49,7 +55,7 @@ _running_sandboxes: ContextVar[list[tuple[str, str, dict[str, str]]]] = ContextV
 class _InspectSettings:
     base_url: str
     headers: dict[str, str]
-    image: str
+    image: Image
     cpus: float | None
     memory_mb: int | None
     disk_mb: int | None
@@ -134,23 +140,23 @@ class UCloudSandboxEnvironment(SandboxEnvironment):
                 network = "bridge"
             handle = await _create_sandbox_with_wait(
                 client,
-                {
-                    "id": sandbox_id,
-                    "image": image,
-                    "command": command or ["sh", "-lc", "sleep 2147483647"],
-                    "env": env,
-                    "working_dir": "/tmp",
-                    "cpus": settings.cpus,
-                    "memory_mb": settings.memory_mb,
-                    "disk_mb": settings.disk_mb,
-                    "network": network,
-                    "ttl_seconds": settings.ttl_seconds,
-                    "ssh": {
+                SandboxSpec(
+                    id=sandbox_id,
+                    image=image,
+                    command=command or ["sh", "-lc", "sleep 2147483647"],
+                    env=env,
+                    working_dir="/tmp",
+                    cpus=settings.cpus,
+                    memory_mb=settings.memory_mb,
+                    disk_mb=settings.disk_mb,
+                    network=network,
+                    ttl_seconds=settings.ttl_seconds,
+                    ssh={
                         "enabled": settings.ssh_enabled,
                         "user": settings.ssh_user,
                     },
-                    "labels": labels,
-                },
+                    labels=labels,
+                ),
                 settings=settings,
             )
         except Exception:
@@ -340,22 +346,23 @@ async def _image_command_env(
     *,
     sandbox_id: str,
     config: SandboxEnvironmentConfigType | None,
-    default_image: str,
+    default_image: Image,
     settings: _InspectSettings,
-) -> tuple[str, list[str], dict[str, str]]:
+) -> tuple[Image, list[str], dict[str, str]]:
     if config is None:
         return default_image, [], {}
     if is_dockerfile(config):
         path = Path(str(config))
-        image = f"ucloud-inspect/{sandbox_id}:latest"
+        image = Image.from_dockerfile(
+            name=f"{sandbox_id}-image",
+            tag=f"ucloud-inspect/{sandbox_id}:latest",
+            context_path=path.parent or Path("."),
+            dockerfile=path.name,
+            push=True,
+        )
         await _build_image_with_wait(
             client,
-            {
-                "id": f"{sandbox_id}-image",
-                "tag": image,
-                "context_path": str(path.parent or Path(".")),
-                "dockerfile": path.name,
-            },
+            image,
             settings=settings,
         )
         return image, [], {}
@@ -371,13 +378,14 @@ async def _image_command_env(
 
 def _compose_image_command_env(
     config: ComposeConfig,
-    default_image: str,
-) -> tuple[str, list[str], dict[str, str]]:
+    default_image: Image,
+) -> tuple[Image, list[str], dict[str, str]]:
     services = getattr(config, "services", None)
     if not isinstance(services, dict) or not services:
         return default_image, [], {}
     service = services.get("default") or next(iter(services.values()))
-    image = str(getattr(service, "image", None) or default_image)
+    raw_image = getattr(service, "image", None)
+    image = _registry_image(str(raw_image)) if raw_image else default_image
     return image, _compose_command(getattr(service, "command", None)), _compose_env(
         getattr(service, "environment", None)
     )
@@ -426,7 +434,7 @@ def _settings_from_env() -> _InspectSettings:
     return _InspectSettings(
         base_url=base_url,
         headers=headers,
-        image=os.environ.get("UCLOUD_SANDBOX_IMAGE", DEFAULT_INSPECT_IMAGE),
+        image=_registry_image(os.environ.get("UCLOUD_SANDBOX_IMAGE", DEFAULT_INSPECT_IMAGE)),
         cpus=_float_env("UCLOUD_SANDBOX_CPUS") or DEFAULT_INSPECT_CPUS,
         memory_mb=_int_env("UCLOUD_SANDBOX_MEMORY_MB") or DEFAULT_INSPECT_MEMORY_MB,
         disk_mb=_int_env("UCLOUD_SANDBOX_DISK_MB") or DEFAULT_INSPECT_DISK_MB,
@@ -466,7 +474,7 @@ def _label_value(value: object) -> str:
 
 async def _create_sandbox_with_wait(
     client: AsyncSandboxClient,
-    payload: dict[str, Any],
+    spec: SandboxSpec,
     *,
     settings: _InspectSettings,
 ) -> AsyncSandboxHandle:
@@ -474,13 +482,13 @@ async def _create_sandbox_with_wait(
         "sandbox node",
         timeout_seconds=settings.start_timeout_seconds,
         retry_interval_seconds=settings.retry_interval_seconds,
-        operation=lambda: client.create_sandbox(payload),
+        operation=lambda: client.create_sandbox(spec),
     )
 
 
 async def _build_image_with_wait(
     client: AsyncSandboxClient,
-    payload: dict[str, Any],
+    image: Image,
     *,
     settings: _InspectSettings,
 ) -> dict[str, Any]:
@@ -488,8 +496,12 @@ async def _build_image_with_wait(
         "builder node",
         timeout_seconds=settings.build_timeout_seconds,
         retry_interval_seconds=settings.retry_interval_seconds,
-        operation=lambda: client.build_image(payload),
+        operation=lambda: client.build_image(image),
     )
+
+
+def _registry_image(reference: str) -> Image:
+    return Image.from_registry(reference)
 
 
 async def _retry_scale_up(

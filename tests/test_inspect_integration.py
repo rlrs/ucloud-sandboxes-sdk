@@ -4,7 +4,7 @@ import asyncio
 import importlib.util
 import unittest
 
-from ucloud_sandboxes_sdk import SandboxApiError
+from ucloud_sandboxes_sdk import Image, SandboxApiError, SandboxSpec
 
 
 INSPECT_AVAILABLE = importlib.util.find_spec("inspect_ai") is not None
@@ -30,7 +30,7 @@ class InspectIntegrationTests(unittest.TestCase):
                             "pending_resources": {"vcpu": 1.0},
                         },
                     )
-                return {"created": payload["id"]}
+                return {"created": payload.id}
 
         client = FakeClient()
         settings = _settings(inspect_integration)
@@ -38,7 +38,7 @@ class InspectIntegrationTests(unittest.TestCase):
         result = asyncio.run(
             inspect_integration._create_sandbox_with_wait(
                 client,
-                {"id": "sandbox-one"},
+                _sandbox_spec(),
                 settings=settings,
             )
         )
@@ -68,7 +68,7 @@ class InspectIntegrationTests(unittest.TestCase):
             asyncio.run(
                 inspect_integration._create_sandbox_with_wait(
                     client,
-                    {"id": "sandbox-one"},
+                    _sandbox_spec(),
                     settings=settings,
                 )
             )
@@ -101,7 +101,7 @@ class InspectIntegrationTests(unittest.TestCase):
                         status_code=503,
                         body={"error": "Your job is currently unavailable"},
                     )
-                return {"created": payload["id"]}
+                return {"created": payload.id}
 
         client = FakeClient()
         settings = _settings(inspect_integration)
@@ -109,7 +109,7 @@ class InspectIntegrationTests(unittest.TestCase):
         result = asyncio.run(
             inspect_integration._create_sandbox_with_wait(
                 client,
-                {"id": "sandbox-one"},
+                _sandbox_spec(),
                 settings=settings,
             )
         )
@@ -143,7 +143,7 @@ class InspectIntegrationTests(unittest.TestCase):
                             },
                         },
                     )
-                return {"created": payload["id"]}
+                return {"created": payload.id}
 
         client = FakeClient()
         settings = _settings(inspect_integration)
@@ -151,7 +151,7 @@ class InspectIntegrationTests(unittest.TestCase):
         result = asyncio.run(
             inspect_integration._create_sandbox_with_wait(
                 client,
-                {"id": "sandbox-one"},
+                _sandbox_spec(),
                 settings=settings,
             )
         )
@@ -175,7 +175,7 @@ def _settings(inspect_integration):
     return inspect_integration._InspectSettings(
         base_url="http://gateway.invalid",
         headers={},
-        image="python:3.12-slim",
+        image=Image.from_registry("python:3.12-slim"),
         cpus=1.0,
         memory_mb=2048,
         disk_mb=10240,
@@ -186,6 +186,14 @@ def _settings(inspect_integration):
         start_timeout_seconds=5,
         build_timeout_seconds=5,
         retry_interval_seconds=0.0,
+    )
+
+
+def _sandbox_spec() -> SandboxSpec:
+    return SandboxSpec(
+        id="sandbox-one",
+        image=Image.from_registry("python:3.12-slim"),
+        memory_mb=128,
     )
 
 

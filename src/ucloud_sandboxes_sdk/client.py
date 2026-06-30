@@ -107,7 +107,7 @@ class SandboxSshTarget:
 @dataclass(frozen=True)
 class SandboxSpec:
     id: str
-    image: str
+    image: "Image"
     command: Sequence[str] = ()
     env: Mapping[str, str] = field(default_factory=dict)
     working_dir: str | None = None
@@ -124,7 +124,7 @@ class SandboxSpec:
     def to_dict(self) -> JsonObject:
         return {
             "id": self.id,
-            "image": self.image,
+            "image": _image_reference(self.image),
             "command": [str(item) for item in self.command],
             "env": dict(self.env),
             "working_dir": self.working_dir,
@@ -141,11 +141,12 @@ class SandboxSpec:
 
 
 @dataclass(frozen=True)
-class ImageBuildSpec:
+class _ImageBuildSpec:
     id: str
     tag: str
     context_path: str
     dockerfile: str = "Dockerfile"
+    push: bool = False
     build_args: Mapping[str, str] = field(default_factory=dict)
     labels: Mapping[str, str] = field(default_factory=dict)
 
@@ -155,9 +156,78 @@ class ImageBuildSpec:
             "tag": self.tag,
             "context_path": self.context_path,
             "dockerfile": self.dockerfile,
+            "push": self.push,
             "build_args": dict(self.build_args),
             "labels": dict(self.labels),
         }
+
+
+@dataclass(frozen=True)
+class Image:
+    reference: str
+    name: str | None = None
+    tag: str | None = None
+    build_spec: _ImageBuildSpec | None = None
+
+    @classmethod
+    def from_registry(cls, tag: str) -> "Image":
+        tag = _non_empty_string("tag", tag)
+        return cls(reference=tag, tag=tag)
+
+    @classmethod
+    def from_name(cls, name: str) -> "Image":
+        name = _non_empty_string("name", name)
+        return cls(reference=name, name=name)
+
+    @classmethod
+    def from_id(cls, image_id: str) -> "Image":
+        return cls.from_name(image_id)
+
+    @classmethod
+    def from_dockerfile(
+        cls,
+        *,
+        name: str,
+        tag: str,
+        context_path: str | Path,
+        dockerfile: str = "Dockerfile",
+        push: bool = True,
+        build_args: Mapping[str, str] | None = None,
+        labels: Mapping[str, str] | None = None,
+    ) -> "Image":
+        name = _non_empty_string("name", name)
+        tag = _non_empty_string("tag", tag)
+        build_spec = _ImageBuildSpec(
+            id=name,
+            tag=tag,
+            context_path=str(context_path),
+            dockerfile=dockerfile,
+            push=push,
+            build_args=dict(build_args or {}),
+            labels=dict(labels or {}),
+        )
+        return cls(reference=name, name=name, tag=tag, build_spec=build_spec)
+
+    def to_build_spec(self) -> _ImageBuildSpec:
+        if self.build_spec is None:
+            raise TypeError(
+                "image does not include build metadata; use Image.from_dockerfile() "
+                "before calling build_image()"
+            )
+        return self.build_spec
+
+    def to_sandbox_image(self) -> str:
+        return self.reference
+
+    def to_dict(self) -> JsonObject:
+        payload: JsonObject = {"reference": self.reference}
+        if self.name is not None:
+            payload["name"] = self.name
+        if self.tag is not None:
+            payload["tag"] = self.tag
+        if self.build_spec is not None:
+            payload["build"] = self.build_spec.to_dict()
+        return payload
 
 
 @dataclass(frozen=True)
@@ -270,7 +340,7 @@ class SandboxHandle:
     ) -> Path:
         return self.client.download_file_to_path(self.id, container_path, local_path)
 
-    def snapshot(self, image: str, *, image_id: str | None = None) -> JsonObject:
+    def snapshot(self, image: Image, *, image_id: str | None = None) -> JsonObject:
         return self.client.snapshot_sandbox(self.id, image, image_id=image_id)
 
 
@@ -420,6 +490,32 @@ class SandboxClient:
             f"/v1/capacity/prepare/{_quote_segment(prepare_id)}",
         )
 
+    def list_prepared_builders(self) -> JsonObject:
+        return self._request_json("GET", "/v1/builders/prepare")
+
+    def prepare_builder(
+        self,
+        *,
+        count: int = 1,
+        ttl_seconds: int = 900,
+        prepare_id: str | None = None,
+    ) -> JsonObject:
+        return self._request_json(
+            "POST",
+            "/v1/builders/prepare",
+            payload=_prepare_builder_payload(
+                count=count,
+                ttl_seconds=ttl_seconds,
+                prepare_id=prepare_id,
+            ),
+        )
+
+    def delete_prepared_builder(self, prepare_id: str) -> JsonObject:
+        return self._request_json(
+            "DELETE",
+            f"/v1/builders/prepare/{_quote_segment(prepare_id)}",
+        )
+
     def get_sandbox(self, sandbox_id: str) -> JsonObject | None:
         for record in self.list_sandboxes():
             spec = record.get("spec")
@@ -429,7 +525,7 @@ class SandboxClient:
 
     def create_sandbox(
         self,
-        spec: SandboxSpec | Mapping[str, Any] | None = None,
+        spec: SandboxSpec | None = None,
         **kwargs: Any,
     ) -> SandboxHandle:
         payload = _sandbox_payload(spec, **kwargs)
@@ -634,13 +730,18 @@ class SandboxClient:
 
     def build_image(
         self,
-        spec: ImageBuildSpec | Mapping[str, Any] | None = None,
-        **kwargs: Any,
+        image: Image,
+        *,
+        upload_context: bool = True,
     ) -> JsonObject:
-        return self._request_json("POST", "/v1/images/build", payload=_image_build_payload(spec, **kwargs))
+        return self._request_json(
+            "POST",
+            "/v1/images/build",
+            payload=_image_build_payload(image, upload_context=upload_context),
+        )
 
-    def pull_image(self, image: str, *, image_id: str | None = None) -> JsonObject:
-        payload: JsonObject = {"image": image}
+    def pull_image(self, image: Image, *, image_id: str | None = None) -> JsonObject:
+        payload: JsonObject = {"image": _image_pull_reference(image)}
         if image_id is not None:
             payload["id"] = image_id
         return self._request_json("POST", "/v1/images/pull", payload=payload)
@@ -648,11 +749,11 @@ class SandboxClient:
     def snapshot_sandbox(
         self,
         sandbox_id: str,
-        image: str,
+        image: Image,
         *,
         image_id: str | None = None,
     ) -> JsonObject:
-        payload: JsonObject = {"image": image}
+        payload: JsonObject = {"image": _image_pull_reference(image)}
         if image_id is not None:
             payload["id"] = image_id
         return self._request_json(
@@ -818,7 +919,7 @@ class AsyncSandboxHandle:
     ) -> Path:
         return await self.client.download_file_to_path(self.id, container_path, local_path)
 
-    async def snapshot(self, image: str, *, image_id: str | None = None) -> JsonObject:
+    async def snapshot(self, image: Image, *, image_id: str | None = None) -> JsonObject:
         return await self.client.snapshot_sandbox(self.id, image, image_id=image_id)
 
 
@@ -981,6 +1082,32 @@ class AsyncSandboxClient:
             f"/v1/capacity/prepare/{_quote_segment(prepare_id)}",
         )
 
+    async def list_prepared_builders(self) -> JsonObject:
+        return await self._request_json("GET", "/v1/builders/prepare")
+
+    async def prepare_builder(
+        self,
+        *,
+        count: int = 1,
+        ttl_seconds: int = 900,
+        prepare_id: str | None = None,
+    ) -> JsonObject:
+        return await self._request_json(
+            "POST",
+            "/v1/builders/prepare",
+            payload=_prepare_builder_payload(
+                count=count,
+                ttl_seconds=ttl_seconds,
+                prepare_id=prepare_id,
+            ),
+        )
+
+    async def delete_prepared_builder(self, prepare_id: str) -> JsonObject:
+        return await self._request_json(
+            "DELETE",
+            f"/v1/builders/prepare/{_quote_segment(prepare_id)}",
+        )
+
     async def get_sandbox(self, sandbox_id: str) -> JsonObject | None:
         for record in await self.list_sandboxes():
             spec = record.get("spec")
@@ -990,7 +1117,7 @@ class AsyncSandboxClient:
 
     async def create_sandbox(
         self,
-        spec: SandboxSpec | Mapping[str, Any] | None = None,
+        spec: SandboxSpec | None = None,
         **kwargs: Any,
     ) -> AsyncSandboxHandle:
         payload = _sandbox_payload(spec, **kwargs)
@@ -1198,13 +1325,18 @@ class AsyncSandboxClient:
 
     async def build_image(
         self,
-        spec: ImageBuildSpec | Mapping[str, Any] | None = None,
-        **kwargs: Any,
+        image: Image,
+        *,
+        upload_context: bool = True,
     ) -> JsonObject:
-        return await self._request_json("POST", "/v1/images/build", payload=_image_build_payload(spec, **kwargs))
+        return await self._request_json(
+            "POST",
+            "/v1/images/build",
+            payload=_image_build_payload(image, upload_context=upload_context),
+        )
 
-    async def pull_image(self, image: str, *, image_id: str | None = None) -> JsonObject:
-        payload: JsonObject = {"image": image}
+    async def pull_image(self, image: Image, *, image_id: str | None = None) -> JsonObject:
+        payload: JsonObject = {"image": _image_pull_reference(image)}
         if image_id is not None:
             payload["id"] = image_id
         return await self._request_json("POST", "/v1/images/pull", payload=payload)
@@ -1212,11 +1344,11 @@ class AsyncSandboxClient:
     async def snapshot_sandbox(
         self,
         sandbox_id: str,
-        image: str,
+        image: Image,
         *,
         image_id: str | None = None,
     ) -> JsonObject:
-        payload: JsonObject = {"image": image}
+        payload: JsonObject = {"image": _image_pull_reference(image)}
         if image_id is not None:
             payload["id"] = image_id
         return await self._request_json(
@@ -1294,37 +1426,65 @@ class AsyncSandboxClient:
 
 
 def _sandbox_payload(
-    spec: SandboxSpec | Mapping[str, Any] | None,
+    spec: SandboxSpec | None,
     **kwargs: Any,
 ) -> JsonObject:
     payload = _object_payload(spec)
-    payload.update({key: value for key, value in kwargs.items() if value is not None})
+    overrides = {key: value for key, value in kwargs.items() if value is not None}
+    payload.update(overrides)
+    if "image" in payload:
+        if not (
+            isinstance(spec, SandboxSpec)
+            and "image" not in overrides
+            and isinstance(payload["image"], str)
+        ):
+            payload["image"] = _image_reference(payload["image"])
+    else:
+        raise TypeError("sandbox image is required and must be an Image")
     return payload
 
 
 def _image_build_payload(
-    spec: ImageBuildSpec | Mapping[str, Any] | None,
-    **kwargs: Any,
+    image: Image,
+    *,
+    upload_context: bool = True,
 ) -> JsonObject:
-    upload_context = bool(kwargs.pop("upload_context", True))
-    payload = _object_payload(spec)
-    payload.update({key: value for key, value in kwargs.items() if value is not None})
+    if not isinstance(image, Image):
+        raise TypeError("build_image() requires an Image from Image.from_dockerfile()")
+    payload = image.to_build_spec().to_dict()
     if upload_context:
         _attach_build_context_archive(payload)
     return payload
 
 
+def _image_reference(image: object) -> str:
+    if not isinstance(image, Image):
+        raise TypeError("sandbox image must be an Image")
+    return image.to_sandbox_image()
+
+
+def _image_pull_reference(image: Image) -> str:
+    if not isinstance(image, Image):
+        raise TypeError("image must be an Image")
+    return image.tag or image.reference
+
+
+def _non_empty_string(name: str, value: object) -> str:
+    text = str(value).strip()
+    if not text:
+        raise ValueError(f"{name} cannot be empty")
+    return text
+
+
 def _object_payload(spec: object | None) -> JsonObject:
     if spec is None:
         return {}
-    if isinstance(spec, Mapping):
-        return dict(spec)
     to_dict = getattr(spec, "to_dict", None)
     if callable(to_dict):
         raw = to_dict()
         if isinstance(raw, Mapping):
             return dict(raw)
-    raise TypeError("spec must be a mapping or expose to_dict().")
+    raise TypeError("spec must expose to_dict().")
 
 
 def _nested_payload(value: object) -> object:
@@ -1401,6 +1561,21 @@ def _prepare_capacity_payload(
         payload["memory_mb"] = memory_mb
     if disk_mb is not None:
         payload["disk_mb"] = disk_mb
+    return payload
+
+
+def _prepare_builder_payload(
+    *,
+    count: int,
+    ttl_seconds: int,
+    prepare_id: str | None,
+) -> JsonObject:
+    payload: JsonObject = {
+        "count": count,
+        "ttl_seconds": ttl_seconds,
+    }
+    if prepare_id is not None:
+        payload["id"] = prepare_id
     return payload
 
 
