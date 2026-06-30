@@ -69,8 +69,19 @@ The SDK attaches `context_archive_base64` by default when
 `Image.from_dockerfile(...).build_spec.context_path` points at a local
 directory. Pass `upload_context=False` to `build_image()` when `context_path`
 already exists on the gateway or builder VM.
-Large builds can exceed the client's default request timeout; pass
-`timeout_seconds` to `build_image()` for long-running Docker builds.
+`build_image()` submits with `wait: false`, then polls
+`GET /v1/images/builds/{build_id_or_image_id}` until the tracked build reaches
+`succeeded` or `failed`. SDK callers can use `on_status` to receive each status
+change and rolling `log_tail`. Large builds should pass `timeout_seconds` as
+the overall wait deadline and context-upload request timeout.
+
+Tracked build status is exposed through:
+
+```text
+POST /v1/images/build       # body includes wait: false
+GET  /v1/images/builds
+GET  /v1/images/builds/{build_id_or_image_id}
+```
 
 Builds intended for sandbox nodes should set `push: true` and use a registry
 tag. The gateway records the pushed tag under the image id, so a later sandbox

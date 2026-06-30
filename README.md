@@ -209,7 +209,14 @@ image = Image.from_dockerfile(
     context_path="./docker/python-base",
     push=True,
 )
-client.build_image(image)
+client.build_image(
+    image,
+    on_status=lambda build: print(
+        build["status"],
+        build.get("updated_at"),
+        (build.get("log_tail") or "")[-500:],
+    ),
+)
 
 sandbox = client.create_sandbox(
     image=Image.from_name("python-base"),
@@ -221,9 +228,12 @@ sandbox = client.create_sandbox(
 ```
 
 `Image.from_dockerfile(...)` describes a Docker build. `client.build_image(...)`
-uploads `context_path` as a compressed tarball by default, so callers can point
-at a normal local Docker build directory. If the build context already exists on
-the gateway or builder VM, pass `upload_context=False`:
+uploads `context_path` as a compressed tarball by default, submits a tracked
+build to the gateway, and polls build status until it succeeds or fails. The
+same lower-level flow is available as `submit_image_build(...)`,
+`get_image_build(...)`, `list_image_builds()`, and
+`wait_for_image_build(...)`. If the build context already exists on the gateway
+or builder VM, pass `upload_context=False`:
 
 ```python
 client.build_image(
@@ -241,8 +251,10 @@ client.build_image(
 Use `push=True` with a registry tag for any image that sandbox nodes should run.
 The builder/control-plane Docker daemon and sandbox-node Docker daemons are
 different machines. The registry tag is the durable handoff.
-For large Docker builds, pass `timeout_seconds` to `build_image()` or construct
-the client with a larger request timeout than the 30s default.
+For large Docker builds, pass `timeout_seconds` to `build_image()` as the
+overall wait deadline and context-upload request timeout. Status polls use the
+client's normal request timeout and return build state, command, node metadata,
+error text, and a rolling log tail.
 
 After a pushed build, sandbox creation can use either the registry tag or the
 recorded image id:

@@ -83,7 +83,7 @@ class SandboxSdkTests(unittest.TestCase):
             images = client.list_images()
 
         self.assertEqual(built["image"]["id"], "python-base")
-        self.assertTrue(built["received_push"])
+        self.assertTrue(built["image"]["received_push"])
         self.assertEqual(pulled["image"]["id"], "busybox")
         self.assertEqual(snapshot["image"]["id"], "snap-one")
         self.assertEqual(
@@ -127,11 +127,38 @@ class SandboxSdkTests(unittest.TestCase):
                 )
 
         self.assertEqual(built["image"]["id"], "local-context")
-        self.assertEqual(built["received_context_path"], ".")
-        self.assertGreater(built["received_archive_bytes"], 0)
+        self.assertEqual(built["image"]["received_context_path"], ".")
+        self.assertGreater(built["image"]["received_archive_bytes"], 0)
+
+    def test_sync_client_can_submit_and_poll_image_builds(self) -> None:
+        with running_gateway() as gateway:
+            client = SandboxClient(gateway.base_url)
+            statuses: list[str] = []
+
+            submitted = client.submit_image_build(
+                Image.from_dockerfile(
+                    name="python-base",
+                    tag="gateway-private-host:5000/python-base:latest",
+                    context_path="/tmp/context",
+                )
+            )
+            listed = client.list_image_builds()
+            completed = client.wait_for_image_build(
+                "python-base",
+                poll_interval_seconds=0.1,
+                on_status=lambda build: statuses.append(str(build.get("status"))),
+            )
+
+        self.assertEqual(submitted["image_id"], "python-base")
+        self.assertEqual(listed[0]["image_id"], "python-base")
+        self.assertEqual(completed["status"], "succeeded")
+        self.assertEqual(statuses, ["succeeded"])
 
     def test_sync_build_image_accepts_per_call_timeout(self) -> None:
         class FakeResponse:
+            def __init__(self, body: bytes) -> None:
+                self.body = body
+
             def __enter__(self) -> "FakeResponse":
                 return self
 
@@ -139,13 +166,20 @@ class SandboxSdkTests(unittest.TestCase):
                 return None
 
             def read(self) -> bytes:
-                return b'{"image": {"id": "slow-build"}}'
+                return self.body
 
         captured_timeouts: list[object] = []
 
         def fake_urlopen(req: object, timeout: object = None) -> FakeResponse:
             captured_timeouts.append(timeout)
-            return FakeResponse()
+            url = getattr(req, "full_url", "")
+            if str(url).endswith("/v1/images/build"):
+                return FakeResponse(
+                    b'{"build": {"build_id": "build-slow", "image_id": "slow-build", "status": "running"}}'
+                )
+            return FakeResponse(
+                b'{"build": {"build_id": "build-slow", "image_id": "slow-build", "status": "succeeded", "image": {"id": "slow-build"}, "command": ["docker", "build"], "exit_code": 0}}'
+            )
 
         client = SandboxClient("http://gateway.invalid", timeout_seconds=11)
         with patch.object(client_module.request, "urlopen", fake_urlopen):
@@ -158,7 +192,7 @@ class SandboxSdkTests(unittest.TestCase):
                 timeout_seconds=123,
             )
 
-        self.assertEqual(captured_timeouts, [123])
+        self.assertEqual(captured_timeouts, [123, 11])
 
     def test_sync_client_surfaces_api_errors(self) -> None:
         with running_gateway() as gateway:
@@ -267,6 +301,8 @@ class SandboxSdkTests(unittest.TestCase):
     def test_async_build_image_accepts_per_call_timeout(self) -> None:
         class FakeResponse:
             status = 200
+            def __init__(self, body: str) -> None:
+                self.body = body
 
             async def __aenter__(self) -> "FakeResponse":
                 return self
@@ -275,15 +311,21 @@ class SandboxSdkTests(unittest.TestCase):
                 return None
 
             async def text(self) -> str:
-                return '{"image": {"id": "slow-build"}}'
+                return self.body
 
         class FakeSession:
             def __init__(self) -> None:
                 self.timeouts: list[object] = []
 
-            def request(self, *_args: object, **kwargs: object) -> FakeResponse:
+            def request(self, _method: object, url: object, **kwargs: object) -> FakeResponse:
                 self.timeouts.append(kwargs.get("timeout"))
-                return FakeResponse()
+                if str(url).endswith("/v1/images/build"):
+                    return FakeResponse(
+                        '{"build": {"build_id": "build-slow", "image_id": "slow-build", "status": "running"}}'
+                    )
+                return FakeResponse(
+                    '{"build": {"build_id": "build-slow", "image_id": "slow-build", "status": "succeeded", "image": {"id": "slow-build"}, "command": ["docker", "build"], "exit_code": 0}}'
+                )
 
         async def scenario() -> list[object]:
             session = FakeSession()
@@ -304,7 +346,7 @@ class SandboxSdkTests(unittest.TestCase):
 
         timeouts = asyncio.run(scenario())
 
-        self.assertEqual([_timeout_total(timeout) for timeout in timeouts], [123])
+        self.assertEqual([_timeout_total(timeout) for timeout in timeouts], [123, 11])
 
 
 def _timeout_total(timeout: object) -> object:
@@ -341,6 +383,7 @@ class FakeGatewayState:
         self.lock = Lock()
         self.sandboxes: dict[str, dict] = {}
         self.images: dict[str, dict] = {}
+        self.builds: dict[str, dict] = {}
         self.exec_sessions: dict[str, dict] = {}
         self.exec_events: dict[str, list[dict]] = {}
         self.prepared: dict[str, dict] = {}
@@ -379,6 +422,29 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
             with self.state.lock:
                 images = [self.state.images[key] for key in sorted(self.state.images)]
             self._write_json({"images": images})
+            return
+        if path == "/v1/images/builds":
+            with self.state.lock:
+                builds = [self.state.builds[key] for key in sorted(self.state.builds)]
+            self._write_json({"builds": builds})
+            return
+        build_key = _image_build_key_from_path(path)
+        if build_key is not None:
+            with self.state.lock:
+                build = self.state.builds.get(build_key)
+                if build is None:
+                    build = next(
+                        (
+                            item
+                            for item in self.state.builds.values()
+                            if item.get("image_id") == build_key
+                        ),
+                        None,
+                    )
+            if build is None:
+                self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
+                return
+            self._write_json({"build": build})
             return
         if path == "/v1/capacity/prepare":
             with self.state.lock:
@@ -460,20 +526,35 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
                     status=HTTPStatus.FORBIDDEN,
                 )
                 return
+            archive = payload.get("context_archive_base64")
             image = {
                 "id": str(payload.get("id") or payload.get("tag") or "image"),
                 "tag": str(payload.get("tag") or ""),
+                "received_context_path": payload.get("context_path"),
+                "received_archive_bytes": len(archive or ""),
+                "received_push": bool(payload.get("push")),
             }
-            archive = payload.get("context_archive_base64")
+            build = {
+                "build_id": f"build-{image['id']}",
+                "image_id": image["id"],
+                "tag": image["tag"],
+                "status": "succeeded",
+                "image": image,
+                "command": ["docker", "build"],
+                "exit_code": 0,
+                "log_tail": "build complete\n",
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "updated_at": "2026-01-01T00:00:01+00:00",
+            }
             with self.state.lock:
                 self.state.images[image["id"]] = image
+                self.state.builds[build["build_id"]] = build
             self._write_json(
                 {
-                    "image": image,
-                    "received_context_path": payload.get("context_path"),
-                    "received_archive_bytes": len(archive or ""),
-                    "received_push": bool(payload.get("push")),
-                }
+                    "build": build,
+                    "started": True,
+                },
+                status=HTTPStatus.ACCEPTED,
             )
             return
         if path == "/v1/images/pull":
@@ -684,6 +765,16 @@ def _sandbox_id_from_path(path: str) -> str | None:
 
 def _exec_id_from_path(path: str) -> str | None:
     prefix = "/v1/exec/"
+    if not path.startswith(prefix):
+        return None
+    rest = path[len(prefix):]
+    if not rest:
+        return None
+    return unquote(rest.split("/", 1)[0])
+
+
+def _image_build_key_from_path(path: str) -> str | None:
+    prefix = "/v1/images/builds/"
     if not path.startswith(prefix):
         return None
     rest = path[len(prefix):]

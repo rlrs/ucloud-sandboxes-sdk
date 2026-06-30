@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 from dataclasses import asdict, dataclass, field
 import io
@@ -8,7 +9,7 @@ from pathlib import Path
 import shlex
 import tarfile
 import time
-from typing import Any, AsyncIterator, Iterator, Mapping, Sequence
+from typing import Any, AsyncIterator, Callable, Iterator, Mapping, Sequence
 from urllib import error, parse, request
 
 
@@ -728,19 +729,96 @@ class SandboxClient:
         images = payload.get("images")
         return [item for item in images if isinstance(item, dict)] if isinstance(images, list) else []
 
-    def build_image(
+    def list_image_builds(self) -> list[JsonObject]:
+        payload = self._request_json("GET", "/v1/images/builds")
+        builds = payload.get("builds")
+        return [item for item in builds if isinstance(item, dict)] if isinstance(builds, list) else []
+
+    def get_image_build(self, build_id_or_image_id: str) -> JsonObject:
+        payload = self._request_json(
+            "GET",
+            f"/v1/images/builds/{_quote_segment(build_id_or_image_id)}",
+        )
+        build = payload.get("build")
+        if not isinstance(build, dict):
+            raise SandboxApiError("gateway returned an invalid image build payload", body=payload)
+        return build
+
+    def submit_image_build(
         self,
         image: Image,
         *,
         upload_context: bool = True,
         timeout_seconds: float | None = None,
     ) -> JsonObject:
-        return self._request_json(
+        payload = _image_build_payload(image, upload_context=upload_context)
+        payload["wait"] = False
+        submitted = self._request_json(
             "POST",
             "/v1/images/build",
-            payload=_image_build_payload(image, upload_context=upload_context),
+            payload=payload,
             timeout_seconds=timeout_seconds,
         )
+        build = submitted.get("build")
+        if not isinstance(build, dict):
+            raise SandboxApiError("gateway returned an invalid image build payload", body=submitted)
+        return build
+
+    def wait_for_image_build(
+        self,
+        build_id_or_image_id: str,
+        *,
+        timeout_seconds: float | None = None,
+        poll_interval_seconds: float = 5.0,
+        on_status: Callable[[JsonObject], object] | None = None,
+    ) -> JsonObject:
+        deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
+        last_seen: tuple[object, object, object] | None = None
+        while True:
+            build = self.get_image_build(build_id_or_image_id)
+            seen = (
+                build.get("status"),
+                build.get("updated_at"),
+                len(str(build.get("log_tail") or "")),
+            )
+            if on_status is not None and seen != last_seen:
+                on_status(build)
+            last_seen = seen
+            if build.get("status") in {"succeeded", "failed"}:
+                return build
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(f"image build did not finish: {build_id_or_image_id}")
+            sleep_seconds = max(0.1, poll_interval_seconds)
+            if deadline is not None:
+                sleep_seconds = min(sleep_seconds, max(0.1, deadline - time.monotonic()))
+            time.sleep(sleep_seconds)
+
+    def build_image(
+        self,
+        image: Image,
+        *,
+        upload_context: bool = True,
+        timeout_seconds: float | None = None,
+        poll_interval_seconds: float = 5.0,
+        on_status: Callable[[JsonObject], object] | None = None,
+    ) -> JsonObject:
+        submitted = self.submit_image_build(
+            image,
+            upload_context=upload_context,
+            timeout_seconds=timeout_seconds,
+        )
+        build = self.wait_for_image_build(
+            str(submitted.get("build_id") or submitted.get("image_id") or ""),
+            timeout_seconds=timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+            on_status=on_status,
+        )
+        if build.get("status") != "succeeded":
+            raise SandboxApiError(
+                f"image build failed: {build.get('error') or build.get('status')}",
+                body={"build": build},
+            )
+        return _completed_build_payload(build)
 
     def pull_image(self, image: Image, *, image_id: str | None = None) -> JsonObject:
         payload: JsonObject = {"image": _image_pull_reference(image)}
@@ -1329,19 +1407,96 @@ class AsyncSandboxClient:
         images = payload.get("images")
         return [item for item in images if isinstance(item, dict)] if isinstance(images, list) else []
 
-    async def build_image(
+    async def list_image_builds(self) -> list[JsonObject]:
+        payload = await self._request_json("GET", "/v1/images/builds")
+        builds = payload.get("builds")
+        return [item for item in builds if isinstance(item, dict)] if isinstance(builds, list) else []
+
+    async def get_image_build(self, build_id_or_image_id: str) -> JsonObject:
+        payload = await self._request_json(
+            "GET",
+            f"/v1/images/builds/{_quote_segment(build_id_or_image_id)}",
+        )
+        build = payload.get("build")
+        if not isinstance(build, dict):
+            raise SandboxApiError("gateway returned an invalid image build payload", body=payload)
+        return build
+
+    async def submit_image_build(
         self,
         image: Image,
         *,
         upload_context: bool = True,
         timeout_seconds: float | None = None,
     ) -> JsonObject:
-        return await self._request_json(
+        payload = _image_build_payload(image, upload_context=upload_context)
+        payload["wait"] = False
+        submitted = await self._request_json(
             "POST",
             "/v1/images/build",
-            payload=_image_build_payload(image, upload_context=upload_context),
+            payload=payload,
             timeout_seconds=timeout_seconds,
         )
+        build = submitted.get("build")
+        if not isinstance(build, dict):
+            raise SandboxApiError("gateway returned an invalid image build payload", body=submitted)
+        return build
+
+    async def wait_for_image_build(
+        self,
+        build_id_or_image_id: str,
+        *,
+        timeout_seconds: float | None = None,
+        poll_interval_seconds: float = 5.0,
+        on_status: Callable[[JsonObject], object] | None = None,
+    ) -> JsonObject:
+        deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
+        last_seen: tuple[object, object, object] | None = None
+        while True:
+            build = await self.get_image_build(build_id_or_image_id)
+            seen = (
+                build.get("status"),
+                build.get("updated_at"),
+                len(str(build.get("log_tail") or "")),
+            )
+            if on_status is not None and seen != last_seen:
+                on_status(build)
+            last_seen = seen
+            if build.get("status") in {"succeeded", "failed"}:
+                return build
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(f"image build did not finish: {build_id_or_image_id}")
+            sleep_seconds = max(0.1, poll_interval_seconds)
+            if deadline is not None:
+                sleep_seconds = min(sleep_seconds, max(0.1, deadline - time.monotonic()))
+            await asyncio.sleep(sleep_seconds)
+
+    async def build_image(
+        self,
+        image: Image,
+        *,
+        upload_context: bool = True,
+        timeout_seconds: float | None = None,
+        poll_interval_seconds: float = 5.0,
+        on_status: Callable[[JsonObject], object] | None = None,
+    ) -> JsonObject:
+        submitted = await self.submit_image_build(
+            image,
+            upload_context=upload_context,
+            timeout_seconds=timeout_seconds,
+        )
+        build = await self.wait_for_image_build(
+            str(submitted.get("build_id") or submitted.get("image_id") or ""),
+            timeout_seconds=timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+            on_status=on_status,
+        )
+        if build.get("status") != "succeeded":
+            raise SandboxApiError(
+                f"image build failed: {build.get('error') or build.get('status')}",
+                body={"build": build},
+            )
+        return _completed_build_payload(build)
 
     async def pull_image(self, image: Image, *, image_id: str | None = None) -> JsonObject:
         payload: JsonObject = {"image": _image_pull_reference(image)}
@@ -1468,6 +1623,19 @@ def _image_build_payload(
     payload = image.to_build_spec().to_dict()
     if upload_context:
         _attach_build_context_archive(payload)
+    return payload
+
+
+def _completed_build_payload(build: JsonObject) -> JsonObject:
+    payload: JsonObject = {
+        "build": dict(build),
+        "image": build.get("image") if isinstance(build.get("image"), dict) else {},
+        "command": list(build.get("command") or []),
+        "exitCode": build.get("exit_code"),
+    }
+    if build.get("push_command"):
+        payload["pushCommand"] = list(build.get("push_command") or [])
+        payload["pushExitCode"] = build.get("push_exit_code")
     return payload
 
 
