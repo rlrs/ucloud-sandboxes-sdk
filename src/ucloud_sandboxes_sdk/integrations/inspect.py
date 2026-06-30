@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 from contextvars import ContextVar
 from dataclasses import dataclass
 import errno
@@ -9,7 +8,6 @@ from logging import getLogger
 import os
 from pathlib import Path, PurePosixPath
 import re
-import shlex
 import sys
 import time
 from typing import Any, Literal, overload
@@ -269,18 +267,16 @@ class UCloudSandboxEnvironment(SandboxEnvironment):
     async def write_file(self, file: str, contents: str | bytes) -> None:
         parent = str(PurePosixPath(file).parent)
         content_bytes = contents.encode("utf-8") if isinstance(contents, str) else contents
-        encoded = base64.b64encode(content_bytes).decode("ascii")
-        mkdir = ""
         if parent and parent not in {"/", "."}:
-            mkdir = f"mkdir -p {shlex.quote(parent)} && "
-        result = await self.exec(
-            ["sh", "-lc", f"{mkdir}base64 -d > {shlex.quote(file)}"],
-            input=encoded,
-        )
-        if not result.success:
+            result = await self.exec(["mkdir", "-p", parent])
+            if not result.success:
+                raise RuntimeError(result.stderr or f"failed to create {parent}")
+        try:
+            await self.handle.upload_file(file, content_bytes)
+        except SandboxApiError as exc:
             if await self._is_directory(file):
-                raise IsADirectoryError(errno.EISDIR, "Is a directory", file)
-            raise RuntimeError(result.stderr or f"failed to write {file}")
+                raise IsADirectoryError(errno.EISDIR, "Is a directory", file) from exc
+            raise RuntimeError(f"failed to write {file}: {exc}") from exc
 
     @overload
     async def read_file(self, file: str, text: Literal[True] = True) -> str: ...
@@ -297,10 +293,14 @@ class UCloudSandboxEnvironment(SandboxEnvironment):
                 limit_str=SandboxEnvironmentLimits.MAX_READ_FILE_SIZE_STR,
                 truncated_output=None,
             )
-        result = await self.exec(["sh", "-lc", f"base64 < {shlex.quote(file)}"])
-        if not result.success:
-            raise FileNotFoundError(errno.ENOENT, "No such file or directory", file)
-        raw = base64.b64decode(result.stdout.encode("ascii"))
+        try:
+            raw = await self.handle.download_file(file)
+        except SandboxApiError as exc:
+            raise FileNotFoundError(
+                errno.ENOENT,
+                "No such file or directory",
+                file,
+            ) from exc
         if not text:
             return raw
         return raw.decode("utf-8")

@@ -9,6 +9,8 @@ with `src/ucloud_sandboxes_sdk/client.py` when endpoints are added.
 - `GET /v1/sandboxes`
 - `POST /v1/sandboxes`
 - `DELETE /v1/sandboxes/<sandbox-id>`
+- `PUT /v1/sandboxes/<sandbox-id>/files?path=<absolute-container-path>`
+- `GET /v1/sandboxes/<sandbox-id>/files?path=<absolute-container-path>`
 - `GET /v1/sandboxes/<sandbox-id>/ssh`
 - `POST /v1/sandboxes/<sandbox-id>/exec`
 - `GET /v1/exec/<session-id>`
@@ -54,6 +56,24 @@ Terminal statuses are:
 
 `SandboxExecResult.stdout` and `.stderr` are assembled from events whose
 `stream` fields are `stdout` and `stderr`.
+
+## File Transfer
+
+`PUT /v1/sandboxes/<sandbox-id>/files?path=/absolute/container/path` uploads the
+raw request body to a file in the sandbox.
+
+`GET /v1/sandboxes/<sandbox-id>/files?path=/absolute/container/path` downloads
+the raw file bytes.
+
+The SDK exposes these as:
+
+- `upload_file(...)`
+- `upload_file_from_path(...)`
+- `download_file(...)`
+- `download_file_to_path(...)`
+
+The sandbox handle methods use the same operations with the handle's sandbox id.
+Inspect `read_file()` and `write_file()` call these endpoints.
 
 ## Prepared Capacity
 

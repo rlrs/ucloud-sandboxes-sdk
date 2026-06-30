@@ -32,6 +32,11 @@ class SandboxSdkTests(unittest.TestCase):
             )
             listed = client.list_sandboxes()
             result = handle.exec(["cat"], input="hello\n", timeout_seconds=2)
+            uploaded = handle.upload_file(
+                "/workspace/prompt.txt",
+                b"prompt bytes\n",
+            )
+            downloaded = handle.download_file("/workspace/prompt.txt")
             deleted = handle.delete()
 
         self.assertTrue(health["ok"])
@@ -42,6 +47,8 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(result.stdout, "stdout\n")
         self.assertEqual(result.stderr, "stderr\n")
         self.assertIn("stdin", [event["stream"] for event in result.events])
+        self.assertEqual(uploaded["size"], 13)
+        self.assertEqual(downloaded, b"prompt bytes\n")
         self.assertEqual(deleted["deleted"]["spec"]["id"], "sdk-one")
 
     def test_sync_client_image_cache_methods(self) -> None:
@@ -125,7 +132,7 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(deleted["demand"]["prepared_resources"]["vcpu"], 0.0)
 
     def test_async_client_lifecycle_and_exec(self) -> None:
-        async def scenario(base_url: str) -> tuple[str, int | None, list[str]]:
+        async def scenario(base_url: str) -> tuple[str, int | None, list[str], int, bytes]:
             async with AsyncSandboxClient(base_url) as client:
                 handle = await client.create_sandbox(
                     id="async-one",
@@ -133,17 +140,26 @@ class SandboxSdkTests(unittest.TestCase):
                     memory_mb=128,
                 )
                 result = await handle.exec(["true"], timeout_seconds=2)
+                uploaded = await handle.upload_file(
+                    "/workspace/out.txt",
+                    "async bytes\n",
+                )
+                downloaded = await handle.download_file("/workspace/out.txt")
                 await handle.delete()
                 return handle.id, result.exit_code, [
                     event["stream"] for event in result.events
-                ]
+                ], uploaded["size"], downloaded
 
         with running_gateway() as gateway:
-            sandbox_id, exit_code, streams = asyncio.run(scenario(gateway.base_url))
+            sandbox_id, exit_code, streams, size, downloaded = asyncio.run(
+                scenario(gateway.base_url)
+            )
 
         self.assertEqual(sandbox_id, "async-one")
         self.assertEqual(exit_code, 0)
         self.assertIn("stdout", streams)
+        self.assertEqual(size, 12)
+        self.assertEqual(downloaded, b"async bytes\n")
 
 
 @contextmanager
@@ -179,6 +195,7 @@ class FakeGatewayState:
         self.exec_sessions: dict[str, dict] = {}
         self.exec_events: dict[str, list[dict]] = {}
         self.prepared: dict[str, dict] = {}
+        self.files: dict[tuple[str, str], bytes] = {}
         self.exec_counter = 0
 
     def next_exec_id(self) -> str:
@@ -218,6 +235,20 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
                 prepared = list(self.state.prepared.values())
             self._write_json({"prepared": prepared, "demand": self._demand()})
             return
+        sandbox_id = _sandbox_id_from_path(path)
+        if sandbox_id is not None and path.endswith("/files"):
+            file_path = _file_path(parsed)
+            with self.state.lock:
+                content = self.state.files.get((sandbox_id, file_path or ""))
+            if content is None:
+                self._write_json({"error": "file not found"}, status=HTTPStatus.NOT_FOUND)
+                return
+            self._write_bytes(
+                content,
+                "application/octet-stream",
+                headers={"X-Sandbox-Path": file_path or ""},
+            )
+            return
         exec_id = _exec_id_from_path(path)
         if exec_id is not None and path.endswith("/events"):
             after = int(parse_qs(parsed.query).get("after", ["0"])[0] or 0)
@@ -238,7 +269,6 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
                 return
             self._write_json({"session": session})
             return
-        sandbox_id = _sandbox_id_from_path(path)
         if sandbox_id is not None and path.endswith("/ssh"):
             self._write_json(
                 {
@@ -353,6 +383,32 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
             return
         self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
+    def do_PUT(self) -> None:
+        parsed = urlparse(self.path)
+        path = parsed.path
+        sandbox_id = _sandbox_id_from_path(path)
+        if sandbox_id is not None and path.endswith("/files"):
+            file_path = _file_path(parsed)
+            if not file_path:
+                self._write_json(
+                    {"error": "path query parameter is required"},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
+            content = self._read_body()
+            with self.state.lock:
+                self.state.files[(sandbox_id, file_path)] = content
+            self._write_json(
+                {
+                    "ok": True,
+                    "sandboxId": sandbox_id,
+                    "path": file_path,
+                    "size": len(content),
+                }
+            )
+            return
+        self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
+
     def do_DELETE(self) -> None:
         path = urlparse(self.path).path
         sandbox_id = _sandbox_id_from_path(path)
@@ -372,12 +428,17 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
         self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
     def _read_json(self) -> dict:
-        length = int(self.headers.get("Content-Length") or 0)
-        if length <= 0:
+        raw = self._read_body().decode("utf-8")
+        if not raw:
             return {}
-        raw = self.rfile.read(length).decode("utf-8")
         parsed = json.loads(raw)
         return parsed if isinstance(parsed, dict) else {}
+
+    def _read_body(self) -> bytes:
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            return b""
+        return self.rfile.read(length)
 
     def _write_json(
         self,
@@ -389,6 +450,22 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _write_bytes(
+        self,
+        body: bytes,
+        content_type: str,
+        *,
+        status: HTTPStatus = HTTPStatus.OK,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
         self.end_headers()
         self.wfile.write(body)
 
@@ -434,6 +511,12 @@ def _prepare_id_from_path(path: str) -> str | None:
     if not rest:
         return None
     return unquote(rest.split("/", 1)[0])
+
+
+def _file_path(parsed) -> str | None:
+    raw = parse_qs(parsed.query).get("path") or [""]
+    value = raw[0].strip()
+    return value or None
 
 
 def _resources_from_prepare(payload: dict) -> dict:

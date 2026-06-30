@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass, field
 import io
 import json
 from pathlib import Path
+import shlex
 import tarfile
 import time
 from typing import Any, AsyncIterator, Iterator, Mapping, Sequence
@@ -69,6 +70,38 @@ class SandboxSshSpec:
         raw = asdict(self)
         raw["authorized_keys"] = list(self.authorized_keys)
         return raw
+
+
+@dataclass(frozen=True)
+class SandboxSshTarget:
+    sandbox_id: str
+    user: str
+    host: str
+    port: int
+    command: str
+    raw: JsonObject = field(default_factory=dict)
+
+    @classmethod
+    def from_payload(cls, sandbox_id: str, payload: JsonObject) -> "SandboxSshTarget":
+        ssh = payload.get("ssh")
+        if not isinstance(ssh, dict):
+            raise SandboxApiError("gateway returned an invalid SSH payload", body=payload)
+        host = ssh.get("host")
+        port = ssh.get("port")
+        user = ssh.get("user") or "root"
+        if not isinstance(host, str) or not isinstance(port, int):
+            raise SandboxApiError("gateway SSH payload is missing host/port", body=payload)
+        return cls(
+            sandbox_id=str(payload.get("sandboxId") or sandbox_id),
+            user=str(user),
+            host=host,
+            port=port,
+            command=str(ssh.get("command") or f"ssh -p {port} {user}@{host}"),
+            raw=dict(payload),
+        )
+
+    def direct_argv(self) -> list[str]:
+        return ["ssh", "-p", str(self.port), f"{self.user}@{self.host}"]
 
 
 @dataclass(frozen=True)
@@ -198,6 +231,44 @@ class SandboxHandle:
 
     def ssh(self) -> JsonObject:
         return self.client.get_ssh_target(self.id)
+
+    def ssh_target(self) -> SandboxSshTarget:
+        return self.client.get_ssh_connection(self.id)
+
+    def ssh_command(self) -> str:
+        return self.ssh_target().command
+
+    def ssh_proxy_command(
+        self,
+        *,
+        token_env: str = "UCLOUD_SANDBOX_API_TOKEN",
+        python: str = "python3",
+    ) -> str:
+        return self.client.ssh_proxy_command(
+            self.id,
+            token_env=token_env,
+            python=python,
+        )
+
+    def upload_file(self, container_path: str, content: bytes | str) -> JsonObject:
+        return self.client.upload_file(self.id, container_path, content)
+
+    def upload_file_from_path(
+        self,
+        local_path: str | Path,
+        container_path: str,
+    ) -> JsonObject:
+        return self.client.upload_file_from_path(self.id, local_path, container_path)
+
+    def download_file(self, container_path: str) -> bytes:
+        return self.client.download_file(self.id, container_path)
+
+    def download_file_to_path(
+        self,
+        container_path: str,
+        local_path: str | Path,
+    ) -> Path:
+        return self.client.download_file_to_path(self.id, container_path, local_path)
 
     def snapshot(self, image: str, *, image_id: str | None = None) -> JsonObject:
         return self.client.snapshot_sandbox(self.id, image, image_id=image_id)
@@ -372,8 +443,61 @@ class SandboxClient:
             raise SandboxApiError("node-agent sandbox payload is missing spec.id", body=response)
         return SandboxHandle(self, sandbox_id, record=record, create_response=response)
 
+    def create_ssh_sandbox(
+        self,
+        *,
+        ssh_user: str = "sandbox",
+        authorized_keys: Sequence[str] = (),
+        **kwargs: Any,
+    ) -> SandboxHandle:
+        kwargs.setdefault("network", "bridge")
+        kwargs["ssh"] = {
+            "enabled": True,
+            "user": ssh_user,
+            "authorized_keys": list(authorized_keys),
+        }
+        return self.create_sandbox(**kwargs)
+
     def delete_sandbox(self, sandbox_id: str) -> JsonObject:
         return self._request_json("DELETE", f"/v1/sandboxes/{_quote_segment(sandbox_id)}")
+
+    def upload_file(
+        self,
+        sandbox_id: str,
+        container_path: str,
+        content: bytes | str,
+    ) -> JsonObject:
+        return self._request_json(
+            "PUT",
+            _file_path(sandbox_id, container_path),
+            body=_bytes_payload(content),
+            content_type="application/octet-stream",
+        )
+
+    def upload_file_from_path(
+        self,
+        sandbox_id: str,
+        local_path: str | Path,
+        container_path: str,
+    ) -> JsonObject:
+        return self.upload_file(
+            sandbox_id,
+            container_path,
+            Path(local_path).read_bytes(),
+        )
+
+    def download_file(self, sandbox_id: str, container_path: str) -> bytes:
+        return self._request_bytes("GET", _file_path(sandbox_id, container_path))
+
+    def download_file_to_path(
+        self,
+        sandbox_id: str,
+        container_path: str,
+        local_path: str | Path,
+    ) -> Path:
+        path = Path(local_path)
+        path.write_bytes(self.download_file(sandbox_id, container_path))
+        return path
 
     def start_exec(
         self,
@@ -464,6 +588,45 @@ class SandboxClient:
     def get_ssh_target(self, sandbox_id: str) -> JsonObject:
         return self._request_json("GET", f"/v1/sandboxes/{_quote_segment(sandbox_id)}/ssh")
 
+    def get_ssh_connection(self, sandbox_id: str) -> SandboxSshTarget:
+        return SandboxSshTarget.from_payload(sandbox_id, self.get_ssh_target(sandbox_id))
+
+    def ssh_proxy_argv(
+        self,
+        sandbox_id: str,
+        *,
+        token_env: str = "UCLOUD_SANDBOX_API_TOKEN",
+        python: str = "python3",
+    ) -> list[str]:
+        return [
+            python,
+            "-m",
+            "ucloud_sandboxes_sdk.ssh_proxy",
+            "--gateway-url",
+            self.base_url,
+            "--sandbox-id",
+            sandbox_id,
+            "--token-env",
+            token_env,
+        ]
+
+    def ssh_proxy_command(
+        self,
+        sandbox_id: str,
+        *,
+        token_env: str = "UCLOUD_SANDBOX_API_TOKEN",
+        python: str = "python3",
+    ) -> str:
+        proxy = " ".join(
+            shlex.quote(part)
+            for part in self.ssh_proxy_argv(
+                sandbox_id,
+                token_env=token_env,
+                python=python,
+            )
+        )
+        return f"ssh -o ProxyCommand={shlex.quote(proxy)} sandbox@{sandbox_id}"
+
     def list_images(self) -> list[JsonObject]:
         payload = self._request_json("GET", "/v1/images")
         images = payload.get("images")
@@ -504,14 +667,18 @@ class SandboxClient:
         path: str,
         *,
         payload: JsonObject | None = None,
+        body: bytes | None = None,
+        content_type: str | None = None,
     ) -> JsonObject:
-        body = json.dumps(payload).encode("utf-8") if payload is not None else None
+        raw_body = json.dumps(payload).encode("utf-8") if payload is not None else body
         headers = dict(self.headers)
         if payload is not None:
             headers["Content-Type"] = "application/json"
+        elif content_type is not None:
+            headers["Content-Type"] = content_type
         req = request.Request(
             self.base_url + path,
-            data=body,
+            data=raw_body,
             method=method,
             headers=headers,
         )
@@ -533,6 +700,27 @@ class SandboxClient:
         if not isinstance(decoded, dict):
             raise SandboxApiError("node-agent returned a non-object JSON payload", body=decoded)
         return decoded
+
+    def _request_bytes(self, method: str, path: str) -> bytes:
+        req = request.Request(
+            self.base_url + path,
+            method=method,
+            headers=dict(self.headers),
+        )
+        try:
+            with request.urlopen(req, timeout=self.timeout_seconds) as response:
+                return response.read()
+        except error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            exc.close()
+            decoded = _decode_json_error(raw)
+            raise SandboxApiError(
+                f"node-agent request failed ({exc.code}): {decoded}",
+                status_code=exc.code,
+                body=decoded,
+            ) from exc
+        except OSError as exc:
+            raise SandboxApiError(f"node-agent request failed: {exc}") from exc
 
 
 @dataclass
@@ -591,6 +779,44 @@ class AsyncSandboxHandle:
 
     async def ssh(self) -> JsonObject:
         return await self.client.get_ssh_target(self.id)
+
+    async def ssh_target(self) -> SandboxSshTarget:
+        return await self.client.get_ssh_connection(self.id)
+
+    async def ssh_command(self) -> str:
+        return (await self.ssh_target()).command
+
+    def ssh_proxy_command(
+        self,
+        *,
+        token_env: str = "UCLOUD_SANDBOX_API_TOKEN",
+        python: str = "python3",
+    ) -> str:
+        return self.client.ssh_proxy_command(
+            self.id,
+            token_env=token_env,
+            python=python,
+        )
+
+    async def upload_file(self, container_path: str, content: bytes | str) -> JsonObject:
+        return await self.client.upload_file(self.id, container_path, content)
+
+    async def upload_file_from_path(
+        self,
+        local_path: str | Path,
+        container_path: str,
+    ) -> JsonObject:
+        return await self.client.upload_file_from_path(self.id, local_path, container_path)
+
+    async def download_file(self, container_path: str) -> bytes:
+        return await self.client.download_file(self.id, container_path)
+
+    async def download_file_to_path(
+        self,
+        container_path: str,
+        local_path: str | Path,
+    ) -> Path:
+        return await self.client.download_file_to_path(self.id, container_path, local_path)
 
     async def snapshot(self, image: str, *, image_id: str | None = None) -> JsonObject:
         return await self.client.snapshot_sandbox(self.id, image, image_id=image_id)
@@ -778,8 +1004,61 @@ class AsyncSandboxClient:
             raise SandboxApiError("node-agent sandbox payload is missing spec.id", body=response)
         return AsyncSandboxHandle(self, sandbox_id, record=record, create_response=response)
 
+    async def create_ssh_sandbox(
+        self,
+        *,
+        ssh_user: str = "sandbox",
+        authorized_keys: Sequence[str] = (),
+        **kwargs: Any,
+    ) -> AsyncSandboxHandle:
+        kwargs.setdefault("network", "bridge")
+        kwargs["ssh"] = {
+            "enabled": True,
+            "user": ssh_user,
+            "authorized_keys": list(authorized_keys),
+        }
+        return await self.create_sandbox(**kwargs)
+
     async def delete_sandbox(self, sandbox_id: str) -> JsonObject:
         return await self._request_json("DELETE", f"/v1/sandboxes/{_quote_segment(sandbox_id)}")
+
+    async def upload_file(
+        self,
+        sandbox_id: str,
+        container_path: str,
+        content: bytes | str,
+    ) -> JsonObject:
+        return await self._request_json(
+            "PUT",
+            _file_path(sandbox_id, container_path),
+            body=_bytes_payload(content),
+            content_type="application/octet-stream",
+        )
+
+    async def upload_file_from_path(
+        self,
+        sandbox_id: str,
+        local_path: str | Path,
+        container_path: str,
+    ) -> JsonObject:
+        return await self.upload_file(
+            sandbox_id,
+            container_path,
+            Path(local_path).read_bytes(),
+        )
+
+    async def download_file(self, sandbox_id: str, container_path: str) -> bytes:
+        return await self._request_bytes("GET", _file_path(sandbox_id, container_path))
+
+    async def download_file_to_path(
+        self,
+        sandbox_id: str,
+        container_path: str,
+        local_path: str | Path,
+    ) -> Path:
+        path = Path(local_path)
+        path.write_bytes(await self.download_file(sandbox_id, container_path))
+        return path
 
     async def start_exec(
         self,
@@ -870,6 +1149,48 @@ class AsyncSandboxClient:
     async def get_ssh_target(self, sandbox_id: str) -> JsonObject:
         return await self._request_json("GET", f"/v1/sandboxes/{_quote_segment(sandbox_id)}/ssh")
 
+    async def get_ssh_connection(self, sandbox_id: str) -> SandboxSshTarget:
+        return SandboxSshTarget.from_payload(
+            sandbox_id,
+            await self.get_ssh_target(sandbox_id),
+        )
+
+    def ssh_proxy_argv(
+        self,
+        sandbox_id: str,
+        *,
+        token_env: str = "UCLOUD_SANDBOX_API_TOKEN",
+        python: str = "python3",
+    ) -> list[str]:
+        return [
+            python,
+            "-m",
+            "ucloud_sandboxes_sdk.ssh_proxy",
+            "--gateway-url",
+            self.base_url,
+            "--sandbox-id",
+            sandbox_id,
+            "--token-env",
+            token_env,
+        ]
+
+    def ssh_proxy_command(
+        self,
+        sandbox_id: str,
+        *,
+        token_env: str = "UCLOUD_SANDBOX_API_TOKEN",
+        python: str = "python3",
+    ) -> str:
+        proxy = " ".join(
+            shlex.quote(part)
+            for part in self.ssh_proxy_argv(
+                sandbox_id,
+                token_env=token_env,
+                python=python,
+            )
+        )
+        return f"ssh -o ProxyCommand={shlex.quote(proxy)} sandbox@{sandbox_id}"
+
     async def list_images(self) -> list[JsonObject]:
         payload = await self._request_json("GET", "/v1/images")
         images = payload.get("images")
@@ -924,13 +1245,18 @@ class AsyncSandboxClient:
         path: str,
         *,
         payload: JsonObject | None = None,
+        body: bytes | None = None,
+        content_type: str | None = None,
     ) -> JsonObject:
         headers = dict(self.headers)
+        if content_type is not None and payload is None:
+            headers["Content-Type"] = content_type
         client = await self._client()
         async with client.request(
             method,
             self.base_url + path,
             json=payload,
+            data=body,
             headers=headers,
         ) as response:
             raw = await response.text()
@@ -947,6 +1273,24 @@ class AsyncSandboxClient:
         if not isinstance(decoded, dict):
             raise SandboxApiError("node-agent returned a non-object JSON payload", body=decoded)
         return decoded
+
+    async def _request_bytes(self, method: str, path: str) -> bytes:
+        client = await self._client()
+        async with client.request(
+            method,
+            self.base_url + path,
+            headers=dict(self.headers),
+        ) as response:
+            raw = await response.read()
+            if response.status >= 400:
+                text = raw.decode("utf-8", errors="replace")
+                decoded = _decode_json_error(text)
+                raise SandboxApiError(
+                    f"node-agent request failed ({response.status}): {decoded}",
+                    status_code=response.status,
+                    body=decoded,
+                )
+            return raw
 
 
 def _sandbox_payload(
@@ -1070,10 +1414,23 @@ def _quote_segment(value: str) -> str:
     return parse.quote(value, safe="")
 
 
+def _file_path(sandbox_id: str, container_path: str) -> str:
+    return (
+        f"/v1/sandboxes/{_quote_segment(sandbox_id)}/files?"
+        f"{parse.urlencode({'path': container_path})}"
+    )
+
+
 def _text_payload(data: str | bytes) -> str:
     if isinstance(data, bytes):
         return data.decode("utf-8")
     return data
+
+
+def _bytes_payload(data: str | bytes) -> bytes:
+    if isinstance(data, bytes):
+        return data
+    return data.encode("utf-8")
 
 
 def _decode_json_error(raw: str) -> object:
