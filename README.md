@@ -1,0 +1,201 @@
+# ucloud-sandboxes-sdk
+
+Python SDK and Inspect AI sandbox provider for UCloud sandbox gateways.
+
+This package is intentionally client-only. It talks to an already deployed
+gateway or node-agent HTTP API. It does not contain autoscaler policy, UCloud VM
+job submission, node initialization, Docker/gVisor runtime setup, or UCloud
+credentials.
+
+## Install
+
+```bash
+uv add ucloud-sandboxes-sdk
+uv add "ucloud-sandboxes-sdk[async]"
+uv add "ucloud-sandboxes-sdk[inspect]"
+```
+
+Use the base package for the synchronous client, the `async` extra for
+`AsyncSandboxClient`, and the `inspect` extra for `inspect eval --sandbox
+ucloud`.
+
+## Authentication
+
+Production gateways should require a bearer token. Pass it as an HTTP header:
+
+```python
+from ucloud_sandboxes_sdk import SandboxClient
+
+client = SandboxClient(
+    "https://app-sandboxes.cloud.sdu.dk",
+    headers={"Authorization": "Bearer <token>"},
+)
+```
+
+Do not put gateway tokens in source files, tests, or examples with real values.
+
+## Sandboxes
+
+```python
+from ucloud_sandboxes_sdk import SandboxClient
+
+client = SandboxClient(
+    "https://app-sandboxes.cloud.sdu.dk",
+    headers={"Authorization": "Bearer <token>"},
+)
+
+sandbox = client.create_sandbox(
+    id="example",
+    image="python:3.12-slim",
+    command=["sleep", "300"],
+    cpus=1,
+    memory_mb=2048,
+    disk_mb=10240,
+    ttl_seconds=600,
+)
+try:
+    result = sandbox.exec(
+        ["python", "-c", "print('ok')"],
+        timeout_seconds=30,
+    )
+    assert result.success
+    print(result.stdout)
+finally:
+    sandbox.delete()
+```
+
+`exec()` returns stdout, stderr, exit status, and the ordered event stream. For
+long-lived or interactive commands, call `start_exec()`, then use the returned
+exec handle to write stdin, read events, close stdin, or wait for completion.
+
+## Prepared Capacity
+
+If a benchmark runner knows it will soon need a burst of sandboxes, it can ask
+the autoscaler to start preparing resources before the first sandbox request:
+
+```python
+client.prepare_capacity(
+    prepare_id="mbpp-run",
+    count=16,
+    cpus=1,
+    memory_mb=2048,
+    disk_mb=10240,
+    ttl_seconds=900,
+)
+```
+
+This is an expiring demand signal only. It does not create placeholder
+sandboxes, reserve specific nodes, or bind capacity to a caller. Cancel it early
+when a run is abandoned:
+
+```python
+client.delete_prepared_capacity("mbpp-run")
+```
+
+## Images
+
+The gateway can build images on a build-capable control-plane or builder node
+and can ask sandbox nodes to pull registry images. Use registry tags for durable
+sharing between VMs.
+
+```python
+client.build_image(
+    id="python-base",
+    tag="registry.example.org/ucloud/python-base:latest",
+    context_path="./docker/python-base",
+    push=True,
+)
+
+client.pull_image(
+    "registry.example.org/ucloud/python-base:latest",
+    image_id="python-base",
+)
+
+client.snapshot_sandbox(
+    "example",
+    "registry.example.org/ucloud/example-snapshot:latest",
+)
+```
+
+When `context_path` points to a local directory, the SDK sends a compressed
+build context in the JSON request. Pass `upload_context=False` when the path
+already exists on the gateway machine.
+
+## Async Client
+
+```python
+from ucloud_sandboxes_sdk import AsyncSandboxClient
+
+async with AsyncSandboxClient(
+    "https://app-sandboxes.cloud.sdu.dk",
+    headers={"Authorization": "Bearer <token>"},
+) as client:
+    sandbox = await client.create_sandbox(
+        id="async-example",
+        image="busybox:latest",
+        cpus=0.5,
+        memory_mb=256,
+        disk_mb=1024,
+    )
+    try:
+        result = await sandbox.exec(["true"], timeout_seconds=30)
+    finally:
+        await sandbox.delete()
+```
+
+Sync and async clients should expose the same gateway operations.
+
+## Inspect AI
+
+Install:
+
+```bash
+uv add "ucloud-sandboxes-sdk[inspect]"
+```
+
+Set runtime configuration:
+
+```bash
+export UCLOUD_SANDBOX_URL="https://app-sandboxes.cloud.sdu.dk"
+export UCLOUD_SANDBOX_API_TOKEN="<token>"
+export UCLOUD_SANDBOX_IMAGE="python:3.12-slim"
+export UCLOUD_SANDBOX_CPUS="1"
+export UCLOUD_SANDBOX_MEMORY_MB="2048"
+export UCLOUD_SANDBOX_DISK_MB="10240"
+export UCLOUD_SANDBOX_START_TIMEOUT_SECONDS="1800"
+export UCLOUD_SANDBOX_BUILD_TIMEOUT_SECONDS="1800"
+export UCLOUD_SANDBOX_RETRY_INTERVAL_SECONDS="10"
+```
+
+Run:
+
+```bash
+inspect eval task.py --sandbox ucloud
+```
+
+The provider accepts `None`, a single-service Compose config, a Compose YAML
+file, or a Dockerfile. Compose `image`, `command`, and `environment` are mapped
+into a sandbox spec. Dockerfile configs call `build_image`; local build contexts
+are uploaded to the gateway. When the gateway reports that a sandbox or builder
+node is scaling up, the provider retries until the configured timeout expires.
+
+Set `UCLOUD_SANDBOX_SSH=1` to request SSH-enabled sandboxes. SSH forces bridge
+networking and exposes connection metadata through Inspect's sandbox
+connection API.
+
+## Development
+
+```bash
+uv run python -m unittest
+uv build
+```
+
+Run Inspect integration tests with the optional dependency installed:
+
+```bash
+uv run --extra inspect python -m unittest
+```
+
+The unit tests use a local fake gateway and must stay independent of the
+autoscaler repository. Live gateway smoke tests belong in separate operational
+docs and should never require checked-in secrets.

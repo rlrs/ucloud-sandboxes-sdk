@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ucloud-sandboxes-sdk"
+version = "0.1.0"
+description = "Python SDK and Inspect AI integration for UCloud sandbox gateways"
+readme = "README.md"
+requires-python = ">=3.10.13"
+dependencies = []
+
+[project.optional-dependencies]
+async = [
+    "aiohttp>=3.10,<4",
+]
+inspect = [
+    "aiohttp>=3.10,<4",
+    "inspect-ai>=0.3.240,<0.4",
+]
+
+[project.entry-points.inspect_ai]
+ucloud_sandboxes = "ucloud_sandboxes_sdk.integrations.inspect"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ucloud_sandboxes_sdk"]
+
+[dependency-groups]
+dev = [
+    "aiohttp>=3.10,<4",
+]
