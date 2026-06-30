@@ -2,10 +2,9 @@
 
 Python SDK and Inspect AI sandbox provider for UCloud sandbox gateways.
 
-This package is intentionally client-only. It talks to an already deployed
-gateway or node-agent HTTP API. It does not contain autoscaler policy, UCloud VM
-job submission, node initialization, Docker/gVisor runtime setup, or UCloud
-credentials.
+Use this package from benchmark runners, evaluations, and user code that needs
+to create sandboxes, execute commands, stream results, manage images, and signal
+near-term capacity needs through a deployed UCloud sandbox gateway.
 
 ## Install
 
@@ -21,7 +20,7 @@ ucloud`.
 
 ## Authentication
 
-Production gateways should require a bearer token. Pass it as an HTTP header:
+Pass the gateway bearer token as an HTTP `Authorization` header:
 
 ```python
 from ucloud_sandboxes_sdk import SandboxClient
@@ -31,8 +30,6 @@ client = SandboxClient(
     headers={"Authorization": "Bearer <token>"},
 )
 ```
-
-Do not put gateway tokens in source files, tests, or examples with real values.
 
 ## Sandboxes
 
@@ -70,8 +67,8 @@ exec handle to write stdin, read events, close stdin, or wait for completion.
 
 ## Prepared Capacity
 
-If a benchmark runner knows it will soon need a burst of sandboxes, it can ask
-the autoscaler to start preparing resources before the first sandbox request:
+If a runner knows it will soon need a burst of sandboxes, it can send a
+capacity hint before the first sandbox request:
 
 ```python
 client.prepare_capacity(
@@ -84,9 +81,8 @@ client.prepare_capacity(
 )
 ```
 
-This is an expiring demand signal only. It does not create placeholder
-sandboxes, reserve specific nodes, or bind capacity to a caller. Cancel it early
-when a run is abandoned:
+The signal contributes `count * resources` to gateway demand until its TTL
+expires. Cancel it early when a run is abandoned:
 
 ```python
 client.delete_prepared_capacity("mbpp-run")
@@ -94,9 +90,8 @@ client.delete_prepared_capacity("mbpp-run")
 
 ## Images
 
-The gateway can build images on a build-capable control-plane or builder node
-and can ask sandbox nodes to pull registry images. Use registry tags for durable
-sharing between VMs.
+Build images through the gateway and use registry tags as the durable cache
+between build-capable machines and sandbox nodes.
 
 ```python
 client.build_image(
@@ -143,7 +138,7 @@ async with AsyncSandboxClient(
         await sandbox.delete()
 ```
 
-Sync and async clients should expose the same gateway operations.
+The async client mirrors the synchronous gateway operations.
 
 ## Inspect AI
 
@@ -196,6 +191,5 @@ Run Inspect integration tests with the optional dependency installed:
 uv run --extra inspect python -m unittest
 ```
 
-The unit tests use a local fake gateway and must stay independent of the
-autoscaler repository. Live gateway smoke tests belong in separate operational
-docs and should never require checked-in secrets.
+The unit tests use a local fake gateway. Keep live gateway smoke tests in
+separate operational docs.

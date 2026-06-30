@@ -37,9 +37,8 @@ Sandbox create requests are individually resource-shaped:
 }
 ```
 
-The SDK should pass through resource fields as requested by the caller. It
-should not enforce local scheduling policy; the gateway decides placement and
-may return `503` while nodes are scaling up.
+The SDK passes these resource fields through to the gateway. The gateway owns
+placement and may return `503` while nodes are scaling up.
 
 ## Exec Events
 
@@ -76,11 +75,10 @@ Semantics:
 - The signal contributes `count * resources` to autoscaler demand.
 - It expires automatically at `ttl_seconds`.
 - Deleting it removes the demand signal.
-- It does not reserve capacity for a user, node, or future sandbox id.
-- It does not create sandboxes.
+- Future sandbox creation still uses the normal gateway placement path.
 
-SDK changes in this area should stay thin: expose the gateway operation, return
-the gateway JSON, and avoid adding local reservation state.
+SDK changes in this area should expose the gateway operation, return the
+gateway JSON, and keep scheduler state in the gateway.
 
 ## Error Handling
 
@@ -88,6 +86,5 @@ Sync and async clients raise `SandboxApiError` for non-2xx HTTP responses and
 malformed JSON/object payloads. `status_code` is set for HTTP errors, and
 `body` contains the decoded JSON error body when possible.
 
-Inspect integration retries transient scale-up and gateway errors, but normal
-SDK methods should not retry by default unless the public API explicitly grows a
-retry policy.
+Inspect integration retries transient scale-up and gateway errors. Normal SDK
+methods make one gateway request per method call.
