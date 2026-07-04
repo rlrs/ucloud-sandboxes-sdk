@@ -13,6 +13,23 @@ from ucloud_sandboxes_sdk import Image, SandboxApiError, SandboxSpec
 INSPECT_AVAILABLE = importlib.util.find_spec("inspect_ai") is not None
 
 
+class _BuildCaptureClient:
+    def __init__(self) -> None:
+        self.images: list[Image] = []
+        self.context_paths: list[str] = []
+        self.dockerfiles: list[str] = []
+
+    async def submit_image_build(self, image, **_kwargs):
+        self.images.append(image)
+        spec = image.to_build_spec()
+        self.context_paths.append(spec.context_path)
+        self.dockerfiles.append((Path(spec.context_path) / spec.dockerfile).read_text())
+        return {"build_id": image.name}
+
+    async def wait_for_image_build(self, build_id, **_kwargs):
+        return {"status": "succeeded", "image": {"id": build_id}}
+
+
 @unittest.skipUnless(INSPECT_AVAILABLE, "inspect-ai is not installed")
 class InspectIntegrationTests(unittest.TestCase):
     def test_create_sandbox_waits_through_scale_up_503(self) -> None:
@@ -21,9 +38,11 @@ class InspectIntegrationTests(unittest.TestCase):
         class FakeClient:
             def __init__(self) -> None:
                 self.attempts = 0
+                self.timeouts: list[float | None] = []
 
-            async def create_sandbox(self, payload):
+            async def create_sandbox(self, payload, *, request_timeout_seconds=None):
                 self.attempts += 1
+                self.timeouts.append(request_timeout_seconds)
                 if self.attempts < 3:
                     raise SandboxApiError(
                         "pending",
@@ -48,6 +67,9 @@ class InspectIntegrationTests(unittest.TestCase):
 
         self.assertEqual(result, {"created": "sandbox-one"})
         self.assertEqual(client.attempts, 3)
+        self.assertEqual(len(client.timeouts), 3)
+        self.assertTrue(all(timeout is not None for timeout in client.timeouts))
+        self.assertTrue(all(0 < timeout <= 5 for timeout in client.timeouts if timeout is not None))
 
     def test_create_sandbox_does_not_retry_non_scale_up_errors(self) -> None:
         from ucloud_sandboxes_sdk.integrations import inspect as inspect_integration
@@ -56,7 +78,8 @@ class InspectIntegrationTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.attempts = 0
 
-            async def create_sandbox(self, _payload):
+            async def create_sandbox(self, _payload, *, request_timeout_seconds=None):
+                del request_timeout_seconds
                 self.attempts += 1
                 raise SandboxApiError(
                     "bad request",
@@ -85,7 +108,8 @@ class InspectIntegrationTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.attempts = 0
 
-            async def create_sandbox(self, payload):
+            async def create_sandbox(self, payload, *, request_timeout_seconds=None):
+                del request_timeout_seconds
                 self.attempts += 1
                 if self.attempts == 1:
                     raise SandboxApiError(
@@ -127,7 +151,8 @@ class InspectIntegrationTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.attempts = 0
 
-            async def create_sandbox(self, payload):
+            async def create_sandbox(self, payload, *, request_timeout_seconds=None):
+                del request_timeout_seconds
                 self.attempts += 1
                 if self.attempts == 1:
                     raise SandboxApiError(
@@ -170,7 +195,8 @@ class InspectIntegrationTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.attempts = 0
 
-            async def create_sandbox(self, payload):
+            async def create_sandbox(self, payload, *, request_timeout_seconds=None):
+                del request_timeout_seconds
                 self.attempts += 1
                 if self.attempts == 1:
                     raise ServerDisconnectedError("Server disconnected")
@@ -190,6 +216,205 @@ class InspectIntegrationTests(unittest.TestCase):
         self.assertEqual(result, {"created": "sandbox-one"})
         self.assertEqual(client.attempts, 2)
 
+    def test_scale_up_retries_individual_attempt_timeouts(self) -> None:
+        from ucloud_sandboxes_sdk.integrations import inspect as inspect_integration
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.attempts = 0
+                self.timeouts: list[float | None] = []
+
+            async def create_sandbox(self, payload, *, request_timeout_seconds=None):
+                self.attempts += 1
+                self.timeouts.append(request_timeout_seconds)
+                if self.attempts == 1:
+                    raise TimeoutError("single request timed out")
+                return {"created": payload.id}
+
+        client = FakeClient()
+        settings = _settings(inspect_integration)
+
+        result = asyncio.run(
+            inspect_integration._create_sandbox_with_wait(
+                client,
+                _sandbox_spec(),
+                settings=settings,
+            )
+        )
+
+        self.assertEqual(result, {"created": "sandbox-one"})
+        self.assertEqual(client.attempts, 2)
+        self.assertEqual(len(client.timeouts), 2)
+        self.assertTrue(all(timeout is not None for timeout in client.timeouts))
+
+    def test_builder_timeout_is_not_resubmitted_by_scale_up_retry(self) -> None:
+        from ucloud_sandboxes_sdk.integrations import inspect as inspect_integration
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.submit_attempts = 0
+                self.wait_attempts = 0
+
+            async def submit_image_build(self, image, **_kwargs):
+                del image
+                self.submit_attempts += 1
+                return {"build_id": "build-timeout"}
+
+            async def wait_for_image_build(self, build_id, **_kwargs):
+                del build_id
+                self.wait_attempts += 1
+                raise TimeoutError("image build did not finish")
+
+        client = FakeClient()
+        settings = _settings(inspect_integration)
+
+        with self.assertRaises(TimeoutError):
+            asyncio.run(
+                inspect_integration._build_image_with_wait(
+                    client,
+                    Image.from_dockerfile(
+                        name="timeout-build",
+                        tag="registry.invalid/timeout-build:latest",
+                        context_path="/tmp/context",
+                    ),
+                    settings=settings,
+                )
+            )
+
+        self.assertEqual(client.submit_attempts, 1)
+        self.assertEqual(client.wait_attempts, 1)
+
+    def test_builder_submit_retries_no_ready_builder_then_waits_by_build_id(self) -> None:
+        from ucloud_sandboxes_sdk.integrations import inspect as inspect_integration
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.submit_attempts = 0
+                self.wait_build_ids: list[str] = []
+
+            async def submit_image_build(self, image, **_kwargs):
+                del image
+                self.submit_attempts += 1
+                if self.submit_attempts == 1:
+                    raise SandboxApiError(
+                        "no builder",
+                        status_code=503,
+                        body={"error": "no ready builder node is available"},
+                    )
+                return {"build_id": "build-ready"}
+
+            async def wait_for_image_build(self, build_id, **_kwargs):
+                self.wait_build_ids.append(build_id)
+                return {"status": "succeeded", "image": {"id": "built"}}
+
+        client = FakeClient()
+        settings = _settings(inspect_integration)
+
+        build = asyncio.run(
+            inspect_integration._build_image_with_wait(
+                client,
+                Image.from_dockerfile(
+                    name="ready-build",
+                    tag="registry.invalid/ready-build:latest",
+                    context_path="/tmp/context",
+                ),
+                settings=settings,
+            )
+        )
+
+        self.assertEqual(build["status"], "succeeded")
+        self.assertEqual(client.submit_attempts, 2)
+        self.assertEqual(client.wait_build_ids, ["build-ready"])
+
+    def test_builder_wait_disconnect_is_not_resubmitted_by_scale_up_retry(self) -> None:
+        from aiohttp import ServerDisconnectedError
+        from ucloud_sandboxes_sdk.integrations import inspect as inspect_integration
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.submit_attempts = 0
+                self.wait_attempts = 0
+
+            async def submit_image_build(self, image, **_kwargs):
+                del image
+                self.submit_attempts += 1
+                return {"build_id": "build-disconnect"}
+
+            async def wait_for_image_build(self, build_id, **_kwargs):
+                del build_id
+                self.wait_attempts += 1
+                raise ServerDisconnectedError("Server disconnected")
+
+        client = FakeClient()
+        settings = _settings(inspect_integration)
+
+        with self.assertRaises(ServerDisconnectedError):
+            asyncio.run(
+                inspect_integration._build_image_with_wait(
+                    client,
+                    Image.from_dockerfile(
+                        name="disconnect-build",
+                        tag="registry.invalid/disconnect-build:latest",
+                        context_path="/tmp/context",
+                    ),
+                    settings=settings,
+                )
+            )
+
+        self.assertEqual(client.submit_attempts, 1)
+        self.assertEqual(client.wait_attempts, 1)
+
+    def test_inspect_builds_add_writable_harbor_harness_dirs(self) -> None:
+        from ucloud_sandboxes_sdk.integrations import inspect as inspect_integration
+
+        with TemporaryDirectory() as tmp_dir:
+            context = Path(tmp_dir)
+            dockerfile = context / "Dockerfile"
+            dockerfile.write_text("FROM python:3.12-slim\nUSER app\n")
+            client = _BuildCaptureClient()
+
+            asyncio.run(
+                inspect_integration._build_image_with_wait(
+                    client,
+                    Image.from_dockerfile(
+                        name="harbor-build",
+                        tag="registry.invalid/harbor-build:latest",
+                        context_path=context,
+                    ),
+                    settings=_settings(inspect_integration),
+                )
+            )
+
+            original_dockerfile = dockerfile.read_text()
+
+        self.assertEqual(original_dockerfile, "FROM python:3.12-slim\nUSER app\n")
+        self.assertEqual(len(client.dockerfiles), 1)
+        self.assertNotEqual(client.context_paths[0], str(context))
+        self.assertIn("USER 0", client.dockerfiles[0])
+        self.assertIn("mkdir -p /tests /logs/agent /logs/verifier /task /oracle", client.dockerfiles[0])
+        self.assertIn("chmod -R 0777 /tests /logs /task /oracle", client.dockerfiles[0])
+        self.assertTrue(client.dockerfiles[0].rstrip().endswith("USER app"))
+
+    def test_harbor_harness_dockerfile_adapter_ignores_previous_stage_user(self) -> None:
+        from ucloud_sandboxes_sdk.integrations import inspect as inspect_integration
+
+        adapted = inspect_integration._dockerfile_with_harbor_harness_dirs(
+            "\n".join(
+                [
+                    "FROM python:3.12-slim AS builder",
+                    "USER builder",
+                    "RUN true",
+                    "FROM python:3.12-slim",
+                    "RUN true",
+                    "",
+                ]
+            )
+        )
+
+        self.assertIn("USER 0", adapted)
+        self.assertIn("mkdir -p /tests /logs/agent /logs/verifier /task /oracle", adapted)
+        self.assertFalse(adapted.rstrip().endswith("USER builder"))
+
     def test_sample_id_helpers_accept_numeric_metadata(self) -> None:
         from ucloud_sandboxes_sdk.integrations import inspect as inspect_integration
 
@@ -205,20 +430,12 @@ class InspectIntegrationTests(unittest.TestCase):
         from inspect_ai.util import ComposeBuild, ComposeConfig, ComposeService
         from ucloud_sandboxes_sdk.integrations import inspect as inspect_integration
 
-        class FakeClient:
-            def __init__(self) -> None:
-                self.images: list[Image] = []
-
-            async def build_image(self, image, **_kwargs):
-                self.images.append(image)
-                return {"image": {"id": image.name}}
-
         with TemporaryDirectory() as tmp_dir:
             context = Path(tmp_dir) / "environment"
             context.mkdir()
             (context / "Dockerfile").write_text("FROM python:3.12-slim\n")
             sandbox_id = "s" * 59
-            client = FakeClient()
+            client = _BuildCaptureClient()
 
             with patch.dict("os.environ", {}, clear=True):
                 launch = asyncio.run(
@@ -248,9 +465,10 @@ class InspectIntegrationTests(unittest.TestCase):
             build.tag,
             f"ucloud-sandbox-registry:5000/ucloud-inspect/{sandbox_id}:latest",
         )
-        self.assertEqual(build.context_path, str(context.resolve()))
+        self.assertNotEqual(build.context_path, str(context.resolve()))
         self.assertEqual(build.dockerfile, "Dockerfile")
-        self.assertEqual(launch.image, client.images[0])
+        self.assertEqual(launch.image.name, client.images[0].name)
+        self.assertIn("mkdir -p /tests /logs/agent /logs/verifier /task /oracle", client.dockerfiles[0])
         self.assertEqual(launch.command, ["sh", "-lc", "tail -f /dev/null"])
         self.assertEqual(launch.env, {"HARBOR": "1"})
         self.assertEqual(launch.cpus, 2.0)
@@ -258,14 +476,6 @@ class InspectIntegrationTests(unittest.TestCase):
 
     def test_compose_yaml_build_context_is_resolved_from_compose_dir(self) -> None:
         from ucloud_sandboxes_sdk.integrations import inspect as inspect_integration
-
-        class FakeClient:
-            def __init__(self) -> None:
-                self.images: list[Image] = []
-
-            async def build_image(self, image, **_kwargs):
-                self.images.append(image)
-                return {"image": {"id": image.name}}
 
         with TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -291,7 +501,7 @@ class InspectIntegrationTests(unittest.TestCase):
                     ]
                 )
             )
-            client = FakeClient()
+            client = _BuildCaptureClient()
 
             with patch.dict("os.environ", {}, clear=True):
                 launch = asyncio.run(
@@ -306,9 +516,10 @@ class InspectIntegrationTests(unittest.TestCase):
 
         self.assertEqual(len(client.images), 1)
         build = client.images[0].to_build_spec()
-        self.assertEqual(build.context_path, str(context.resolve()))
+        self.assertNotEqual(build.context_path, str(context.resolve()))
         self.assertEqual(build.dockerfile, "Dockerfile.custom")
         self.assertEqual(build.tag, "ucloud-sandbox-registry:5000/test/image:latest")
+        self.assertIn("mkdir -p /tests /logs/agent /logs/verifier /task /oracle", client.dockerfiles[0])
         self.assertEqual(launch.command, ["sleep", "infinity"])
         self.assertEqual(launch.env, {"A": "B"})
         self.assertEqual(launch.cpus, 4.0)
@@ -318,19 +529,11 @@ class InspectIntegrationTests(unittest.TestCase):
         from inspect_ai.util import ComposeBuild, ComposeConfig, ComposeService
         from ucloud_sandboxes_sdk.integrations import inspect as inspect_integration
 
-        class FakeClient:
-            def __init__(self) -> None:
-                self.images: list[Image] = []
-
-            async def build_image(self, image, **_kwargs):
-                self.images.append(image)
-                return {"image": {"id": image.name}}
-
         with TemporaryDirectory() as tmp_dir:
             context = Path(tmp_dir) / "environment"
             context.mkdir()
             (context / "Dockerfile").write_text("FROM python:3.12-slim\n")
-            client = FakeClient()
+            client = _BuildCaptureClient()
             with patch.dict(
                 "os.environ",
                 {"UCLOUD_SANDBOX_BUILD_IMAGE_PREFIX": "registry.local:5000/Inspect"},
@@ -363,8 +566,11 @@ class InspectIntegrationTests(unittest.TestCase):
         from ucloud_sandboxes_sdk.integrations import inspect as inspect_integration
 
         class FakeClient:
-            async def build_image(self, image, **_kwargs):
-                return {"image": {"id": image.name}}
+            async def submit_image_build(self, image, **_kwargs):
+                return {"build_id": image.name}
+
+            async def wait_for_image_build(self, build_id, **_kwargs):
+                return {"status": "succeeded", "image": {"id": build_id}}
 
         with self.assertRaises(NotImplementedError):
             asyncio.run(

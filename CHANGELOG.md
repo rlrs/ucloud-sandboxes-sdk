@@ -2,6 +2,16 @@
 
 This project uses semantic versioning.
 
+## 0.2.2 - 2026-07-04
+
+- Treated SDK image build timeouts as total build deadlines during polling.
+- Bounded image build polling requests by the remaining timeout budget.
+- Added `request_timeout_seconds` for per-call sandbox creation request timeouts.
+- Passed remaining Inspect scale-up budget into sandbox and builder attempts.
+- Avoided re-submitting Inspect image builds after the builder has accepted them.
+- Added empty writable Harbor harness directories to images built by the Inspect
+  Dockerfile and Compose adapters.
+
 ## 0.2.1 - 2026-07-04
 
 - Fixed generated Inspect build tags to default to the UCloud private registry.

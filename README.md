@@ -356,11 +356,17 @@ a sandbox spec. Dockerfile configs and single-service Compose builds call
 tags use `UCLOUD_SANDBOX_BUILD_IMAGE_PREFIX`, falling back to
 `UCLOUD_SANDBOX_REGISTRY_PREFIX`, then
 `ucloud-sandbox-registry:5000/ucloud-inspect`. Explicit Compose `image:` values
-are preserved. Multi-service Compose is rejected until the UCloud node agent has
+are preserved. For Dockerfile and Compose builds, the provider adds empty
+writable Harbor harness directories (`/tests`, `/logs/agent`, `/logs/verifier`,
+`/task`, and `/oracle`) in the built image without copying test files into the
+image. Multi-service Compose is rejected until the UCloud node agent has
 project-level Compose support. Inspect `read_file()` and `write_file()` use the
 gateway file endpoints. When the gateway reports that a sandbox or builder node
 is scaling up, or the gateway connection briefly drops during scale-up, the
-provider retries until the configured timeout expires.
+provider retries until the configured timeout expires. Start and build timeouts
+are treated as total budgets; individual scale-up attempts and build-status
+polls are bounded by the remaining budget. After a builder accepts an image
+build, the provider waits by build ID instead of re-submitting the build.
 
 Set `UCLOUD_SANDBOX_SSH=1` only for debug sandboxes whose images explicitly
 support an SSH server. Normal benchmark control uses exec and file APIs; model

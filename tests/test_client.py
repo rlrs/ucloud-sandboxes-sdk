@@ -110,6 +110,42 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(sandbox.id, "spec-one")
         self.assertEqual(deleted["deleted"]["spec"]["image"], "busybox")
 
+    def test_sync_create_sandbox_accepts_per_call_request_timeout(self) -> None:
+        class FakeResponse:
+            status = 200
+
+            def __init__(self, body: bytes) -> None:
+                self.body = body
+
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return self.body
+
+        captured_timeouts: list[object] = []
+
+        def fake_urlopen(req: object, timeout: object = None) -> FakeResponse:
+            captured_timeouts.append(timeout)
+            return FakeResponse(
+                b'{"sandbox": {"spec": {"id": "timeout-one", "image": "busybox"}}}'
+            )
+
+        client = SandboxClient("http://gateway.invalid", timeout_seconds=11)
+        with patch.object(client_module.request, "urlopen", fake_urlopen):
+            sandbox = client.create_sandbox(
+                id="timeout-one",
+                image=Image.from_registry("busybox"),
+                memory_mb=128,
+                request_timeout_seconds=7,
+            )
+
+        self.assertEqual(sandbox.id, "timeout-one")
+        self.assertEqual(captured_timeouts, [7])
+
     def test_sync_client_uploads_local_build_context(self) -> None:
         with TemporaryDirectory() as raw_dir:
             context = Path(raw_dir) / "context"
@@ -297,6 +333,47 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertIn("stdout", streams)
         self.assertEqual(size, 12)
         self.assertEqual(downloaded, b"async bytes\n")
+
+    def test_async_create_sandbox_accepts_per_call_request_timeout(self) -> None:
+        class FakeResponse:
+            status = 200
+
+            async def __aenter__(self) -> "FakeResponse":
+                return self
+
+            async def __aexit__(self, *args: object) -> None:
+                return None
+
+            async def text(self) -> str:
+                return '{"sandbox": {"spec": {"id": "timeout-one", "image": "busybox"}}}'
+
+        class FakeSession:
+            def __init__(self) -> None:
+                self.timeouts: list[object] = []
+
+            def request(self, _method: object, _url: object, **kwargs: object) -> FakeResponse:
+                self.timeouts.append(kwargs.get("timeout"))
+                return FakeResponse()
+
+        async def scenario() -> tuple[str, list[object]]:
+            session = FakeSession()
+            client = AsyncSandboxClient(
+                "http://gateway.invalid",
+                session=session,
+                timeout_seconds=11,
+            )
+            sandbox = await client.create_sandbox(
+                id="timeout-one",
+                image=Image.from_registry("busybox"),
+                memory_mb=128,
+                request_timeout_seconds=7,
+            )
+            return sandbox.id, session.timeouts
+
+        sandbox_id, timeouts = asyncio.run(scenario())
+
+        self.assertEqual(sandbox_id, "timeout-one")
+        self.assertEqual([_timeout_total(timeout) for timeout in timeouts], [7])
 
     def test_async_build_image_accepts_per_call_timeout(self) -> None:
         class FakeResponse:

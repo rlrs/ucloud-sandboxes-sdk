@@ -527,10 +527,17 @@ class SandboxClient:
     def create_sandbox(
         self,
         spec: SandboxSpec | None = None,
+        *,
+        request_timeout_seconds: float | None = None,
         **kwargs: Any,
     ) -> SandboxHandle:
         payload = _sandbox_payload(spec, **kwargs)
-        response = self._request_json("POST", "/v1/sandboxes", payload=payload)
+        response = self._request_json(
+            "POST",
+            "/v1/sandboxes",
+            payload=payload,
+            timeout_seconds=request_timeout_seconds,
+        )
         record = response.get("sandbox")
         if not isinstance(record, dict):
             raise SandboxApiError("node-agent returned an invalid sandbox payload", body=response)
@@ -734,10 +741,16 @@ class SandboxClient:
         builds = payload.get("builds")
         return [item for item in builds if isinstance(item, dict)] if isinstance(builds, list) else []
 
-    def get_image_build(self, build_id_or_image_id: str) -> JsonObject:
+    def get_image_build(
+        self,
+        build_id_or_image_id: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> JsonObject:
         payload = self._request_json(
             "GET",
             f"/v1/images/builds/{_quote_segment(build_id_or_image_id)}",
+            timeout_seconds=timeout_seconds,
         )
         build = payload.get("build")
         if not isinstance(build, dict):
@@ -772,10 +785,20 @@ class SandboxClient:
         poll_interval_seconds: float = 5.0,
         on_status: Callable[[JsonObject], object] | None = None,
     ) -> JsonObject:
-        deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
+        deadline = _deadline(timeout_seconds)
         last_seen: tuple[object, object, object] | None = None
+        build: JsonObject | None = None
         while True:
-            build = self.get_image_build(build_id_or_image_id)
+            remaining = _remaining_seconds(deadline)
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError(_image_build_timeout_message(build_id_or_image_id, build))
+            build = self.get_image_build(
+                build_id_or_image_id,
+                timeout_seconds=_request_timeout_seconds(
+                    remaining,
+                    self.timeout_seconds,
+                ),
+            )
             seen = (
                 build.get("status"),
                 build.get("updated_at"),
@@ -786,11 +809,12 @@ class SandboxClient:
             last_seen = seen
             if build.get("status") in {"succeeded", "failed"}:
                 return build
-            if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError(f"image build did not finish: {build_id_or_image_id}")
             sleep_seconds = max(0.1, poll_interval_seconds)
-            if deadline is not None:
-                sleep_seconds = min(sleep_seconds, max(0.1, deadline - time.monotonic()))
+            remaining = _remaining_seconds(deadline)
+            if remaining is not None:
+                if remaining <= 0:
+                    raise TimeoutError(_image_build_timeout_message(build_id_or_image_id, build))
+                sleep_seconds = min(sleep_seconds, remaining)
             time.sleep(sleep_seconds)
 
     def build_image(
@@ -802,6 +826,7 @@ class SandboxClient:
         poll_interval_seconds: float = 5.0,
         on_status: Callable[[JsonObject], object] | None = None,
     ) -> JsonObject:
+        deadline = _deadline(timeout_seconds)
         submitted = self.submit_image_build(
             image,
             upload_context=upload_context,
@@ -809,7 +834,7 @@ class SandboxClient:
         )
         build = self.wait_for_image_build(
             str(submitted.get("build_id") or submitted.get("image_id") or ""),
-            timeout_seconds=timeout_seconds,
+            timeout_seconds=_remaining_seconds(deadline),
             poll_interval_seconds=poll_interval_seconds,
             on_status=on_status,
         )
@@ -1202,10 +1227,17 @@ class AsyncSandboxClient:
     async def create_sandbox(
         self,
         spec: SandboxSpec | None = None,
+        *,
+        request_timeout_seconds: float | None = None,
         **kwargs: Any,
     ) -> AsyncSandboxHandle:
         payload = _sandbox_payload(spec, **kwargs)
-        response = await self._request_json("POST", "/v1/sandboxes", payload=payload)
+        response = await self._request_json(
+            "POST",
+            "/v1/sandboxes",
+            payload=payload,
+            timeout_seconds=request_timeout_seconds,
+        )
         record = response.get("sandbox")
         if not isinstance(record, dict):
             raise SandboxApiError("node-agent returned an invalid sandbox payload", body=response)
@@ -1412,10 +1444,16 @@ class AsyncSandboxClient:
         builds = payload.get("builds")
         return [item for item in builds if isinstance(item, dict)] if isinstance(builds, list) else []
 
-    async def get_image_build(self, build_id_or_image_id: str) -> JsonObject:
+    async def get_image_build(
+        self,
+        build_id_or_image_id: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> JsonObject:
         payload = await self._request_json(
             "GET",
             f"/v1/images/builds/{_quote_segment(build_id_or_image_id)}",
+            timeout_seconds=timeout_seconds,
         )
         build = payload.get("build")
         if not isinstance(build, dict):
@@ -1450,10 +1488,20 @@ class AsyncSandboxClient:
         poll_interval_seconds: float = 5.0,
         on_status: Callable[[JsonObject], object] | None = None,
     ) -> JsonObject:
-        deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
+        deadline = _deadline(timeout_seconds)
         last_seen: tuple[object, object, object] | None = None
+        build: JsonObject | None = None
         while True:
-            build = await self.get_image_build(build_id_or_image_id)
+            remaining = _remaining_seconds(deadline)
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError(_image_build_timeout_message(build_id_or_image_id, build))
+            build = await self.get_image_build(
+                build_id_or_image_id,
+                timeout_seconds=_request_timeout_seconds(
+                    remaining,
+                    self.timeout_seconds,
+                ),
+            )
             seen = (
                 build.get("status"),
                 build.get("updated_at"),
@@ -1464,11 +1512,12 @@ class AsyncSandboxClient:
             last_seen = seen
             if build.get("status") in {"succeeded", "failed"}:
                 return build
-            if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError(f"image build did not finish: {build_id_or_image_id}")
             sleep_seconds = max(0.1, poll_interval_seconds)
-            if deadline is not None:
-                sleep_seconds = min(sleep_seconds, max(0.1, deadline - time.monotonic()))
+            remaining = _remaining_seconds(deadline)
+            if remaining is not None:
+                if remaining <= 0:
+                    raise TimeoutError(_image_build_timeout_message(build_id_or_image_id, build))
+                sleep_seconds = min(sleep_seconds, remaining)
             await asyncio.sleep(sleep_seconds)
 
     async def build_image(
@@ -1480,6 +1529,7 @@ class AsyncSandboxClient:
         poll_interval_seconds: float = 5.0,
         on_status: Callable[[JsonObject], object] | None = None,
     ) -> JsonObject:
+        deadline = _deadline(timeout_seconds)
         submitted = await self.submit_image_build(
             image,
             upload_context=upload_context,
@@ -1487,7 +1537,7 @@ class AsyncSandboxClient:
         )
         build = await self.wait_for_image_build(
             str(submitted.get("build_id") or submitted.get("image_id") or ""),
-            timeout_seconds=timeout_seconds,
+            timeout_seconds=_remaining_seconds(deadline),
             poll_interval_seconds=poll_interval_seconds,
             on_status=on_status,
         )
@@ -1702,6 +1752,47 @@ def _aiohttp_timeout(timeout_seconds: float | None) -> object:
     except ImportError:
         return timeout_seconds
     return ClientTimeout(total=timeout_seconds)
+
+
+def _deadline(timeout_seconds: float | None) -> float | None:
+    if timeout_seconds is None:
+        return None
+    return time.monotonic() + max(0.0, float(timeout_seconds))
+
+
+def _remaining_seconds(deadline: float | None) -> float | None:
+    if deadline is None:
+        return None
+    return max(0.0, deadline - time.monotonic())
+
+
+def _request_timeout_seconds(
+    remaining_seconds: float | None,
+    default_timeout_seconds: float,
+) -> float:
+    default_timeout_seconds = max(0.001, float(default_timeout_seconds))
+    if remaining_seconds is None:
+        return default_timeout_seconds
+    return max(0.001, min(default_timeout_seconds, remaining_seconds))
+
+
+def _image_build_timeout_message(
+    build_id_or_image_id: str,
+    build: JsonObject | None,
+) -> str:
+    if not isinstance(build, dict):
+        return f"image build did not finish: {build_id_or_image_id}"
+    details = [
+        f"status={build.get('status')}",
+        f"updated_at={build.get('updated_at')}",
+    ]
+    error = build.get("error")
+    if error:
+        details.append(f"error={error}")
+    log_tail = str(build.get("log_tail") or "").strip()
+    if log_tail:
+        details.append(f"log_tail={log_tail[-500:]}")
+    return f"image build did not finish: {build_id_or_image_id} ({', '.join(details)})"
 
 
 def _tar_gz_directory(path: Path) -> bytes:

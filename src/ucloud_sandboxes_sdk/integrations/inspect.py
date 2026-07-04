@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 import errno
@@ -9,9 +10,11 @@ import math
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import sys
+from tempfile import TemporaryDirectory
 import time
-from typing import Any, Literal, overload
+from typing import Any, Iterator, Literal, overload
 from uuid import uuid4
 
 from aiohttp import ClientError
@@ -46,7 +49,9 @@ DEFAULT_INSPECT_DISK_MB = 10_240
 DEFAULT_START_TIMEOUT_SECONDS = 1800
 DEFAULT_BUILD_TIMEOUT_SECONDS = 1800
 DEFAULT_RETRY_INTERVAL_SECONDS = 10.0
+DEFAULT_SCALE_UP_REQUEST_TIMEOUT_SECONDS = 30.0
 DEFAULT_BUILD_IMAGE_PREFIX = "ucloud-sandbox-registry:5000/ucloud-inspect"
+HARBOR_HARNESS_DIRS = ("/tests", "/logs/agent", "/logs/verifier", "/task", "/oracle")
 INSPECT_CREATED_BY = "inspect-ai"
 logger = getLogger(__name__)
 _running_sandboxes: ContextVar[list[tuple[str, str, dict[str, str]]]] = ContextVar(
@@ -677,7 +682,15 @@ async def _create_sandbox_with_wait(
         "sandbox node",
         timeout_seconds=settings.start_timeout_seconds,
         retry_interval_seconds=settings.retry_interval_seconds,
-        operation=lambda: client.create_sandbox(spec),
+        retry_client_errors=True,
+        retry_timeout_errors=True,
+        operation=lambda timeout_seconds: client.create_sandbox(
+            spec,
+            request_timeout_seconds=min(
+                DEFAULT_SCALE_UP_REQUEST_TIMEOUT_SECONDS,
+                timeout_seconds,
+            ),
+        ),
     )
 
 
@@ -687,15 +700,115 @@ async def _build_image_with_wait(
     *,
     settings: _InspectSettings,
 ) -> dict[str, Any]:
-    return await _retry_scale_up(
-        "builder node",
-        timeout_seconds=settings.build_timeout_seconds,
-        retry_interval_seconds=settings.retry_interval_seconds,
-        operation=lambda: client.build_image(
-            image,
-            timeout_seconds=settings.build_timeout_seconds,
-        ),
+    timeout_seconds = max(0, int(settings.build_timeout_seconds))
+    deadline = time.monotonic() + timeout_seconds
+    with _harbor_compatible_build_image(image) as build_image:
+        submitted = await _retry_scale_up(
+            "builder node",
+            timeout_seconds=timeout_seconds,
+            retry_interval_seconds=settings.retry_interval_seconds,
+            retry_client_errors=False,
+            retry_timeout_errors=False,
+            operation=lambda request_timeout_seconds: client.submit_image_build(
+                build_image,
+                timeout_seconds=request_timeout_seconds,
+            ),
+        )
+    build_id = str(submitted.get("build_id") or submitted.get("image_id") or "")
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError(f"image build did not finish: {build_id}")
+    build = await client.wait_for_image_build(
+        build_id,
+        timeout_seconds=remaining,
     )
+    if build.get("status") != "succeeded":
+        raise SandboxApiError(
+            f"image build failed: {build.get('error') or build.get('status')}",
+            body={"build": build},
+        )
+    return build
+
+
+@contextmanager
+def _harbor_compatible_build_image(image: Image) -> Iterator[Image]:
+    spec = image.to_build_spec()
+    context_path = Path(spec.context_path)
+    dockerfile = Path(spec.dockerfile)
+    if dockerfile.is_absolute() or not context_path.is_dir():
+        yield image
+        return
+    source_dockerfile = context_path / dockerfile
+    if not source_dockerfile.is_file():
+        yield image
+        return
+    with TemporaryDirectory(prefix="ucloud-inspect-build-") as raw_dir:
+        adapted_context = Path(raw_dir) / "context"
+        shutil.copytree(context_path, adapted_context, symlinks=True)
+        adapted_dockerfile = adapted_context / dockerfile
+        original = adapted_dockerfile.read_text(encoding="utf-8")
+        adapted_dockerfile.write_text(
+            _dockerfile_with_harbor_harness_dirs(original),
+            encoding="utf-8",
+        )
+        yield Image.from_dockerfile(
+            name=spec.id,
+            tag=spec.tag,
+            context_path=adapted_context,
+            dockerfile=spec.dockerfile,
+            push=spec.push,
+            build_args=spec.build_args,
+            labels=spec.labels,
+        )
+
+
+def _dockerfile_with_harbor_harness_dirs(dockerfile: str) -> str:
+    final_user = _final_stage_user(dockerfile)
+    harness_dirs = " ".join(HARBOR_HARNESS_DIRS)
+    lines = [
+        dockerfile.rstrip(),
+        "",
+        "# UCloud Inspect/Harbor harness compatibility.",
+        "USER 0",
+        f"RUN mkdir -p {harness_dirs} \\",
+        " && chmod -R 0777 /tests /logs /task /oracle",
+    ]
+    if final_user:
+        lines.append(f"USER {final_user}")
+    return "\n".join(lines) + "\n"
+
+
+def _final_stage_user(dockerfile: str) -> str | None:
+    final_user: str | None = None
+    for line in _dockerfile_logical_lines(dockerfile):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        instruction, _, argument = stripped.partition(" ")
+        instruction = instruction.upper()
+        if instruction == "FROM":
+            final_user = None
+        elif instruction == "USER":
+            user = argument.strip()
+            if user:
+                final_user = user
+    return final_user
+
+
+def _dockerfile_logical_lines(dockerfile: str) -> list[str]:
+    lines: list[str] = []
+    current = ""
+    for raw_line in dockerfile.splitlines():
+        line = raw_line.rstrip()
+        continued = line.endswith("\\")
+        part = line[:-1].rstrip() if continued else line
+        current = f"{current} {part.lstrip()}".strip() if current else part
+        if not continued:
+            lines.append(current)
+            current = ""
+    if current:
+        lines.append(current)
+    return lines
 
 
 def _registry_image(reference: str) -> Image:
@@ -707,17 +820,27 @@ async def _retry_scale_up(
     *,
     timeout_seconds: int,
     retry_interval_seconds: float,
+    retry_client_errors: bool,
+    retry_timeout_errors: bool,
     operation: Any,
 ) -> Any:
     timeout_seconds = max(0, int(timeout_seconds))
     retry_interval_seconds = max(0.0, float(retry_interval_seconds))
     deadline = time.monotonic() + timeout_seconds
     attempts = 0
+    last_error: BaseException | None = None
     while True:
         attempts += 1
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"Timed out waiting for UCloud {label} readiness "
+                f"after {timeout_seconds}s and {attempts - 1} attempt(s): {last_error}"
+            ) from last_error
         try:
-            return await operation()
+            return await operation(max(0.001, remaining))
         except SandboxApiError as exc:
+            last_error = exc
             if not _is_retryable_gateway_error(exc):
                 raise
             remaining = deadline - time.monotonic()
@@ -728,6 +851,20 @@ async def _retry_scale_up(
                 ) from exc
             await asyncio.sleep(min(retry_interval_seconds, remaining))
         except ClientError as exc:
+            if not retry_client_errors:
+                raise
+            last_error = exc
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"Timed out waiting for UCloud {label} readiness "
+                    f"after {timeout_seconds}s and {attempts} attempt(s): {exc}"
+                ) from exc
+            await asyncio.sleep(min(retry_interval_seconds, remaining))
+        except TimeoutError as exc:
+            if not retry_timeout_errors:
+                raise
+            last_error = exc
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(
