@@ -2,6 +2,13 @@
 
 This project uses semantic versioning.
 
+## 0.2.4 - 2026-07-04
+
+- Recovered Inspect image builds after transient disconnects during build
+  submission by looking up the deterministic image id before resubmitting.
+- Kept accepted image builds from being duplicated when the submit response is
+  lost before reaching the SDK.
+
 ## 0.2.3 - 2026-07-04
 
 - Added Inspect AI environment configuration for sandbox security profiles.

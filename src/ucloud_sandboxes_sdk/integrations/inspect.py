@@ -750,16 +750,12 @@ async def _build_image_with_wait(
     timeout_seconds = max(0, int(settings.build_timeout_seconds))
     deadline = time.monotonic() + timeout_seconds
     with _harbor_compatible_build_image(image) as build_image:
-        submitted = await _retry_scale_up(
-            "builder node",
+        submitted = await _submit_image_build_with_recovery(
+            client,
+            build_image,
+            settings=settings,
+            deadline=deadline,
             timeout_seconds=timeout_seconds,
-            retry_interval_seconds=settings.retry_interval_seconds,
-            retry_client_errors=False,
-            retry_timeout_errors=False,
-            operation=lambda request_timeout_seconds: client.submit_image_build(
-                build_image,
-                timeout_seconds=request_timeout_seconds,
-            ),
         )
     build_id = str(submitted.get("build_id") or submitted.get("image_id") or "")
     remaining = deadline - time.monotonic()
@@ -775,6 +771,84 @@ async def _build_image_with_wait(
             body={"build": build},
         )
     return build
+
+
+async def _submit_image_build_with_recovery(
+    client: AsyncSandboxClient,
+    image: Image,
+    *,
+    settings: _InspectSettings,
+    deadline: float,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    spec = image.to_build_spec()
+    attempts = 0
+    last_error: BaseException | None = None
+    retry_interval_seconds = max(0.0, float(settings.retry_interval_seconds))
+    while True:
+        attempts += 1
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"Timed out waiting for UCloud builder node readiness "
+                f"after {timeout_seconds}s and {attempts - 1} attempt(s): {last_error}"
+            ) from last_error
+        try:
+            return await client.submit_image_build(
+                image,
+                timeout_seconds=max(0.001, remaining),
+            )
+        except SandboxApiError as exc:
+            last_error = exc
+            if not _is_retryable_gateway_error(exc):
+                raise
+            await _sleep_with_deadline(retry_interval_seconds, deadline)
+        except (ClientError, TimeoutError) as exc:
+            last_error = exc
+            recovered = await _recover_submitted_image_build(
+                client,
+                spec.id,
+                deadline=deadline,
+                retry_interval_seconds=retry_interval_seconds,
+            )
+            if recovered is not None:
+                return recovered
+
+
+async def _recover_submitted_image_build(
+    client: AsyncSandboxClient,
+    image_id: str,
+    *,
+    deadline: float,
+    retry_interval_seconds: float,
+) -> dict[str, Any] | None:
+    poll_deadline = min(deadline, time.monotonic() + retry_interval_seconds)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        try:
+            return await client.get_image_build(
+                image_id,
+                timeout_seconds=max(
+                    0.001,
+                    min(DEFAULT_SCALE_UP_REQUEST_TIMEOUT_SECONDS, remaining),
+                ),
+            )
+        except SandboxApiError as exc:
+            if exc.status_code != 404:
+                raise
+        remaining_poll = poll_deadline - time.monotonic()
+        if remaining_poll <= 0:
+            return None
+        await asyncio.sleep(min(1.0, remaining_poll))
+
+
+async def _sleep_with_deadline(seconds: float, deadline: float) -> None:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return
+    await asyncio.sleep(min(max(0.0, seconds), remaining))
 
 
 @contextmanager

@@ -432,6 +432,102 @@ class InspectIntegrationTests(unittest.TestCase):
         self.assertEqual(client.submit_attempts, 2)
         self.assertEqual(client.wait_build_ids, ["build-ready"])
 
+    def test_builder_submit_disconnect_recovers_accepted_build_by_image_id(self) -> None:
+        from aiohttp import ServerDisconnectedError
+        from ucloud_sandboxes_sdk.integrations import inspect as inspect_integration
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.submit_attempts = 0
+                self.get_build_ids: list[str] = []
+                self.wait_build_ids: list[str] = []
+
+            async def submit_image_build(self, image, **_kwargs):
+                del image
+                self.submit_attempts += 1
+                raise ServerDisconnectedError("Server disconnected")
+
+            async def get_image_build(self, build_id, **_kwargs):
+                self.get_build_ids.append(build_id)
+                return {
+                    "build_id": "accepted-build",
+                    "image_id": build_id,
+                    "status": "running",
+                }
+
+            async def wait_for_image_build(self, build_id, **_kwargs):
+                self.wait_build_ids.append(build_id)
+                return {"status": "succeeded", "image": {"id": "built"}}
+
+        client = FakeClient()
+        settings = _settings(inspect_integration)
+
+        build = asyncio.run(
+            inspect_integration._build_image_with_wait(
+                client,
+                Image.from_dockerfile(
+                    name="accepted-image",
+                    tag="registry.invalid/accepted-image:latest",
+                    context_path="/tmp/context",
+                ),
+                settings=settings,
+            )
+        )
+
+        self.assertEqual(build["status"], "succeeded")
+        self.assertEqual(client.submit_attempts, 1)
+        self.assertEqual(client.get_build_ids, ["accepted-image"])
+        self.assertEqual(client.wait_build_ids, ["accepted-build"])
+
+    def test_builder_submit_disconnect_resubmits_when_build_was_not_accepted(self) -> None:
+        from aiohttp import ServerDisconnectedError
+        from ucloud_sandboxes_sdk.integrations import inspect as inspect_integration
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.submit_attempts = 0
+                self.get_build_ids: list[str] = []
+                self.wait_build_ids: list[str] = []
+
+            async def submit_image_build(self, image, **_kwargs):
+                del image
+                self.submit_attempts += 1
+                if self.submit_attempts == 1:
+                    raise ServerDisconnectedError("Server disconnected")
+                return {"build_id": "resubmitted-build"}
+
+            async def get_image_build(self, build_id, **_kwargs):
+                self.get_build_ids.append(build_id)
+                raise SandboxApiError(
+                    "not found",
+                    status_code=404,
+                    body={"error": "image build not found"},
+                )
+
+            async def wait_for_image_build(self, build_id, **_kwargs):
+                self.wait_build_ids.append(build_id)
+                return {"status": "succeeded", "image": {"id": "built"}}
+
+        client = FakeClient()
+        settings = _settings(inspect_integration)
+
+        build = asyncio.run(
+            inspect_integration._build_image_with_wait(
+                client,
+                Image.from_dockerfile(
+                    name="not-accepted-image",
+                    tag="registry.invalid/not-accepted-image:latest",
+                    context_path="/tmp/context",
+                ),
+                settings=settings,
+            )
+        )
+
+        self.assertEqual(build["status"], "succeeded")
+        self.assertEqual(client.submit_attempts, 2)
+        self.assertEqual(client.get_build_ids, ["not-accepted-image"])
+        self.assertEqual(client.wait_build_ids, ["resubmitted-build"])
+
     def test_builder_wait_disconnect_is_not_resubmitted_by_scale_up_retry(self) -> None:
         from aiohttp import ServerDisconnectedError
         from ucloud_sandboxes_sdk.integrations import inspect as inspect_integration
