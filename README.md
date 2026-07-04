@@ -20,16 +20,21 @@ ucloud`.
 
 ## Authentication
 
-Pass the gateway bearer token as an HTTP `Authorization` header:
+Pass the gateway token with `api_token`. The SDK sends it as
+`X-UCloud-Sandbox-Token`, which avoids UCloud public-link handling of standard
+`Authorization` headers:
 
 ```python
 from ucloud_sandboxes_sdk import Image, SandboxClient
 
 client = SandboxClient(
     "https://app-sandboxes.cloud.sdu.dk",
-    headers={"Authorization": "Bearer <token>"},
+    api_token="<token>",
 )
 ```
+
+Raw HTTP callers should send the same token as
+`X-UCloud-Sandbox-Token: <token>`.
 
 ## Sandboxes
 
@@ -38,7 +43,7 @@ from ucloud_sandboxes_sdk import Image, SandboxClient
 
 client = SandboxClient(
     "https://app-sandboxes.cloud.sdu.dk",
-    headers={"Authorization": "Bearer <token>"},
+    api_token="<token>",
 )
 
 sandbox = client.create_sandbox(
@@ -308,7 +313,7 @@ from ucloud_sandboxes_sdk import AsyncSandboxClient, Image
 
 async with AsyncSandboxClient(
     "https://app-sandboxes.cloud.sdu.dk",
-    headers={"Authorization": "Bearer <token>"},
+    api_token="<token>",
 ) as client:
     sandbox = await client.create_sandbox(
         id="async-example",

@@ -15,6 +15,7 @@ from urllib import error, parse, request
 
 JsonObject = dict[str, Any]
 TERMINAL_EXEC_STATUSES = {"exited", "failed"}
+SANDBOX_TOKEN_HEADER = "X-UCloud-Sandbox-Token"
 
 
 class SandboxApiError(RuntimeError):
@@ -28,6 +29,11 @@ class SandboxApiError(RuntimeError):
         super().__init__(message)
         self.status_code = status_code
         self.body = body
+
+
+def sandbox_auth_headers(api_token: str | None) -> dict[str, str]:
+    token = (api_token or "").strip()
+    return {SANDBOX_TOKEN_HEADER: token} if token else {}
 
 
 @dataclass(frozen=True)
@@ -440,11 +446,13 @@ class SandboxClient:
         base_url: str,
         *,
         timeout_seconds: float = 30.0,
+        api_token: str | None = None,
         headers: Mapping[str, str] | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
-        self.headers = dict(headers or {})
+        self.headers = sandbox_auth_headers(api_token)
+        self.headers.update(dict(headers or {}))
 
     def health(self) -> JsonObject:
         return self._request_json("GET", "/healthz")
@@ -1146,13 +1154,15 @@ class AsyncSandboxClient:
         *,
         timeout_seconds: float = 30.0,
         session: Any | None = None,
+        api_token: str | None = None,
         headers: Mapping[str, str] | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
         self._session = session
         self._owned_session: Any | None = None
-        self.headers = dict(headers or {})
+        self.headers = sandbox_auth_headers(api_token)
+        self.headers.update(dict(headers or {}))
 
     async def __aenter__(self) -> "AsyncSandboxClient":
         await self._client()

@@ -42,6 +42,7 @@ from ucloud_sandboxes_sdk import (
     SandboxApiError,
     SandboxSecuritySpec,
     SandboxSpec,
+    sandbox_auth_headers,
 )
 
 
@@ -717,17 +718,16 @@ def _parse_memory_mb(value: object) -> int:
 
 
 def _settings_from_env() -> _InspectSettings:
-    base_url = os.environ.get("UCLOUD_SANDBOX_URL") or os.environ.get(
-        "UCLOUD_SANDBOX_BASE_URL"
+    base_url = (
+        os.environ.get("UCLOUD_SANDBOX_URL")
+        or os.environ.get("UCLOUD_SANDBOX_API_URL")
+        or os.environ.get("UCLOUD_SANDBOX_BASE_URL")
     )
     if not base_url:
         raise ValueError(
             "Set UCLOUD_SANDBOX_URL to the UCloud sandbox gateway or node-agent URL."
         )
-    headers: dict[str, str] = {}
-    token = os.environ.get("UCLOUD_SANDBOX_API_TOKEN")
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    headers = sandbox_auth_headers(os.environ.get("UCLOUD_SANDBOX_API_TOKEN"))
     ssh_enabled = _bool_env("UCLOUD_SANDBOX_SSH", False)
     cpus = _float_env("UCLOUD_SANDBOX_CPUS")
     memory_mb = _int_env("UCLOUD_SANDBOX_MEMORY_MB")

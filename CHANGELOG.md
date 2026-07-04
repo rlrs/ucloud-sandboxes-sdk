@@ -2,6 +2,15 @@
 
 This project uses semantic versioning.
 
+## 0.2.6 - 2026-07-04
+
+- Added `api_token` to sync and async sandbox clients, sent as
+  `X-UCloud-Sandbox-Token` for UCloud public-link compatibility.
+- Switched the Inspect provider and SSH proxy helper to the public-link-safe
+  sandbox token header.
+- Let the Inspect provider read `UCLOUD_SANDBOX_API_URL` in addition to the
+  existing sandbox URL environment variables.
+
 ## 0.2.5 - 2026-07-04
 
 - Generated Inspect Dockerfile and Compose build image ids from a deterministic

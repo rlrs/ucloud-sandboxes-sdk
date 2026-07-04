@@ -6,6 +6,8 @@ import os
 import sys
 from urllib.parse import quote, urlsplit, urlunsplit
 
+from .client import sandbox_auth_headers
+
 
 def websocket_url(gateway_url: str, sandbox_id: str) -> str:
     parsed = urlsplit(gateway_url.rstrip("/"))
@@ -41,9 +43,7 @@ async def run_proxy(
     effective_token = token
     if effective_token is None and token_env:
         effective_token = os.environ.get(token_env)
-    headers = {}
-    if effective_token:
-        headers["Authorization"] = f"Bearer {effective_token}"
+    headers = sandbox_auth_headers(effective_token)
 
     async with ClientSession(headers=headers) as session:
         async with session.ws_connect(

@@ -20,10 +20,31 @@ from ucloud_sandboxes_sdk import (
     SandboxApiError,
     SandboxClient,
     SandboxSpec,
+    sandbox_auth_headers,
 )
 
 
 class SandboxSdkTests(unittest.TestCase):
+    def test_api_token_uses_public_link_safe_header(self) -> None:
+        with running_gateway() as gateway:
+            client = SandboxClient(gateway.base_url, api_token="secret-token")
+
+            health = client.health()
+
+        self.assertTrue(health["ok"])
+        lower_headers = {
+            key.lower(): value for key, value in gateway.state.last_headers.items()
+        }
+        self.assertEqual(
+            lower_headers.get("x-ucloud-sandbox-token"),
+            "secret-token",
+        )
+        self.assertNotIn("authorization", lower_headers)
+        self.assertEqual(
+            sandbox_auth_headers(" secret-token "),
+            {"X-UCloud-Sandbox-Token": "secret-token"},
+        )
+
     def test_sync_client_lifecycle_and_exec(self) -> None:
         with running_gateway() as gateway:
             client = SandboxClient(gateway.base_url)
@@ -475,6 +496,7 @@ class FakeGatewayState:
         self.prepared_builders: dict[str, dict] = {}
         self.files: dict[tuple[str, str], bytes] = {}
         self.exec_counter = 0
+        self.last_headers: dict[str, str] = {}
 
     def next_exec_id(self) -> str:
         with self.lock:
@@ -490,6 +512,7 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
         return
 
     def do_GET(self) -> None:
+        self._record_headers()
         parsed = urlparse(self.path)
         path = parsed.path
         if path == "/healthz":
@@ -594,6 +617,7 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
         self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
+        self._record_headers()
         parsed = urlparse(self.path)
         path = parsed.path
         payload = self._read_json()
@@ -726,6 +750,7 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
         self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
     def do_PUT(self) -> None:
+        self._record_headers()
         parsed = urlparse(self.path)
         path = parsed.path
         sandbox_id = _sandbox_id_from_path(path)
@@ -752,6 +777,7 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
         self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
     def do_DELETE(self) -> None:
+        self._record_headers()
         path = urlparse(self.path).path
         sandbox_id = _sandbox_id_from_path(path)
         if sandbox_id is not None:
@@ -789,6 +815,12 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
         if length <= 0:
             return b""
         return self.rfile.read(length)
+
+    def _record_headers(self) -> None:
+        with self.state.lock:
+            self.state.last_headers = {
+                str(key): str(value) for key, value in self.headers.items()
+            }
 
     def _write_json(
         self,

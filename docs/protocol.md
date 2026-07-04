@@ -28,6 +28,11 @@ with `src/ucloud_sandboxes_sdk/client.py` when endpoints are added.
 - `POST /v1/builders/prepare`
 - `DELETE /v1/builders/prepare/<prepare-id>`
 
+Protected sandbox gateways expect the token in `X-UCloud-Sandbox-Token`.
+The Python clients set this when constructed with `api_token=...`. Avoid
+standard `Authorization` for UCloud public-link sandbox gateway calls because
+that header can be consumed before the request reaches the gateway service.
+
 ## Sandbox Resources
 
 Sandbox create requests are individually resource-shaped:

@@ -14,6 +14,7 @@ from .client import (
     SandboxSpec,
     SandboxSshSpec,
     SandboxSshTarget,
+    sandbox_auth_headers,
 )
 from .relay import (
     AsyncRelayWorkerClient,
@@ -25,7 +26,7 @@ from .relay import (
     model_relay_env,
 )
 
-__version__ = "0.2.2"
+__version__ = "0.2.6"
 
 __all__ = [
     "AsyncExecHandle",
@@ -42,6 +43,7 @@ __all__ = [
     "SandboxSpec",
     "SandboxSshSpec",
     "SandboxSshTarget",
+    "sandbox_auth_headers",
     "ModelRelayConfig",
     "RelayApiError",
     "RelayPollResult",
