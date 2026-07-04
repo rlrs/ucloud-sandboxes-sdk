@@ -47,6 +47,18 @@ sends a registry tag, `Image.from_name(...)` sends a gateway image id, and
 `Image.from_dockerfile(...)` carries build metadata for `build_image()`.
 The gateway owns placement and may return `503` while nodes are scaling up.
 
+The Inspect AI provider reads sandbox security settings from environment
+variables and passes them as `security` on `POST /v1/sandboxes`. Use
+`UCLOUD_SANDBOX_SECURITY` for a JSON object, or set individual fields with
+`UCLOUD_SANDBOX_SECURITY_USER`, `UCLOUD_SANDBOX_SECURITY_CAP_DROP`,
+`UCLOUD_SANDBOX_SECURITY_CAP_ADD`,
+`UCLOUD_SANDBOX_SECURITY_NO_NEW_PRIVILEGES`,
+`UCLOUD_SANDBOX_SECURITY_PIDS_LIMIT`,
+`UCLOUD_SANDBOX_SECURITY_READ_ONLY_ROOTFS`, and
+`UCLOUD_SANDBOX_SECURITY_INIT`. Empty `USER`, empty `CAP_DROP`, and
+`PIDS_LIMIT=none` are accepted when compatibility with root-oriented benchmark
+images is required.
+
 ## Images
 
 `POST /v1/images/build` accepts:

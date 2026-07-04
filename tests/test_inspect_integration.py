@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from ucloud_sandboxes_sdk import Image, SandboxApiError, SandboxSpec
+from ucloud_sandboxes_sdk import Image, SandboxApiError, SandboxSecuritySpec, SandboxSpec
 
 
 INSPECT_AVAILABLE = importlib.util.find_spec("inspect_ai") is not None
@@ -32,6 +33,111 @@ class _BuildCaptureClient:
 
 @unittest.skipUnless(INSPECT_AVAILABLE, "inspect-ai is not installed")
 class InspectIntegrationTests(unittest.TestCase):
+    def test_settings_from_env_parses_security_profile(self) -> None:
+        from ucloud_sandboxes_sdk.integrations import inspect as inspect_integration
+
+        with patch.dict(
+            os.environ,
+            {
+                "UCLOUD_SANDBOX_URL": "http://gateway.invalid",
+                "UCLOUD_SANDBOX_SECURITY": (
+                    '{"user":"0:0","cap_drop":[],"cap_add":["SYS_PTRACE"],'
+                    '"no_new_privileges":false,"pids_limit":null,'
+                    '"read_only_rootfs":true,"init":false}'
+                ),
+            },
+            clear=True,
+        ):
+            settings = inspect_integration._settings_from_env()
+
+        self.assertEqual(
+            settings.security,
+            SandboxSecuritySpec(
+                user="0:0",
+                cap_drop=(),
+                cap_add=("SYS_PTRACE",),
+                no_new_privileges=False,
+                pids_limit=None,
+                read_only_rootfs=True,
+                init=False,
+            ),
+        )
+
+    def test_settings_from_env_applies_security_field_overrides(self) -> None:
+        from ucloud_sandboxes_sdk.integrations import inspect as inspect_integration
+
+        with patch.dict(
+            os.environ,
+            {
+                "UCLOUD_SANDBOX_URL": "http://gateway.invalid",
+                "UCLOUD_SANDBOX_SECURITY_USER": "",
+                "UCLOUD_SANDBOX_SECURITY_CAP_DROP": "",
+                "UCLOUD_SANDBOX_SECURITY_CAP_ADD": "SYS_PTRACE, NET_ADMIN",
+                "UCLOUD_SANDBOX_SECURITY_NO_NEW_PRIVILEGES": "0",
+                "UCLOUD_SANDBOX_SECURITY_PIDS_LIMIT": "none",
+                "UCLOUD_SANDBOX_SECURITY_READ_ONLY_ROOTFS": "true",
+                "UCLOUD_SANDBOX_SECURITY_INIT": "false",
+            },
+            clear=True,
+        ):
+            settings = inspect_integration._settings_from_env()
+
+        self.assertEqual(
+            settings.security,
+            SandboxSecuritySpec(
+                user=None,
+                cap_drop=(),
+                cap_add=("SYS_PTRACE", "NET_ADMIN"),
+                no_new_privileges=False,
+                pids_limit=None,
+                read_only_rootfs=True,
+                init=False,
+            ),
+        )
+
+    def test_sample_init_passes_security_profile_to_create(self) -> None:
+        from ucloud_sandboxes_sdk.integrations import inspect as inspect_integration
+
+        captured: dict[str, SandboxSpec] = {}
+
+        class FakeClient:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+            async def close(self) -> None:
+                pass
+
+        async def fake_create(client, spec, *, settings):
+            del client, settings
+            captured["spec"] = spec
+            return object()
+
+        with (
+            patch.object(inspect_integration, "AsyncSandboxClient", FakeClient),
+            patch.object(inspect_integration, "_create_sandbox_with_wait", fake_create),
+            patch.dict(
+                os.environ,
+                {
+                    "UCLOUD_SANDBOX_URL": "http://gateway.invalid",
+                    "UCLOUD_SANDBOX_SECURITY_USER": "",
+                    "UCLOUD_SANDBOX_SECURITY_CAP_DROP": "",
+                    "UCLOUD_SANDBOX_SECURITY_NO_NEW_PRIVILEGES": "false",
+                },
+                clear=True,
+            ),
+        ):
+            asyncio.run(
+                inspect_integration.UCloudSandboxEnvironment.sample_init(
+                    "task",
+                    None,
+                    {"__sample_id__": 1},
+                )
+            )
+
+        self.assertEqual(captured["spec"].security.user, None)
+        self.assertEqual(captured["spec"].security.cap_drop, ())
+        self.assertFalse(captured["spec"].security.no_new_privileges)
+
     def test_create_sandbox_waits_through_scale_up_503(self) -> None:
         from ucloud_sandboxes_sdk.integrations import inspect as inspect_integration
 
@@ -601,6 +707,7 @@ def _settings(inspect_integration):
         network="none",
         ssh_enabled=False,
         ssh_user="root",
+        security=SandboxSecuritySpec(),
         start_timeout_seconds=5,
         build_timeout_seconds=5,
         retry_interval_seconds=0.0,

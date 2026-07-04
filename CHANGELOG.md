@@ -2,6 +2,11 @@
 
 This project uses semantic versioning.
 
+## 0.2.3 - 2026-07-04
+
+- Added Inspect AI environment configuration for sandbox security profiles.
+- Passed the configured Inspect security profile through to sandbox creation.
+
 ## 0.2.2 - 2026-07-04
 
 - Treated SDK image build timeouts as total build deadlines during polling.

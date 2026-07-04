@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 import errno
+import json
 from logging import getLogger
 import math
 import os
@@ -38,6 +39,7 @@ from ucloud_sandboxes_sdk import (
     AsyncSandboxHandle,
     Image,
     SandboxApiError,
+    SandboxSecuritySpec,
     SandboxSpec,
 )
 
@@ -71,6 +73,7 @@ class _InspectSettings:
     network: str
     ssh_enabled: bool
     ssh_user: str
+    security: SandboxSecuritySpec
     start_timeout_seconds: int
     build_timeout_seconds: int
     retry_interval_seconds: float
@@ -183,6 +186,7 @@ class UCloudSandboxEnvironment(SandboxEnvironment):
                         "enabled": settings.ssh_enabled,
                         "user": settings.ssh_user,
                     },
+                    security=settings.security,
                     labels=labels,
                 ),
                 settings=settings,
@@ -640,6 +644,7 @@ def _settings_from_env() -> _InspectSettings:
         network=os.environ.get("UCLOUD_SANDBOX_NETWORK", "none"),
         ssh_enabled=ssh_enabled,
         ssh_user=os.environ.get("UCLOUD_SANDBOX_SSH_USER", "root"),
+        security=_security_from_env(),
         start_timeout_seconds=(
             _int_env("UCLOUD_SANDBOX_START_TIMEOUT_SECONDS")
             or DEFAULT_START_TIMEOUT_SECONDS
@@ -655,6 +660,48 @@ def _settings_from_env() -> _InspectSettings:
         ),
         cpus_explicit=cpus is not None,
         memory_mb_explicit=memory_mb is not None,
+    )
+
+
+def _security_from_env() -> SandboxSecuritySpec:
+    data = SandboxSecuritySpec().to_dict()
+    raw_json = os.environ.get("UCLOUD_SANDBOX_SECURITY")
+    if raw_json:
+        try:
+            parsed = json.loads(raw_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError("UCLOUD_SANDBOX_SECURITY must be valid JSON.") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("UCLOUD_SANDBOX_SECURITY must be a JSON object.")
+        data.update(parsed)
+    if "UCLOUD_SANDBOX_SECURITY_USER" in os.environ:
+        data["user"] = _optional_string_env("UCLOUD_SANDBOX_SECURITY_USER")
+    if "UCLOUD_SANDBOX_SECURITY_CAP_DROP" in os.environ:
+        data["cap_drop"] = _csv_env("UCLOUD_SANDBOX_SECURITY_CAP_DROP")
+    if "UCLOUD_SANDBOX_SECURITY_CAP_ADD" in os.environ:
+        data["cap_add"] = _csv_env("UCLOUD_SANDBOX_SECURITY_CAP_ADD")
+    if "UCLOUD_SANDBOX_SECURITY_NO_NEW_PRIVILEGES" in os.environ:
+        data["no_new_privileges"] = _bool_env(
+            "UCLOUD_SANDBOX_SECURITY_NO_NEW_PRIVILEGES",
+            True,
+        )
+    if "UCLOUD_SANDBOX_SECURITY_PIDS_LIMIT" in os.environ:
+        data["pids_limit"] = _optional_int_env("UCLOUD_SANDBOX_SECURITY_PIDS_LIMIT")
+    if "UCLOUD_SANDBOX_SECURITY_READ_ONLY_ROOTFS" in os.environ:
+        data["read_only_rootfs"] = _bool_env(
+            "UCLOUD_SANDBOX_SECURITY_READ_ONLY_ROOTFS",
+            False,
+        )
+    if "UCLOUD_SANDBOX_SECURITY_INIT" in os.environ:
+        data["init"] = _bool_env("UCLOUD_SANDBOX_SECURITY_INIT", True)
+    return SandboxSecuritySpec(
+        user=_optional_string(data.get("user")),
+        cap_drop=_string_tuple(data.get("cap_drop")),
+        cap_add=_string_tuple(data.get("cap_add")),
+        no_new_privileges=_bool_value(data.get("no_new_privileges", True)),
+        pids_limit=_optional_int(data.get("pids_limit")),
+        read_only_rootfs=_bool_value(data.get("read_only_rootfs", False)),
+        init=_bool_value(data.get("init", True)),
     )
 
 
@@ -927,4 +974,56 @@ def _bool_env(name: str, default: bool) -> bool:
     value = os.environ.get(name)
     if value is None:
         return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+    return _bool_value(value)
+
+
+def _bool_value(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _optional_string_env(name: str) -> str | None:
+    return _optional_string(os.environ.get(name))
+
+
+def _optional_string(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _csv_env(name: str) -> tuple[str, ...]:
+    value = os.environ.get(name)
+    if value is None:
+        return ()
+    return tuple(item.strip() for item in value.split(",") if item.strip())
+
+
+def _string_tuple(value: object) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return tuple(item.strip() for item in value.split(",") if item.strip())
+    if isinstance(value, list):
+        return tuple(str(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(str(item) for item in value)
+    return (str(value),)
+
+
+def _optional_int_env(name: str) -> int | None:
+    return _optional_int(os.environ.get(name))
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() in {"", "none", "null"}:
+        return None
+    return int(value)

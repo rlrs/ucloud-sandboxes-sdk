@@ -368,6 +368,27 @@ are treated as total budgets; individual scale-up attempts and build-status
 polls are bounded by the remaining budget. After a builder accepts an image
 build, the provider waits by build ID instead of re-submitting the build.
 
+The Inspect provider passes a sandbox security profile into sandbox creation.
+By default it uses `SandboxSecuritySpec()`, which runs as `1000:1000`, drops all
+capabilities, enables `no-new-privileges`, uses `--init`, and sets a PID limit.
+Set `UCLOUD_SANDBOX_SECURITY` to a JSON object to override the profile:
+
+```bash
+export UCLOUD_SANDBOX_SECURITY='{"user":null,"cap_drop":[],"no_new_privileges":false,"pids_limit":null}'
+```
+
+The same fields can be set individually:
+
+```bash
+export UCLOUD_SANDBOX_SECURITY_USER=""                 # unset Docker --user
+export UCLOUD_SANDBOX_SECURITY_CAP_DROP=""             # comma-separated, empty means none
+export UCLOUD_SANDBOX_SECURITY_CAP_ADD="SYS_PTRACE"
+export UCLOUD_SANDBOX_SECURITY_NO_NEW_PRIVILEGES="0"
+export UCLOUD_SANDBOX_SECURITY_PIDS_LIMIT="none"
+export UCLOUD_SANDBOX_SECURITY_READ_ONLY_ROOTFS="false"
+export UCLOUD_SANDBOX_SECURITY_INIT="true"
+```
+
 Set `UCLOUD_SANDBOX_SSH=1` only for debug sandboxes whose images explicitly
 support an SSH server. Normal benchmark control uses exec and file APIs; model
 connectivity should use a relay environment as shown above.
