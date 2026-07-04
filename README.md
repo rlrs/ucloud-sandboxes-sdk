@@ -348,11 +348,14 @@ inspect eval task.py --sandbox ucloud
 ```
 
 The provider accepts `None`, a single-service Compose config, a Compose YAML
-file, or a Dockerfile. Compose `image`, `command`, and `environment` are mapped
-into a sandbox spec. Dockerfile configs call `build_image`; local build contexts
-are uploaded to the gateway. Inspect `read_file()` and `write_file()` use the
-gateway file endpoints. When the gateway reports that a sandbox or builder node
-is scaling up, the provider retries until the configured timeout expires.
+file, or a Dockerfile. Compose `image`, `build.context`, `build.dockerfile`,
+`command`, `environment`, `cpus`, `mem_limit`, and `working_dir` are mapped into
+a sandbox spec. Dockerfile configs and single-service Compose builds call
+`build_image`; local build contexts are uploaded to the gateway. Multi-service
+Compose is rejected until the UCloud node agent has project-level Compose
+support. Inspect `read_file()` and `write_file()` use the gateway file
+endpoints. When the gateway reports that a sandbox or builder node is scaling
+up, the provider retries until the configured timeout expires.
 
 Set `UCLOUD_SANDBOX_SSH=1` only for debug sandboxes whose images explicitly
 support an SSH server. Normal benchmark control uses exec and file APIs; model

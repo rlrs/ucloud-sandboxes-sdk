@@ -5,6 +5,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 import errno
 from logging import getLogger
+import math
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -66,6 +67,18 @@ class _InspectSettings:
     start_timeout_seconds: int
     build_timeout_seconds: int
     retry_interval_seconds: float
+    cpus_explicit: bool = False
+    memory_mb_explicit: bool = False
+
+
+@dataclass(frozen=True)
+class _SandboxLaunchPlan:
+    image: Image
+    command: list[str]
+    env: dict[str, str]
+    cpus: float | None = None
+    memory_mb: int | None = None
+    working_dir: str | None = None
 
 
 def sandbox_cleanup_startup() -> None:
@@ -121,7 +134,7 @@ class UCloudSandboxEnvironment(SandboxEnvironment):
         sandbox_id = _sandbox_id(task_name, metadata)
         client = AsyncSandboxClient(settings.base_url, headers=settings.headers)
         try:
-            image, command, env = await _image_command_env(
+            launch = await _sandbox_launch_plan(
                 client,
                 sandbox_id=sandbox_id,
                 config=config,
@@ -142,12 +155,20 @@ class UCloudSandboxEnvironment(SandboxEnvironment):
                 client,
                 SandboxSpec(
                     id=sandbox_id,
-                    image=image,
-                    command=command or ["sh", "-lc", "sleep 2147483647"],
-                    env=env,
-                    working_dir="/tmp",
-                    cpus=settings.cpus,
-                    memory_mb=settings.memory_mb,
+                    image=launch.image,
+                    command=launch.command or ["sh", "-lc", "sleep 2147483647"],
+                    env=launch.env,
+                    working_dir=launch.working_dir or "/tmp",
+                    cpus=(
+                        settings.cpus
+                        if settings.cpus_explicit
+                        else launch.cpus or settings.cpus
+                    ),
+                    memory_mb=(
+                        settings.memory_mb
+                        if settings.memory_mb_explicit
+                        else launch.memory_mb or settings.memory_mb
+                    ),
                     disk_mb=settings.disk_mb,
                     network=network,
                     ttl_seconds=settings.ttl_seconds,
@@ -341,20 +362,20 @@ class UCloudSandboxEnvironment(SandboxEnvironment):
             raise RuntimeError(f"Failed to parse file size for {file}") from exc
 
 
-async def _image_command_env(
+async def _sandbox_launch_plan(
     client: AsyncSandboxClient,
     *,
     sandbox_id: str,
     config: SandboxEnvironmentConfigType | None,
     default_image: Image,
     settings: _InspectSettings,
-) -> tuple[Image, list[str], dict[str, str]]:
+) -> _SandboxLaunchPlan:
     if config is None:
-        return default_image, [], {}
+        return _SandboxLaunchPlan(default_image, [], {})
     if is_dockerfile(config):
         path = Path(str(config))
         image = Image.from_dockerfile(
-            name=f"{sandbox_id}-image",
+            name=_compose_image_id(sandbox_id),
             tag=f"ucloud-inspect/{sandbox_id}:latest",
             context_path=path.parent or Path("."),
             dockerfile=path.name,
@@ -365,30 +386,126 @@ async def _image_command_env(
             image,
             settings=settings,
         )
-        return image, [], {}
+        return _SandboxLaunchPlan(image, [], {})
     if is_compose_yaml(config):
-        return _compose_image_command_env(parse_compose_yaml(config, multiple_services=False), default_image)
+        compose_path = Path(str(config))
+        return await _compose_launch_plan(
+            client,
+            sandbox_id=sandbox_id,
+            config=parse_compose_yaml(config, multiple_services=False),
+            default_image=default_image,
+            settings=settings,
+            compose_dir=compose_path.parent,
+        )
     if isinstance(config, ComposeConfig):
-        return _compose_image_command_env(config, default_image)
+        return await _compose_launch_plan(
+            client,
+            sandbox_id=sandbox_id,
+            config=config,
+            default_image=default_image,
+            settings=settings,
+            compose_dir=None,
+        )
     raise ValueError(
         f"Unrecognized config: {config}. Expected a compose file, Dockerfile, "
         "ComposeConfig object, or None."
     )
 
 
-def _compose_image_command_env(
+async def _compose_launch_plan(
+    client: AsyncSandboxClient,
+    *,
+    sandbox_id: str,
     config: ComposeConfig,
     default_image: Image,
-) -> tuple[Image, list[str], dict[str, str]]:
+    settings: _InspectSettings,
+    compose_dir: Path | None,
+) -> _SandboxLaunchPlan:
     services = getattr(config, "services", None)
     if not isinstance(services, dict) or not services:
-        return default_image, [], {}
-    service = services.get("default") or next(iter(services.values()))
-    raw_image = getattr(service, "image", None)
-    image = _registry_image(str(raw_image)) if raw_image else default_image
-    return image, _compose_command(getattr(service, "command", None)), _compose_env(
-        getattr(service, "environment", None)
+        return _SandboxLaunchPlan(default_image, [], {})
+    if len(services) > 1:
+        raise NotImplementedError(
+            "UCloud Inspect integration currently supports single-service Compose "
+            "configs only. Multi-service Compose needs node-agent project support."
+        )
+    service_name, service = (
+        ("default", services["default"])
+        if "default" in services
+        else next(iter(services.items()))
     )
+    raw_image = getattr(service, "image", None)
+    build = getattr(service, "build", None)
+    if build:
+        image = _compose_build_image(
+            sandbox_id=sandbox_id,
+            service_name=service_name,
+            service=service,
+            compose_dir=compose_dir,
+        )
+        await _build_image_with_wait(client, image, settings=settings)
+    else:
+        image = _registry_image(str(raw_image)) if raw_image else default_image
+    return _SandboxLaunchPlan(
+        image=image,
+        command=_compose_command(getattr(service, "command", None)),
+        env=_compose_env(getattr(service, "environment", None)),
+        cpus=_compose_cpus(service),
+        memory_mb=_compose_memory_mb(service),
+        working_dir=getattr(service, "working_dir", None),
+    )
+
+
+def _compose_build_image(
+    *,
+    sandbox_id: str,
+    service_name: str,
+    service: object,
+    compose_dir: Path | None,
+) -> Image:
+    build = getattr(service, "build", None)
+    context, dockerfile = _compose_build_context_and_dockerfile(build)
+    context_path = _resolve_compose_path(context, compose_dir)
+    dockerfile_path = Path(dockerfile)
+    if dockerfile_path.is_absolute():
+        try:
+            dockerfile = dockerfile_path.relative_to(context_path).as_posix()
+        except ValueError as exc:
+            raise ValueError(
+                "Compose build.dockerfile must be inside build.context when "
+                "uploading the build context to UCloud."
+            ) from exc
+    raw_image = getattr(service, "image", None)
+    return Image.from_dockerfile(
+        name=_compose_image_id(sandbox_id, service_name=service_name),
+        tag=str(raw_image) if raw_image else f"ucloud-inspect/{sandbox_id}:latest",
+        context_path=context_path,
+        dockerfile=dockerfile,
+        push=True,
+    )
+
+
+def _compose_build_context_and_dockerfile(build: object) -> tuple[str, str]:
+    if isinstance(build, str):
+        return build, "Dockerfile"
+    context = getattr(build, "context", None) or "."
+    dockerfile = getattr(build, "dockerfile", None) or "Dockerfile"
+    return str(context), str(dockerfile)
+
+
+def _resolve_compose_path(path: str, compose_dir: Path | None) -> Path:
+    raw = Path(path)
+    if raw.is_absolute():
+        return raw.resolve()
+    base = compose_dir if compose_dir is not None else Path(".")
+    return (base / raw).resolve()
+
+
+def _compose_image_id(sandbox_id: str, *, service_name: str = "default") -> str:
+    suffix = "image" if service_name == "default" else f"{service_name}-image"
+    suffix = re.sub(r"[^A-Za-z0-9_.-]+", "-", suffix).strip("_.-") or "image"
+    suffix = f"-{suffix}"[:63]
+    return f"{sandbox_id[:64 - len(suffix)]}{suffix}"
 
 
 def _compose_command(command: object) -> list[str]:
@@ -417,6 +534,63 @@ def _compose_env(environment: object) -> dict[str, str]:
     return {}
 
 
+def _compose_cpus(service: object) -> float | None:
+    cpus = getattr(service, "cpus", None)
+    if cpus is None:
+        cpus = _deploy_resource_value(service, "cpus")
+    if cpus is None:
+        return None
+    return float(cpus)
+
+
+def _compose_memory_mb(service: object) -> int | None:
+    memory = getattr(service, "mem_limit", None)
+    if memory is None:
+        memory = _deploy_resource_value(service, "memory")
+    if memory is None:
+        return None
+    return _parse_memory_mb(memory)
+
+
+def _deploy_resource_value(service: object, name: str) -> object:
+    deploy = getattr(service, "deploy", None)
+    resources = getattr(deploy, "resources", None)
+    limits = getattr(resources, "limits", None)
+    return getattr(limits, name, None)
+
+
+def _parse_memory_mb(value: object) -> int:
+    if isinstance(value, (int, float)):
+        return max(1, math.ceil(float(value) / (1024 * 1024)))
+    raw = str(value).strip().lower()
+    match = re.match(r"^(\d+(?:\.\d+)?)\s*([kmgt]?i?b?|b)?$", raw)
+    if match is None:
+        raise ValueError(f"invalid Compose memory value: {value!r}")
+    amount = float(match.group(1))
+    unit = match.group(2) or "b"
+    factors = {
+        "": 1,
+        "b": 1,
+        "k": 1024,
+        "kb": 1024,
+        "ki": 1024,
+        "kib": 1024,
+        "m": 1024**2,
+        "mb": 1024**2,
+        "mi": 1024**2,
+        "mib": 1024**2,
+        "g": 1024**3,
+        "gb": 1024**3,
+        "gi": 1024**3,
+        "gib": 1024**3,
+        "t": 1024**4,
+        "tb": 1024**4,
+        "ti": 1024**4,
+        "tib": 1024**4,
+    }
+    return max(1, math.ceil(amount * factors[unit] / (1024 * 1024)))
+
+
 def _settings_from_env() -> _InspectSettings:
     base_url = os.environ.get("UCLOUD_SANDBOX_URL") or os.environ.get(
         "UCLOUD_SANDBOX_BASE_URL"
@@ -430,14 +604,17 @@ def _settings_from_env() -> _InspectSettings:
     if token:
         headers["Authorization"] = f"Bearer {token}"
     ssh_enabled = _bool_env("UCLOUD_SANDBOX_SSH", False)
+    cpus = _float_env("UCLOUD_SANDBOX_CPUS")
+    memory_mb = _int_env("UCLOUD_SANDBOX_MEMORY_MB")
+    disk_mb = _int_env("UCLOUD_SANDBOX_DISK_MB")
     retry_interval = _float_env("UCLOUD_SANDBOX_RETRY_INTERVAL_SECONDS")
     return _InspectSettings(
         base_url=base_url,
         headers=headers,
         image=_registry_image(os.environ.get("UCLOUD_SANDBOX_IMAGE", DEFAULT_INSPECT_IMAGE)),
-        cpus=_float_env("UCLOUD_SANDBOX_CPUS") or DEFAULT_INSPECT_CPUS,
-        memory_mb=_int_env("UCLOUD_SANDBOX_MEMORY_MB") or DEFAULT_INSPECT_MEMORY_MB,
-        disk_mb=_int_env("UCLOUD_SANDBOX_DISK_MB") or DEFAULT_INSPECT_DISK_MB,
+        cpus=cpus or DEFAULT_INSPECT_CPUS,
+        memory_mb=memory_mb or DEFAULT_INSPECT_MEMORY_MB,
+        disk_mb=disk_mb or DEFAULT_INSPECT_DISK_MB,
         ttl_seconds=_int_env("UCLOUD_SANDBOX_TTL_SECONDS"),
         network=os.environ.get("UCLOUD_SANDBOX_NETWORK", "none"),
         ssh_enabled=ssh_enabled,
@@ -455,6 +632,8 @@ def _settings_from_env() -> _InspectSettings:
             if retry_interval is not None
             else DEFAULT_RETRY_INTERVAL_SECONDS
         ),
+        cpus_explicit=cpus is not None,
+        memory_mb_explicit=memory_mb is not None,
     )
 
 
