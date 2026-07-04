@@ -70,7 +70,13 @@ class SandboxSdkTests(unittest.TestCase):
                     context_path="/tmp/context",
                 )
             )
-            pulled = client.pull_image(Image.from_registry("busybox:latest"), image_id="busybox")
+            pulled = client.pull_image(
+                Image.from_registry("busybox:latest"),
+                image_id="busybox",
+                count=2,
+                cpus=1,
+                memory_mb=512,
+            )
             sandbox = client.create_sandbox(
                 id="snapshot-src",
                 image=Image.from_registry("busybox"),
@@ -274,12 +280,14 @@ class SandboxSdkTests(unittest.TestCase):
                 cpus=1,
                 memory_mb=1024,
                 disk_mb=2048,
+                image=Image.from_registry("busybox:latest"),
                 ttl_seconds=600,
             )
             listed = client.list_prepared_capacity()
             deleted = client.delete_prepared_capacity("sdk-prep")
 
         self.assertEqual(prepared["prepare"]["prepare_id"], "sdk-prep")
+        self.assertEqual(prepared["prepare"]["image"], "busybox:latest")
         self.assertEqual(prepared["demand"]["prepared_resources"]["vcpu"], 3.0)
         self.assertEqual(listed["prepared"][0]["count"], 3)
         self.assertEqual(deleted["deleted"]["prepare_id"], "sdk-prep")
@@ -650,6 +658,7 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
                 "resources": resources,
                 "count": count,
                 "total_resources": _scale_resources(resources, count),
+                "image": str(payload.get("image") or ""),
             }
             with self.state.lock:
                 self.state.prepared[prepare_id] = item

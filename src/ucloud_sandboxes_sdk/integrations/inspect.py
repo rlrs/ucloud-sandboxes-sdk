@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -15,7 +16,7 @@ import shutil
 import sys
 from tempfile import TemporaryDirectory
 import time
-from typing import Any, Iterator, Literal, overload
+from typing import Any, Iterator, Literal, Mapping, overload
 from uuid import uuid4
 
 from aiohttp import ClientError
@@ -53,6 +54,7 @@ DEFAULT_BUILD_TIMEOUT_SECONDS = 1800
 DEFAULT_RETRY_INTERVAL_SECONDS = 10.0
 DEFAULT_SCALE_UP_REQUEST_TIMEOUT_SECONDS = 30.0
 DEFAULT_BUILD_IMAGE_PREFIX = "ucloud-sandbox-registry:5000/ucloud-inspect"
+BUILD_CACHE_VERSION = "ucloud-inspect-build-v1"
 HARBOR_HARNESS_DIRS = ("/tests", "/logs/agent", "/logs/verifier", "/task", "/oracle")
 INSPECT_CREATED_BY = "inspect-ai"
 logger = getLogger(__name__)
@@ -385,11 +387,18 @@ async def _sandbox_launch_plan(
         return _SandboxLaunchPlan(default_image, [], {})
     if is_dockerfile(config):
         path = Path(str(config))
+        context_path = (path.parent or Path(".")).resolve()
+        dockerfile = path.name
+        image_id = _build_image_id(
+            context_path=context_path,
+            dockerfile=dockerfile,
+            service_name="default",
+        )
         image = Image.from_dockerfile(
-            name=_compose_image_id(sandbox_id),
-            tag=_generated_build_image_tag(sandbox_id),
-            context_path=path.parent or Path("."),
-            dockerfile=path.name,
+            name=image_id,
+            tag=_generated_build_image_tag(image_id),
+            context_path=context_path,
+            dockerfile=dockerfile,
             push=True,
         )
         await _build_image_with_wait(
@@ -487,12 +496,21 @@ def _compose_build_image(
                 "uploading the build context to UCloud."
             ) from exc
     raw_image = getattr(service, "image", None)
+    build_args = _compose_build_args(build)
+    image_id = _build_image_id(
+        context_path=context_path,
+        dockerfile=dockerfile,
+        service_name=service_name,
+        build_args=build_args,
+        tag=str(raw_image) if raw_image else "",
+    )
     return Image.from_dockerfile(
-        name=_compose_image_id(sandbox_id, service_name=service_name),
-        tag=str(raw_image) if raw_image else _generated_build_image_tag(sandbox_id),
+        name=image_id,
+        tag=str(raw_image) if raw_image else _generated_build_image_tag(image_id),
         context_path=context_path,
         dockerfile=dockerfile,
         push=True,
+        build_args=build_args,
     )
 
 
@@ -504,6 +522,13 @@ def _compose_build_context_and_dockerfile(build: object) -> tuple[str, str]:
     return str(context), str(dockerfile)
 
 
+def _compose_build_args(build: object) -> dict[str, str]:
+    args = getattr(build, "args", None) or getattr(build, "build_args", None) or {}
+    if not isinstance(args, Mapping):
+        return {}
+    return {str(key): str(value) for key, value in args.items()}
+
+
 def _resolve_compose_path(path: str, compose_dir: Path | None) -> Path:
     raw = Path(path)
     if raw.is_absolute():
@@ -512,20 +537,95 @@ def _resolve_compose_path(path: str, compose_dir: Path | None) -> Path:
     return (base / raw).resolve()
 
 
-def _compose_image_id(sandbox_id: str, *, service_name: str = "default") -> str:
-    suffix = "image" if service_name == "default" else f"{service_name}-image"
-    suffix = re.sub(r"[^A-Za-z0-9_.-]+", "-", suffix).strip("_.-") or "image"
-    suffix = f"-{suffix}"[:63]
-    return f"{sandbox_id[:64 - len(suffix)]}{suffix}"
+def _build_image_id(
+    *,
+    context_path: Path,
+    dockerfile: str,
+    service_name: str,
+    build_args: Mapping[str, str] | None = None,
+    tag: str = "",
+) -> str:
+    service = _docker_repository_component(service_name)[:24] or "default"
+    fingerprint = _build_context_fingerprint(
+        context_path=context_path,
+        dockerfile=dockerfile,
+        service_name=service_name,
+        build_args=build_args or {},
+        tag=tag,
+    )
+    image_id = f"ucloud-inspect-{service}-{fingerprint[:24]}"
+    return image_id[:64].strip("_.-") or f"ucloud-inspect-{fingerprint[:32]}"
 
 
-def _generated_build_image_tag(sandbox_id: str) -> str:
+def _build_context_fingerprint(
+    *,
+    context_path: Path,
+    dockerfile: str,
+    service_name: str,
+    build_args: Mapping[str, str],
+    tag: str,
+) -> str:
+    context_path = context_path.resolve()
+    digest = hashlib.sha256()
+    _hash_json(
+        digest,
+        {
+            "version": BUILD_CACHE_VERSION,
+            "dockerfile": dockerfile,
+            "service_name": service_name,
+            "build_args": {str(key): str(value) for key, value in sorted(build_args.items())},
+            "tag": tag,
+            "harbor_harness_dirs": HARBOR_HARNESS_DIRS,
+        },
+    )
+    if not context_path.is_dir():
+        _hash_text(digest, "missing-context", str(context_path))
+        return digest.hexdigest()
+    for path in sorted(context_path.rglob("*"), key=lambda item: item.relative_to(context_path).as_posix()):
+        rel = path.relative_to(context_path).as_posix()
+        try:
+            stat = path.lstat()
+        except OSError as exc:
+            _hash_text(digest, "unreadable", rel, type(exc).__name__)
+            continue
+        if path.is_symlink():
+            try:
+                target = os.readlink(path)
+            except OSError as exc:
+                target = f"<unreadable:{type(exc).__name__}>"
+            _hash_text(digest, "symlink", rel, target)
+            continue
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            _hash_text(digest, "special", rel, oct(stat.st_mode & 0o777))
+            continue
+        _hash_text(digest, "file", rel, oct(stat.st_mode & 0o777), str(stat.st_size))
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _hash_json(digest: Any, value: object) -> None:
+    digest.update(json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    digest.update(b"\0")
+
+
+def _hash_text(digest: Any, *parts: str) -> None:
+    for part in parts:
+        digest.update(part.encode("utf-8", "surrogateescape"))
+        digest.update(b"\0")
+
+
+def _generated_build_image_tag(image_id: str) -> str:
     prefix = (
         os.environ.get("UCLOUD_SANDBOX_BUILD_IMAGE_PREFIX")
         or os.environ.get("UCLOUD_SANDBOX_REGISTRY_PREFIX")
         or DEFAULT_BUILD_IMAGE_PREFIX
     )
-    return f"{prefix.rstrip('/')}/{_docker_repository_component(sandbox_id)}:latest"
+    return f"{prefix.rstrip('/')}/{_docker_repository_component(image_id)}:latest"
 
 
 def _docker_repository_component(value: str) -> str:
@@ -750,13 +850,22 @@ async def _build_image_with_wait(
     timeout_seconds = max(0, int(settings.build_timeout_seconds))
     deadline = time.monotonic() + timeout_seconds
     with _harbor_compatible_build_image(image) as build_image:
-        submitted = await _submit_image_build_with_recovery(
-            client,
-            build_image,
-            settings=settings,
-            deadline=deadline,
-            timeout_seconds=timeout_seconds,
-        )
+        cached = await _available_built_image(client, build_image)
+        if cached is not None:
+            return {
+                "status": "succeeded",
+                "cached": True,
+                "image": cached,
+            }
+        submitted = await _active_image_build(client, build_image)
+        if submitted is None:
+            submitted = await _submit_image_build_with_recovery(
+                client,
+                build_image,
+                settings=settings,
+                deadline=deadline,
+                timeout_seconds=timeout_seconds,
+            )
     build_id = str(submitted.get("build_id") or submitted.get("image_id") or "")
     remaining = deadline - time.monotonic()
     if remaining <= 0:
@@ -771,6 +880,73 @@ async def _build_image_with_wait(
             body={"build": build},
         )
     return build
+
+
+async def _available_built_image(
+    client: AsyncSandboxClient,
+    image: Image,
+) -> dict[str, Any] | None:
+    list_images = getattr(client, "list_images", None)
+    if not callable(list_images):
+        return None
+    spec = image.to_build_spec()
+    try:
+        images = await list_images()
+    except (SandboxApiError, ClientError, TimeoutError):
+        return None
+    for record in images:
+        if not isinstance(record, dict):
+            continue
+        if record.get("id") != spec.id or record.get("tag") != spec.tag:
+            continue
+        if _image_record_available_to_sandboxes(record):
+            return dict(record)
+    return None
+
+
+async def _active_image_build(
+    client: AsyncSandboxClient,
+    image: Image,
+) -> dict[str, Any] | None:
+    list_image_builds = getattr(client, "list_image_builds", None)
+    if not callable(list_image_builds):
+        return None
+    spec = image.to_build_spec()
+    try:
+        builds = await list_image_builds()
+    except (SandboxApiError, ClientError, TimeoutError):
+        return None
+    matches = [
+        record
+        for record in builds
+        if isinstance(record, dict)
+        and record.get("image_id") == spec.id
+        and record.get("tag") == spec.tag
+        and not _image_build_terminal(record)
+    ]
+    if not matches:
+        return None
+    return dict(
+        sorted(
+            matches,
+            key=lambda item: (
+                str(item.get("created_at") or ""),
+                str(item.get("build_id") or ""),
+            ),
+        )[-1]
+    )
+
+
+def _image_record_available_to_sandboxes(record: Mapping[str, Any]) -> bool:
+    return (
+        bool(record.get("available_to_sandboxes"))
+        or bool(record.get("pushed"))
+        or record.get("source") == "registry"
+    )
+
+
+def _image_build_terminal(record: Mapping[str, Any]) -> bool:
+    return str(record.get("status") or "").lower() in {"succeeded", "failed"}
 
 
 async def _submit_image_build_with_recovery(

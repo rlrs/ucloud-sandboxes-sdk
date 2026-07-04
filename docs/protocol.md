@@ -87,6 +87,15 @@ already exists on the gateway or builder VM.
 change and rolling `log_tail`. Large builds should pass `timeout_seconds` as
 the overall wait deadline and context-upload request timeout.
 
+The Inspect integration generates deterministic image ids for Dockerfile and
+single-service Compose builds. The id is derived from the Dockerfile, build
+context contents, build args, explicit Compose image tag if any, and the SDK's
+build compatibility version. Before uploading a local context, the provider
+checks `GET /v1/images` for a matching pushed image and `GET /v1/images/builds`
+for a matching active build. This keeps repeated Harbor/Inspect samples from
+rebuilding the same environment after a previous pushed build is available or
+while another client is already building it.
+
 Tracked build status is exposed through:
 
 ```text
@@ -166,6 +175,7 @@ Inspect `read_file()` and `write_file()` call these endpoints.
   "cpus": 1,
   "memory_mb": 2048,
   "disk_mb": 10240,
+  "image": "ucloud-sandbox-registry:5000/ucloud/python-base:latest",
   "ttl_seconds": 900
 }
 ```
@@ -176,6 +186,8 @@ Semantics:
 - The executing autoscaler consumes the signal after reacting to it.
 - It expires automatically at `ttl_seconds` if no cycle consumes it.
 - Deleting it removes the demand signal.
+- If `image` is set, the gateway opportunistically pulls that image onto
+  already-ready sandbox nodes that can fit the requested resources.
 - Future sandbox creation still uses the normal gateway placement path.
 
 SDK changes in this area should expose the gateway operation, return the

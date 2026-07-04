@@ -169,13 +169,16 @@ client.prepare_capacity(
     cpus=1,
     memory_mb=2048,
     disk_mb=10240,
+    image=Image.from_registry("ucloud-sandbox-registry:5000/ucloud/python-base:latest"),
     ttl_seconds=900,
 )
 ```
 
 The signal contributes `count * resources` to gateway demand until the
 executing autoscaler reacts and consumes it. The TTL is a cleanup bound for
-missed cycles or a stopped autoscaler. Cancel it early when a run is abandoned:
+missed cycles or a stopped autoscaler. If `image` is set, the gateway also tries
+to prewarm that image on already-ready sandbox nodes that can fit the requested
+resources. Cancel it early when a run is abandoned:
 
 ```python
 client.delete_prepared_capacity("mbpp-run")
@@ -282,6 +285,9 @@ id:
 client.pull_image(
     Image.from_registry("ucloud-sandbox-registry:5000/ucloud/python-base:latest"),
     image_id="python-base",
+    count=4,
+    cpus=1,
+    memory_mb=2048,
 )
 
 client.snapshot_sandbox(
@@ -356,7 +362,12 @@ a sandbox spec. Dockerfile configs and single-service Compose builds call
 tags use `UCLOUD_SANDBOX_BUILD_IMAGE_PREFIX`, falling back to
 `UCLOUD_SANDBOX_REGISTRY_PREFIX`, then
 `ucloud-sandbox-registry:5000/ucloud-inspect`. Explicit Compose `image:` values
-are preserved. For Dockerfile and Compose builds, the provider adds empty
+are preserved. Generated build image ids and tags are deterministic over the
+Dockerfile, build context, build args, explicit tag, and SDK compatibility
+version. Reusing an unchanged context across samples or runs reuses a pushed
+gateway image record; if another client already has the same build running, the
+provider waits for that build instead of submitting another copy of the context.
+For Dockerfile and Compose builds, the provider adds empty
 writable Harbor harness directories (`/tests`, `/logs/agent`, `/logs/verifier`,
 `/task`, and `/oracle`) in the built image without copying test files into the
 image. Multi-service Compose is rejected until the UCloud node agent has

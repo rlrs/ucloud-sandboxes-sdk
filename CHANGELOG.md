@@ -2,6 +2,20 @@
 
 This project uses semantic versioning.
 
+## 0.2.5 - 2026-07-04
+
+- Generated Inspect Dockerfile and Compose build image ids from a deterministic
+  build-context fingerprint instead of the random sandbox id.
+- Reused pushed gateway image records for matching deterministic Inspect build
+  ids and tags instead of submitting duplicate builds.
+- Joined matching active Inspect image builds instead of submitting and
+  uploading duplicate contexts.
+- Kept generated Inspect registry tags stable across samples and runs when the
+  Dockerfile, build context, build args, and SDK build compatibility version do
+  not change.
+- Added optional image prewarm parameters to capacity prepare and multi-node
+  image pull calls.
+
 ## 0.2.4 - 2026-07-04
 
 - Recovered Inspect image builds after transient disconnects during build

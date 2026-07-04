@@ -468,6 +468,7 @@ class SandboxClient:
         memory_mb: int | None = None,
         disk_mb: int | None = None,
         resources: Mapping[str, Any] | None = None,
+        image: Image | None = None,
         ttl_seconds: int = 900,
         prepare_id: str | None = None,
     ) -> JsonObject:
@@ -480,6 +481,7 @@ class SandboxClient:
                 memory_mb=memory_mb,
                 disk_mb=disk_mb,
                 resources=resources,
+                image=image,
                 ttl_seconds=ttl_seconds,
                 prepare_id=prepare_id,
             ),
@@ -845,10 +847,28 @@ class SandboxClient:
             )
         return _completed_build_payload(build)
 
-    def pull_image(self, image: Image, *, image_id: str | None = None) -> JsonObject:
-        payload: JsonObject = {"image": _image_pull_reference(image)}
-        if image_id is not None:
-            payload["id"] = image_id
+    def pull_image(
+        self,
+        image: Image,
+        *,
+        image_id: str | None = None,
+        count: int = 1,
+        cpus: float | None = None,
+        memory_mb: int | None = None,
+        disk_mb: int | None = None,
+        resources: Mapping[str, Any] | None = None,
+        sandbox_nodes_only: bool = True,
+    ) -> JsonObject:
+        payload = _image_pull_payload(
+            image,
+            image_id=image_id,
+            count=count,
+            cpus=cpus,
+            memory_mb=memory_mb,
+            disk_mb=disk_mb,
+            resources=resources,
+            sandbox_nodes_only=sandbox_nodes_only,
+        )
         return self._request_json("POST", "/v1/images/pull", payload=payload)
 
     def snapshot_sandbox(
@@ -1168,6 +1188,7 @@ class AsyncSandboxClient:
         memory_mb: int | None = None,
         disk_mb: int | None = None,
         resources: Mapping[str, Any] | None = None,
+        image: Image | None = None,
         ttl_seconds: int = 900,
         prepare_id: str | None = None,
     ) -> JsonObject:
@@ -1180,6 +1201,7 @@ class AsyncSandboxClient:
                 memory_mb=memory_mb,
                 disk_mb=disk_mb,
                 resources=resources,
+                image=image,
                 ttl_seconds=ttl_seconds,
                 prepare_id=prepare_id,
             ),
@@ -1548,10 +1570,28 @@ class AsyncSandboxClient:
             )
         return _completed_build_payload(build)
 
-    async def pull_image(self, image: Image, *, image_id: str | None = None) -> JsonObject:
-        payload: JsonObject = {"image": _image_pull_reference(image)}
-        if image_id is not None:
-            payload["id"] = image_id
+    async def pull_image(
+        self,
+        image: Image,
+        *,
+        image_id: str | None = None,
+        count: int = 1,
+        cpus: float | None = None,
+        memory_mb: int | None = None,
+        disk_mb: int | None = None,
+        resources: Mapping[str, Any] | None = None,
+        sandbox_nodes_only: bool = True,
+    ) -> JsonObject:
+        payload = _image_pull_payload(
+            image,
+            image_id=image_id,
+            count=count,
+            cpus=cpus,
+            memory_mb=memory_mb,
+            disk_mb=disk_mb,
+            resources=resources,
+            sandbox_nodes_only=sandbox_nodes_only,
+        )
         return await self._request_json("POST", "/v1/images/pull", payload=payload)
 
     async def snapshot_sandbox(
@@ -1827,6 +1867,7 @@ def _prepare_capacity_payload(
     memory_mb: int | None,
     disk_mb: int | None,
     resources: Mapping[str, Any] | None,
+    image: Image | None,
     ttl_seconds: int,
     prepare_id: str | None,
 ) -> JsonObject:
@@ -1836,6 +1877,37 @@ def _prepare_capacity_payload(
     }
     if prepare_id is not None:
         payload["id"] = prepare_id
+    if resources is not None:
+        payload["resources"] = dict(resources)
+    if cpus is not None:
+        payload["cpus"] = cpus
+    if memory_mb is not None:
+        payload["memory_mb"] = memory_mb
+    if disk_mb is not None:
+        payload["disk_mb"] = disk_mb
+    if image is not None:
+        payload["image"] = _image_pull_reference(image)
+    return payload
+
+
+def _image_pull_payload(
+    image: Image,
+    *,
+    image_id: str | None,
+    count: int,
+    cpus: float | None,
+    memory_mb: int | None,
+    disk_mb: int | None,
+    resources: Mapping[str, Any] | None,
+    sandbox_nodes_only: bool,
+) -> JsonObject:
+    payload: JsonObject = {
+        "image": _image_pull_reference(image),
+        "count": count,
+        "sandbox_nodes_only": sandbox_nodes_only,
+    }
+    if image_id is not None:
+        payload["id"] = image_id
     if resources is not None:
         payload["resources"] = dict(resources)
     if cpus is not None:
