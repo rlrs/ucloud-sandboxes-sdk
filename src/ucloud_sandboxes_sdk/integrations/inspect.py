@@ -14,6 +14,7 @@ import time
 from typing import Any, Literal, overload
 from uuid import uuid4
 
+from aiohttp import ClientError
 from inspect_ai.util import (
     ComposeConfig,
     ExecResult,
@@ -45,6 +46,7 @@ DEFAULT_INSPECT_DISK_MB = 10_240
 DEFAULT_START_TIMEOUT_SECONDS = 1800
 DEFAULT_BUILD_TIMEOUT_SECONDS = 1800
 DEFAULT_RETRY_INTERVAL_SECONDS = 10.0
+DEFAULT_BUILD_IMAGE_PREFIX = "ucloud-sandbox-registry:5000/ucloud-inspect"
 INSPECT_CREATED_BY = "inspect-ai"
 logger = getLogger(__name__)
 _running_sandboxes: ContextVar[list[tuple[str, str, dict[str, str]]]] = ContextVar(
@@ -376,7 +378,7 @@ async def _sandbox_launch_plan(
         path = Path(str(config))
         image = Image.from_dockerfile(
             name=_compose_image_id(sandbox_id),
-            tag=f"ucloud-inspect/{sandbox_id}:latest",
+            tag=_generated_build_image_tag(sandbox_id),
             context_path=path.parent or Path("."),
             dockerfile=path.name,
             push=True,
@@ -478,7 +480,7 @@ def _compose_build_image(
     raw_image = getattr(service, "image", None)
     return Image.from_dockerfile(
         name=_compose_image_id(sandbox_id, service_name=service_name),
-        tag=str(raw_image) if raw_image else f"ucloud-inspect/{sandbox_id}:latest",
+        tag=str(raw_image) if raw_image else _generated_build_image_tag(sandbox_id),
         context_path=context_path,
         dockerfile=dockerfile,
         push=True,
@@ -506,6 +508,20 @@ def _compose_image_id(sandbox_id: str, *, service_name: str = "default") -> str:
     suffix = re.sub(r"[^A-Za-z0-9_.-]+", "-", suffix).strip("_.-") or "image"
     suffix = f"-{suffix}"[:63]
     return f"{sandbox_id[:64 - len(suffix)]}{suffix}"
+
+
+def _generated_build_image_tag(sandbox_id: str) -> str:
+    prefix = (
+        os.environ.get("UCLOUD_SANDBOX_BUILD_IMAGE_PREFIX")
+        or os.environ.get("UCLOUD_SANDBOX_REGISTRY_PREFIX")
+        or DEFAULT_BUILD_IMAGE_PREFIX
+    )
+    return f"{prefix.rstrip('/')}/{_docker_repository_component(sandbox_id)}:latest"
+
+
+def _docker_repository_component(value: str) -> str:
+    component = re.sub(r"[^a-z0-9_.-]+", "-", value.lower()).strip("_.-")
+    return component or "image"
 
 
 def _compose_command(command: object) -> list[str]:
@@ -704,6 +720,14 @@ async def _retry_scale_up(
         except SandboxApiError as exc:
             if not _is_retryable_gateway_error(exc):
                 raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"Timed out waiting for UCloud {label} readiness "
+                    f"after {timeout_seconds}s and {attempts} attempt(s): {exc}"
+                ) from exc
+            await asyncio.sleep(min(retry_interval_seconds, remaining))
+        except ClientError as exc:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(

@@ -2,6 +2,12 @@
 
 This project uses semantic versioning.
 
+## 0.2.1 - 2026-07-04
+
+- Fixed generated Inspect build tags to default to the UCloud private registry.
+- Added `UCLOUD_SANDBOX_BUILD_IMAGE_PREFIX` for generated Inspect build tags.
+- Retried transient aiohttp client disconnects during sandbox and builder scale-up waits.
+
 ## 0.2.0 - 2026-07-04
 
 - Added Inspect AI support for Harbor-style single-service Compose builds.

@@ -5,6 +5,7 @@ import importlib.util
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 from ucloud_sandboxes_sdk import Image, SandboxApiError, SandboxSpec
 
@@ -161,6 +162,34 @@ class InspectIntegrationTests(unittest.TestCase):
         self.assertEqual(result, {"created": "sandbox-one"})
         self.assertEqual(client.attempts, 2)
 
+    def test_create_sandbox_retries_raw_aiohttp_disconnects(self) -> None:
+        from aiohttp import ServerDisconnectedError
+        from ucloud_sandboxes_sdk.integrations import inspect as inspect_integration
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.attempts = 0
+
+            async def create_sandbox(self, payload):
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise ServerDisconnectedError("Server disconnected")
+                return {"created": payload.id}
+
+        client = FakeClient()
+        settings = _settings(inspect_integration)
+
+        result = asyncio.run(
+            inspect_integration._create_sandbox_with_wait(
+                client,
+                _sandbox_spec(),
+                settings=settings,
+            )
+        )
+
+        self.assertEqual(result, {"created": "sandbox-one"})
+        self.assertEqual(client.attempts, 2)
+
     def test_sample_id_helpers_accept_numeric_metadata(self) -> None:
         from ucloud_sandboxes_sdk.integrations import inspect as inspect_integration
 
@@ -191,30 +220,34 @@ class InspectIntegrationTests(unittest.TestCase):
             sandbox_id = "s" * 59
             client = FakeClient()
 
-            launch = asyncio.run(
-                inspect_integration._sandbox_launch_plan(
-                    client,
-                    sandbox_id=sandbox_id,
-                    config=ComposeConfig(
-                        services={
-                            "default": ComposeService(
-                                build=ComposeBuild(context=str(context)),
-                                command="tail -f /dev/null",
-                                environment={"HARBOR": "1"},
-                                cpus=2.0,
-                                mem_limit="6144m",
-                            )
-                        }
-                    ),
-                    default_image=Image.from_registry("python:3.12-slim"),
-                    settings=_settings(inspect_integration),
+            with patch.dict("os.environ", {}, clear=True):
+                launch = asyncio.run(
+                    inspect_integration._sandbox_launch_plan(
+                        client,
+                        sandbox_id=sandbox_id,
+                        config=ComposeConfig(
+                            services={
+                                "default": ComposeService(
+                                    build=ComposeBuild(context=str(context)),
+                                    command="tail -f /dev/null",
+                                    environment={"HARBOR": "1"},
+                                    cpus=2.0,
+                                    mem_limit="6144m",
+                                )
+                            }
+                        ),
+                        default_image=Image.from_registry("python:3.12-slim"),
+                        settings=_settings(inspect_integration),
+                    )
                 )
-            )
 
         self.assertEqual(len(client.images), 1)
         build = client.images[0].to_build_spec()
         self.assertLessEqual(len(build.id), 64)
-        self.assertEqual(build.tag, f"ucloud-inspect/{sandbox_id}:latest")
+        self.assertEqual(
+            build.tag,
+            f"ucloud-sandbox-registry:5000/ucloud-inspect/{sandbox_id}:latest",
+        )
         self.assertEqual(build.context_path, str(context.resolve()))
         self.assertEqual(build.dockerfile, "Dockerfile")
         self.assertEqual(launch.image, client.images[0])
@@ -260,15 +293,16 @@ class InspectIntegrationTests(unittest.TestCase):
             )
             client = FakeClient()
 
-            launch = asyncio.run(
-                inspect_integration._sandbox_launch_plan(
-                    client,
-                    sandbox_id="inspect-task-sample-1234567890",
-                    config=str(compose_file),
-                    default_image=Image.from_registry("python:3.12-slim"),
-                    settings=_settings(inspect_integration),
+            with patch.dict("os.environ", {}, clear=True):
+                launch = asyncio.run(
+                    inspect_integration._sandbox_launch_plan(
+                        client,
+                        sandbox_id="inspect-task-sample-1234567890",
+                        config=str(compose_file),
+                        default_image=Image.from_registry("python:3.12-slim"),
+                        settings=_settings(inspect_integration),
+                    )
                 )
-            )
 
         self.assertEqual(len(client.images), 1)
         build = client.images[0].to_build_spec()
@@ -279,6 +313,50 @@ class InspectIntegrationTests(unittest.TestCase):
         self.assertEqual(launch.env, {"A": "B"})
         self.assertEqual(launch.cpus, 4.0)
         self.assertEqual(launch.memory_mb, 2048)
+
+    def test_generated_build_tag_uses_configured_private_registry_prefix(self) -> None:
+        from inspect_ai.util import ComposeBuild, ComposeConfig, ComposeService
+        from ucloud_sandboxes_sdk.integrations import inspect as inspect_integration
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.images: list[Image] = []
+
+            async def build_image(self, image, **_kwargs):
+                self.images.append(image)
+                return {"image": {"id": image.name}}
+
+        with TemporaryDirectory() as tmp_dir:
+            context = Path(tmp_dir) / "environment"
+            context.mkdir()
+            (context / "Dockerfile").write_text("FROM python:3.12-slim\n")
+            client = FakeClient()
+            with patch.dict(
+                "os.environ",
+                {"UCLOUD_SANDBOX_BUILD_IMAGE_PREFIX": "registry.local:5000/Inspect"},
+                clear=True,
+            ):
+                asyncio.run(
+                    inspect_integration._sandbox_launch_plan(
+                        client,
+                        sandbox_id="Inspect-Harbor-Sample-ABC123",
+                        config=ComposeConfig(
+                            services={
+                                "default": ComposeService(
+                                    build=ComposeBuild(context=str(context))
+                                )
+                            }
+                        ),
+                        default_image=Image.from_registry("python:3.12-slim"),
+                        settings=_settings(inspect_integration),
+                    )
+                )
+
+        build = client.images[0].to_build_spec()
+        self.assertEqual(
+            build.tag,
+            "registry.local:5000/Inspect/inspect-harbor-sample-abc123:latest",
+        )
 
     def test_multi_service_compose_is_rejected_for_now(self) -> None:
         from inspect_ai.util import ComposeConfig, ComposeService
