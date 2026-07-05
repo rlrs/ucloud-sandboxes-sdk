@@ -8,7 +8,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "2026-06-27T19:09:20.926462Z"
+exclude-newer = "2026-06-28T08:08:25.673106Z"
 exclude-newer-span = "P7D"
 
 [[package]]
@@ -2480,7 +2480,7 @@ wheels = [
 
 [[package]]
 name = "ucloud-sandboxes-sdk"
-version = "0.2.6"
+version = "0.2.7"
 source = { editable = "." }
 
 [package.optional-dependencies]

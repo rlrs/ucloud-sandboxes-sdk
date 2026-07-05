@@ -73,7 +73,7 @@ class _InspectSettings:
     memory_mb: int | None
     disk_mb: int | None
     ttl_seconds: int | None
-    network: str
+    network: str | None
     ssh_enabled: bool
     ssh_user: str
     security: SandboxSecuritySpec
@@ -92,6 +92,7 @@ class _SandboxLaunchPlan:
     cpus: float | None = None
     memory_mb: int | None = None
     working_dir: str | None = None
+    network: str | None = None
 
 
 def sandbox_cleanup_startup() -> None:
@@ -161,7 +162,7 @@ class UCloudSandboxEnvironment(SandboxEnvironment):
             sample_id = metadata.get("__sample_id__")
             if sample_id is not None:
                 labels["inspect_sample_id"] = _label_value(sample_id)
-            network = settings.network
+            network = settings.network or launch.network or "none"
             if settings.ssh_enabled and network == "none":
                 network = "bridge"
             handle = await _create_sandbox_with_wait(
@@ -474,6 +475,7 @@ async def _compose_launch_plan(
         cpus=_compose_cpus(service),
         memory_mb=_compose_memory_mb(service),
         working_dir=getattr(service, "working_dir", None),
+        network=_compose_network_mode(service),
     )
 
 
@@ -678,6 +680,14 @@ def _compose_memory_mb(service: object) -> int | None:
     return _parse_memory_mb(memory)
 
 
+def _compose_network_mode(service: object) -> str | None:
+    value = getattr(service, "network_mode", None)
+    if value is None:
+        return None
+    network = str(value).strip()
+    return network or None
+
+
 def _deploy_resource_value(service: object, name: str) -> object:
     deploy = getattr(service, "deploy", None)
     resources = getattr(deploy, "resources", None)
@@ -741,7 +751,7 @@ def _settings_from_env() -> _InspectSettings:
         memory_mb=memory_mb or DEFAULT_INSPECT_MEMORY_MB,
         disk_mb=disk_mb or DEFAULT_INSPECT_DISK_MB,
         ttl_seconds=_int_env("UCLOUD_SANDBOX_TTL_SECONDS"),
-        network=os.environ.get("UCLOUD_SANDBOX_NETWORK", "none"),
+        network=os.environ.get("UCLOUD_SANDBOX_NETWORK"),
         ssh_enabled=ssh_enabled,
         ssh_user=os.environ.get("UCLOUD_SANDBOX_SSH_USER", "root"),
         security=_security_from_env(),

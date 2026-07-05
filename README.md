@@ -361,10 +361,11 @@ inspect eval task.py --sandbox ucloud
 
 The provider accepts `None`, a single-service Compose config, a Compose YAML
 file, or a Dockerfile. Compose `image`, `build.context`, `build.dockerfile`,
-`command`, `environment`, `cpus`, `mem_limit`, and `working_dir` are mapped into
-a sandbox spec. Dockerfile configs and single-service Compose builds call
-`build_image`; local build contexts are uploaded to the gateway. Generated build
-tags use `UCLOUD_SANDBOX_BUILD_IMAGE_PREFIX`, falling back to
+`command`, `environment`, `cpus`, `mem_limit`, `working_dir`, and
+`network_mode` are mapped into a sandbox spec. `UCLOUD_SANDBOX_NETWORK`
+overrides Compose networking when set. Dockerfile configs and single-service
+Compose builds call `build_image`; local build contexts are uploaded to the
+gateway. Generated build tags use `UCLOUD_SANDBOX_BUILD_IMAGE_PREFIX`, falling back to
 `UCLOUD_SANDBOX_REGISTRY_PREFIX`, then
 `ucloud-sandbox-registry:5000/ucloud-inspect`. Explicit Compose `image:` values
 are preserved. Generated build image ids and tags are deterministic over the

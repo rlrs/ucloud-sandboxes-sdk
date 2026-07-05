@@ -151,6 +151,68 @@ class InspectIntegrationTests(unittest.TestCase):
         self.assertEqual(captured["spec"].security.cap_drop, ())
         self.assertFalse(captured["spec"].security.no_new_privileges)
 
+    def test_sample_init_uses_compose_network_mode_unless_env_overrides(self) -> None:
+        from inspect_ai.util import ComposeConfig, ComposeService
+        from ucloud_sandboxes_sdk.integrations import inspect as inspect_integration
+
+        captured: list[SandboxSpec] = []
+
+        class FakeClient:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+            async def close(self) -> None:
+                pass
+
+        async def fake_create(client, spec, *, settings):
+            del client, settings
+            captured.append(spec)
+            return object()
+
+        config = ComposeConfig(
+            services={
+                "default": ComposeService(
+                    image="python:3.12-slim",
+                    network_mode="bridge",
+                )
+            }
+        )
+
+        with (
+            patch.object(inspect_integration, "AsyncSandboxClient", FakeClient),
+            patch.object(inspect_integration, "_create_sandbox_with_wait", fake_create),
+        ):
+            with patch.dict(
+                os.environ,
+                {"UCLOUD_SANDBOX_URL": "http://gateway.invalid"},
+                clear=True,
+            ):
+                asyncio.run(
+                    inspect_integration.UCloudSandboxEnvironment.sample_init(
+                        "task",
+                        config,
+                        {"__sample_id__": "compose-network"},
+                    )
+                )
+            with patch.dict(
+                os.environ,
+                {
+                    "UCLOUD_SANDBOX_URL": "http://gateway.invalid",
+                    "UCLOUD_SANDBOX_NETWORK": "none",
+                },
+                clear=True,
+            ):
+                asyncio.run(
+                    inspect_integration.UCloudSandboxEnvironment.sample_init(
+                        "task",
+                        config,
+                        {"__sample_id__": "env-network"},
+                    )
+                )
+
+        self.assertEqual(captured[0].network, "bridge")
+        self.assertEqual(captured[1].network, "none")
+
     def test_create_sandbox_waits_through_scale_up_503(self) -> None:
         from ucloud_sandboxes_sdk.integrations import inspect as inspect_integration
 
@@ -665,6 +727,7 @@ class InspectIntegrationTests(unittest.TestCase):
                                     environment={"HARBOR": "1"},
                                     cpus=2.0,
                                     mem_limit="6144m",
+                                    network_mode="bridge",
                                 )
                             }
                         ),
@@ -691,6 +754,7 @@ class InspectIntegrationTests(unittest.TestCase):
         self.assertEqual(launch.env, {"HARBOR": "1"})
         self.assertEqual(launch.cpus, 2.0)
         self.assertEqual(launch.memory_mb, 6144)
+        self.assertEqual(launch.network, "bridge")
 
     def test_generated_compose_build_identity_is_stable_across_sandboxes(self) -> None:
         from inspect_ai.util import ComposeBuild, ComposeConfig, ComposeService
@@ -956,7 +1020,7 @@ def _settings(inspect_integration):
         memory_mb=2048,
         disk_mb=10240,
         ttl_seconds=None,
-        network="none",
+        network=None,
         ssh_enabled=False,
         ssh_user="root",
         security=SandboxSecuritySpec(),

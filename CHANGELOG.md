@@ -2,6 +2,12 @@
 
 This project uses semantic versioning.
 
+## 0.2.7 - 2026-07-05
+
+- Mapped single-service Compose `network_mode` into sandbox networking.
+- Kept `UCLOUD_SANDBOX_NETWORK` as an explicit override over Compose
+  networking when it is set.
+
 ## 0.2.6 - 2026-07-04
 
 - Added `api_token` to sync and async sandbox clients, sent as
