@@ -2,6 +2,13 @@
 
 This project uses semantic versioning.
 
+## 0.2.8 - 2026-07-06
+
+- Retried transient UCloud public-link `503` responses that return the
+  UCloud `Job is unavailable` HTML page during normal SDK API calls.
+- Kept ordinary structured gateway `503` responses non-retryable in the
+  generic request layer so scale-up and capacity errors still surface cleanly.
+
 ## 0.2.7 - 2026-07-05
 
 - Mapped single-service Compose `network_mode` into sandbox networking.

@@ -2480,7 +2480,7 @@ wheels = [
 
 [[package]]
 name = "ucloud-sandboxes-sdk"
-version = "0.2.7"
+version = "0.2.8"
 source = { editable = "." }
 
 [package.optional-dependencies]

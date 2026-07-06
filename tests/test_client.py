@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Iterator
 from contextlib import contextmanager
+import io
 import json
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -273,6 +274,64 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 403)
         self.assertEqual(raised.exception.body, {"error": "image builds disabled"})
 
+    def test_sync_client_retries_ucloud_unavailable_html(self) -> None:
+        class FakeResponse:
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"ok": true}'
+
+        calls: list[str] = []
+        html = b"<!doctype html><title>Job is unavailable | UCloud</title>"
+
+        def fake_urlopen(req: object, timeout: object = None) -> FakeResponse:
+            calls.append(str(getattr(req, "full_url", "")))
+            if len(calls) == 1:
+                raise client_module.error.HTTPError(
+                    calls[-1],
+                    503,
+                    "Service Unavailable",
+                    {},
+                    io.BytesIO(html),
+                )
+            return FakeResponse()
+
+        client = SandboxClient("http://gateway.invalid")
+        with patch.object(client_module.request, "urlopen", fake_urlopen), patch.object(
+            client_module.time,
+            "sleep",
+            lambda _delay: None,
+        ):
+            health = client.health()
+
+        self.assertEqual(health, {"ok": True})
+        self.assertEqual(len(calls), 2)
+
+    def test_sync_client_does_not_retry_normal_json_503(self) -> None:
+        calls: list[str] = []
+
+        def fake_urlopen(req: object, timeout: object = None) -> object:
+            calls.append(str(getattr(req, "full_url", "")))
+            raise client_module.error.HTTPError(
+                calls[-1],
+                503,
+                "Service Unavailable",
+                {},
+                io.BytesIO(b'{"error": "no ready node has resources"}'),
+            )
+
+        client = SandboxClient("http://gateway.invalid")
+        with patch.object(client_module.request, "urlopen", fake_urlopen):
+            with self.assertRaises(SandboxApiError) as raised:
+                client.health()
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(len(calls), 1)
+
     def test_sync_client_rejects_legacy_image_patterns(self) -> None:
         client = SandboxClient("http://gateway.invalid")
 
@@ -453,6 +512,49 @@ class SandboxSdkTests(unittest.TestCase):
         timeouts = asyncio.run(scenario())
 
         self.assertEqual([_timeout_total(timeout) for timeout in timeouts], [123, 11])
+
+    def test_async_client_retries_ucloud_unavailable_html(self) -> None:
+        class FakeResponse:
+            def __init__(self, status: int, body: str) -> None:
+                self.status = status
+                self.body = body
+
+            async def __aenter__(self) -> "FakeResponse":
+                return self
+
+            async def __aexit__(self, *args: object) -> None:
+                return None
+
+            async def text(self) -> str:
+                return self.body
+
+        class FakeSession:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def request(self, _method: object, _url: object, **_kwargs: object) -> FakeResponse:
+                self.calls += 1
+                if self.calls == 1:
+                    return FakeResponse(
+                        503,
+                        "<!doctype html><title>Job is unavailable | UCloud</title>",
+                    )
+                return FakeResponse(200, '{"ok": true}')
+
+        async def no_sleep(_delay: float) -> None:
+            return None
+
+        async def scenario() -> tuple[dict, int]:
+            session = FakeSession()
+            client = AsyncSandboxClient("http://gateway.invalid", session=session)
+            with patch.object(client_module.asyncio, "sleep", no_sleep):
+                health = await client.health()
+            return health, session.calls
+
+        health, calls = asyncio.run(scenario())
+
+        self.assertEqual(health, {"ok": True})
+        self.assertEqual(calls, 2)
 
 
 def _timeout_total(timeout: object) -> object:

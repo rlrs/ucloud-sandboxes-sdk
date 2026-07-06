@@ -16,6 +16,10 @@ from urllib import error, parse, request
 JsonObject = dict[str, Any]
 TERMINAL_EXEC_STATUSES = {"exited", "failed"}
 SANDBOX_TOKEN_HEADER = "X-UCloud-Sandbox-Token"
+UCLOUD_UNAVAILABLE_STATUS = 503
+UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS = 6
+UCLOUD_UNAVAILABLE_RETRY_BASE_DELAY_SECONDS = 0.25
+UCLOUD_UNAVAILABLE_RETRY_MAX_DELAY_SECONDS = 4.0
 
 
 class SandboxApiError(RuntimeError):
@@ -911,52 +915,62 @@ class SandboxClient:
             headers["Content-Type"] = "application/json"
         elif content_type is not None:
             headers["Content-Type"] = content_type
-        req = request.Request(
-            self.base_url + path,
-            data=raw_body,
-            method=method,
-            headers=headers,
-        )
         timeout = self.timeout_seconds if timeout_seconds is None else timeout_seconds
-        try:
-            with request.urlopen(req, timeout=timeout) as response:
-                raw = response.read().decode("utf-8")
-                decoded = json.loads(raw) if raw else {}
-        except error.HTTPError as exc:
-            raw = exc.read().decode("utf-8", errors="replace")
-            exc.close()
-            decoded = _decode_json_error(raw)
-            raise SandboxApiError(
-                f"node-agent request failed ({exc.code}): {decoded}",
-                status_code=exc.code,
-                body=decoded,
-            ) from exc
-        except (OSError, json.JSONDecodeError) as exc:
-            raise SandboxApiError(f"node-agent request failed: {exc}") from exc
-        if not isinstance(decoded, dict):
-            raise SandboxApiError("node-agent returned a non-object JSON payload", body=decoded)
-        return decoded
+        for attempt in range(UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS):
+            req = request.Request(
+                self.base_url + path,
+                data=raw_body,
+                method=method,
+                headers=headers,
+            )
+            try:
+                with request.urlopen(req, timeout=timeout) as response:
+                    raw = response.read().decode("utf-8")
+                    decoded = json.loads(raw) if raw else {}
+            except error.HTTPError as exc:
+                raw = exc.read().decode("utf-8", errors="replace")
+                exc.close()
+                decoded = _decode_json_error(raw)
+                if _should_retry_ucloud_unavailable(exc.code, decoded, attempt):
+                    time.sleep(_ucloud_unavailable_retry_delay(attempt))
+                    continue
+                raise SandboxApiError(
+                    f"node-agent request failed ({exc.code}): {decoded}",
+                    status_code=exc.code,
+                    body=decoded,
+                ) from exc
+            except (OSError, json.JSONDecodeError) as exc:
+                raise SandboxApiError(f"node-agent request failed: {exc}") from exc
+            if not isinstance(decoded, dict):
+                raise SandboxApiError("node-agent returned a non-object JSON payload", body=decoded)
+            return decoded
+        raise AssertionError("unreachable UCloud unavailable retry state")
 
     def _request_bytes(self, method: str, path: str) -> bytes:
-        req = request.Request(
-            self.base_url + path,
-            method=method,
-            headers=dict(self.headers),
-        )
-        try:
-            with request.urlopen(req, timeout=self.timeout_seconds) as response:
-                return response.read()
-        except error.HTTPError as exc:
-            raw = exc.read().decode("utf-8", errors="replace")
-            exc.close()
-            decoded = _decode_json_error(raw)
-            raise SandboxApiError(
-                f"node-agent request failed ({exc.code}): {decoded}",
-                status_code=exc.code,
-                body=decoded,
-            ) from exc
-        except OSError as exc:
-            raise SandboxApiError(f"node-agent request failed: {exc}") from exc
+        for attempt in range(UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS):
+            req = request.Request(
+                self.base_url + path,
+                method=method,
+                headers=dict(self.headers),
+            )
+            try:
+                with request.urlopen(req, timeout=self.timeout_seconds) as response:
+                    return response.read()
+            except error.HTTPError as exc:
+                raw = exc.read().decode("utf-8", errors="replace")
+                exc.close()
+                decoded = _decode_json_error(raw)
+                if _should_retry_ucloud_unavailable(exc.code, decoded, attempt):
+                    time.sleep(_ucloud_unavailable_retry_delay(attempt))
+                    continue
+                raise SandboxApiError(
+                    f"node-agent request failed ({exc.code}): {decoded}",
+                    status_code=exc.code,
+                    body=decoded,
+                ) from exc
+            except OSError as exc:
+                raise SandboxApiError(f"node-agent request failed: {exc}") from exc
+        raise AssertionError("unreachable UCloud unavailable retry state")
 
 
 @dataclass
@@ -1651,47 +1665,65 @@ class AsyncSandboxClient:
         timeout = _aiohttp_timeout(
             self.timeout_seconds if timeout_seconds is None else timeout_seconds
         )
-        async with client.request(
-            method,
-            self.base_url + path,
-            json=payload,
-            data=body,
-            headers=headers,
-            timeout=timeout,
-        ) as response:
-            raw = await response.text()
-            try:
-                decoded = json.loads(raw) if raw else {}
-            except json.JSONDecodeError:
-                decoded = {"error": raw}
-            if response.status >= 400:
-                raise SandboxApiError(
-                    f"node-agent request failed ({response.status}): {decoded}",
-                    status_code=response.status,
-                    body=decoded,
-                )
-        if not isinstance(decoded, dict):
-            raise SandboxApiError("node-agent returned a non-object JSON payload", body=decoded)
-        return decoded
+        for attempt in range(UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS):
+            async with client.request(
+                method,
+                self.base_url + path,
+                json=payload,
+                data=body,
+                headers=headers,
+                timeout=timeout,
+            ) as response:
+                raw = await response.text()
+                try:
+                    decoded = json.loads(raw) if raw else {}
+                except json.JSONDecodeError:
+                    decoded = {"error": raw}
+                if response.status >= 400:
+                    if _should_retry_ucloud_unavailable(
+                        response.status,
+                        decoded,
+                        attempt,
+                    ):
+                        await asyncio.sleep(_ucloud_unavailable_retry_delay(attempt))
+                        continue
+                    raise SandboxApiError(
+                        f"node-agent request failed ({response.status}): {decoded}",
+                        status_code=response.status,
+                        body=decoded,
+                    )
+            if not isinstance(decoded, dict):
+                raise SandboxApiError("node-agent returned a non-object JSON payload", body=decoded)
+            return decoded
+        raise AssertionError("unreachable UCloud unavailable retry state")
 
     async def _request_bytes(self, method: str, path: str) -> bytes:
         client = await self._client()
-        async with client.request(
-            method,
-            self.base_url + path,
-            headers=dict(self.headers),
-            timeout=_aiohttp_timeout(self.timeout_seconds),
-        ) as response:
-            raw = await response.read()
-            if response.status >= 400:
-                text = raw.decode("utf-8", errors="replace")
-                decoded = _decode_json_error(text)
-                raise SandboxApiError(
-                    f"node-agent request failed ({response.status}): {decoded}",
-                    status_code=response.status,
-                    body=decoded,
-                )
-            return raw
+        for attempt in range(UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS):
+            async with client.request(
+                method,
+                self.base_url + path,
+                headers=dict(self.headers),
+                timeout=_aiohttp_timeout(self.timeout_seconds),
+            ) as response:
+                raw = await response.read()
+                if response.status >= 400:
+                    text = raw.decode("utf-8", errors="replace")
+                    decoded = _decode_json_error(text)
+                    if _should_retry_ucloud_unavailable(
+                        response.status,
+                        decoded,
+                        attempt,
+                    ):
+                        await asyncio.sleep(_ucloud_unavailable_retry_delay(attempt))
+                        continue
+                    raise SandboxApiError(
+                        f"node-agent request failed ({response.status}): {decoded}",
+                        status_code=response.status,
+                        body=decoded,
+                    )
+                return raw
+        raise AssertionError("unreachable UCloud unavailable retry state")
 
 
 def _sandbox_payload(
@@ -1978,6 +2010,37 @@ def _decode_json_error(raw: str) -> object:
         return json.loads(raw) if raw else {}
     except json.JSONDecodeError:
         return {"error": raw}
+
+
+def _should_retry_ucloud_unavailable(
+    status_code: int,
+    body: object,
+    attempt: int,
+) -> bool:
+    if attempt >= UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS - 1:
+        return False
+    if status_code != UCLOUD_UNAVAILABLE_STATUS:
+        return False
+    text = _ucloud_unavailable_error_text(body).lower()
+    return "job is unavailable" in text and "ucloud" in text
+
+
+def _ucloud_unavailable_error_text(body: object) -> str:
+    if isinstance(body, str):
+        return body
+    if isinstance(body, dict):
+        values = []
+        for key in ("error", "message", "detail", "upstream_body_preview"):
+            value = body.get(key)
+            if isinstance(value, str):
+                values.append(value)
+        return "\n".join(values)
+    return ""
+
+
+def _ucloud_unavailable_retry_delay(attempt: int) -> float:
+    delay = UCLOUD_UNAVAILABLE_RETRY_BASE_DELAY_SECONDS * (2**attempt)
+    return min(UCLOUD_UNAVAILABLE_RETRY_MAX_DELAY_SECONDS, delay)
 
 
 def _exec_result(
