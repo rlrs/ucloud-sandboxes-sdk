@@ -7,6 +7,8 @@ This project uses semantic versioning.
 - Streamed deterministic build contexts to a content-addressed binary upload
   endpoint before submitting compact build JSON, with transparent fallback to
   the legacy base64 request for older gateways.
+- Probed content-addressed build contexts before upload so repeated identical
+  builds reuse the gateway copy without retransmitting it.
 - Added rollout registration-token fencing to sync and async relay worker
   clients and carried the token on leased requests.
 - Rejected credentialed HTTP and SSH-websocket redirects instead of forwarding

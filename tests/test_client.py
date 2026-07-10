@@ -316,7 +316,7 @@ class SandboxSdkTests(unittest.TestCase):
             first["image"]["received_context_digest"],
             second["image"]["received_context_digest"],
         )
-        self.assertEqual(gateway.state.build_context_upload_results, [True, False])
+        self.assertEqual(gateway.state.build_context_upload_results, [True])
         self.assertEqual(len(gateway.state.build_contexts), 1)
 
     def test_sync_client_falls_back_to_legacy_build_context_json(self) -> None:
@@ -344,7 +344,22 @@ class SandboxSdkTests(unittest.TestCase):
             (context / "Dockerfile").write_text("FROM busybox\n", encoding="utf-8")
             client = SandboxClient("http://gateway.invalid")
 
-            with patch.object(client_module, "MAX_FILE_BODY_BYTES", 1):
+            def missing_context(req: object, timeout: object = None) -> object:
+                del timeout
+                url = str(getattr(req, "full_url", ""))
+                raise client_module.error.HTTPError(
+                    url,
+                    404,
+                    "Not Found",
+                    {},
+                    io.BytesIO(b'{"error": "not found"}'),
+                )
+
+            with patch.object(client_module, "MAX_FILE_BODY_BYTES", 1), patch.object(
+                client_module,
+                "open_no_redirect",
+                missing_context,
+            ):
                 with self.assertRaisesRegex(SandboxApiError, "request body exceeds"):
                     client.submit_image_build(
                         Image.from_dockerfile(
@@ -376,7 +391,16 @@ class SandboxSdkTests(unittest.TestCase):
         def fake_urlopen(req: object, timeout: object = None) -> FakeResponse:
             del timeout
             url = str(getattr(req, "full_url", ""))
-            if "/v1/image-contexts/" in url:
+            method = str(getattr(req, "get_method")())
+            if "/v1/image-contexts/" in url and method == "GET":
+                raise client_module.error.HTTPError(
+                    url,
+                    404,
+                    "Not Found",
+                    {},
+                    io.BytesIO(b'{"error": "not found"}'),
+                )
+            if "/v1/image-contexts/" in url and method == "PUT":
                 source = getattr(req, "data")
                 uploads.append(source.read())
                 if len(uploads) == 1:
@@ -465,6 +489,31 @@ class SandboxSdkTests(unittest.TestCase):
             self.assertTrue(all(member.mtime == 0 for member in members))
             self.assertTrue(all(member.uid == 0 for member in members))
             self.assertTrue(all(member.gid == 0 for member in members))
+
+    def test_build_context_probe_requires_exact_digest_and_size(self) -> None:
+        digest = "sha256:" + "a" * 64
+
+        self.assertTrue(
+            client_module._build_context_reference_matches(
+                {"digest": digest, "size": 123},
+                digest=digest,
+                size=123,
+            )
+        )
+        self.assertFalse(
+            client_module._build_context_reference_matches(
+                {"digest": "sha256:" + "b" * 64, "size": 123},
+                digest=digest,
+                size=123,
+            )
+        )
+        self.assertFalse(
+            client_module._build_context_reference_matches(
+                {"digest": digest, "size": 122},
+                digest=digest,
+                size=123,
+            )
+        )
 
     def test_sync_client_can_submit_and_poll_image_builds(self) -> None:
         with running_gateway() as gateway:
@@ -719,6 +768,30 @@ class SandboxSdkTests(unittest.TestCase):
         )
         self.assertEqual(gateway.state.build_context_upload_results, [True])
 
+    def test_async_client_skips_existing_build_context_upload(self) -> None:
+        async def scenario(base_url: str, context: Path) -> tuple[dict, dict]:
+            async with AsyncSandboxClient(base_url) as client:
+                image = Image.from_dockerfile(
+                    name="async-deduplicated-context",
+                    tag="local/async-deduplicated-context:latest",
+                    context_path=str(context),
+                )
+                return await client.build_image(image), await client.build_image(image)
+
+        with TemporaryDirectory() as raw_dir:
+            context = Path(raw_dir) / "context"
+            context.mkdir()
+            (context / "Dockerfile").write_text("FROM busybox\n", encoding="utf-8")
+            with running_gateway() as gateway:
+                first, second = asyncio.run(scenario(gateway.base_url, context))
+
+        self.assertEqual(
+            first["image"]["received_context_digest"],
+            second["image"]["received_context_digest"],
+        )
+        self.assertEqual(gateway.state.build_context_upload_results, [True])
+        self.assertEqual(len(gateway.state.build_contexts), 1)
+
     def test_async_build_context_retry_rewinds_stream(self) -> None:
         class FakeResponse:
             headers: dict[str, str] = {}
@@ -752,8 +825,15 @@ class SandboxSdkTests(unittest.TestCase):
                 self.upload_attempts = 0
                 self.uploads: list[bytes] = []
 
-            def request(self, _method: object, url: object, **kwargs: object) -> FakeResponse:
-                if "/v1/image-contexts/" in str(url):
+            def request(self, method: object, url: object, **kwargs: object) -> FakeResponse:
+                if "/v1/image-contexts/" in str(url) and method == "GET":
+                    return FakeResponse(
+                        self,
+                        404,
+                        '{"error": "not found"}',
+                        kwargs.get("data"),
+                    )
+                if "/v1/image-contexts/" in str(url) and method == "PUT":
                     self.upload_attempts += 1
                     if self.upload_attempts == 1:
                         return FakeResponse(
@@ -1059,6 +1139,25 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
         path = parsed.path
         if path == "/healthz":
             self._write_json({"ok": True})
+            return
+        context_prefix = "/v1/image-contexts/"
+        if path.startswith(context_prefix):
+            if not self.state.build_context_uploads:
+                self._write_json(
+                    {"error": "not found"},
+                    status=HTTPStatus.NOT_FOUND,
+                )
+                return
+            digest = unquote(path[len(context_prefix):])
+            with self.state.lock:
+                content = self.state.build_contexts.get(digest)
+            if content is None:
+                self._write_json(
+                    {"error": "not found"},
+                    status=HTTPStatus.NOT_FOUND,
+                )
+                return
+            self._write_json({"digest": digest, "size": len(content)})
             return
         if path == "/v1/heartbeat":
             self._write_json({"node_id": "fake-node"})

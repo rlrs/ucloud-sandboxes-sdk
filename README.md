@@ -253,10 +253,12 @@ uploads `context_path` as a compressed tarball by default, submits a tracked
 build to the gateway, and polls build status until it succeeds or fails. The
 archive is deterministic for identical content and filesystem modes. Packaging
 streams through a bounded in-memory spool, then uploads the compressed bytes
-directly under their SHA-256 digest. The small build request refers to that
-digest, avoiding a second base64-sized copy in memory and the gateway's JSON
-body limit. Docker applies `.dockerignore` on the builder; the SDK deliberately
-archives all files so Docker's context semantics remain authoritative.
+directly under their SHA-256 digest. The SDK first probes that digest and skips
+the upload when the gateway already has the exact archive size. The small build
+request refers to the digest, avoiding a second base64-sized copy in memory and
+the gateway's JSON body limit. Docker applies `.dockerignore` on the builder;
+the SDK deliberately archives all files so Docker's context semantics remain
+authoritative.
 
 The same lower-level flow is available as `submit_image_build(...)`,
 `get_image_build(...)`, `list_image_builds()`, and

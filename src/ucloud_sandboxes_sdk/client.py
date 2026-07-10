@@ -847,20 +847,40 @@ class SandboxClient:
         if context_path is not None:
             with _tar_gz_directory(context_path) as archive:
                 digest, size = _build_context_archive_identity(archive)
+                context_path_url = f"/v1/image-contexts/{digest}"
                 try:
-                    self._request_json(
-                        "PUT",
-                        f"/v1/image-contexts/{digest}",
-                        body=archive,
-                        body_size=size,
-                        content_type="application/gzip",
+                    existing = self._request_json(
+                        "GET",
+                        context_path_url,
                         timeout_seconds=_remaining_seconds(deadline),
                     )
                 except SandboxApiError as exc:
                     if exc.status_code not in {404, 405}:
                         raise
-                    _attach_legacy_build_context_archive(payload, archive)
-                else:
+                    existing = None
+
+                use_context_reference = _build_context_reference_matches(
+                    existing,
+                    digest=digest,
+                    size=size,
+                )
+                if not use_context_reference:
+                    try:
+                        self._request_json(
+                            "PUT",
+                            context_path_url,
+                            body=archive,
+                            body_size=size,
+                            content_type="application/gzip",
+                            timeout_seconds=_remaining_seconds(deadline),
+                        )
+                    except SandboxApiError as exc:
+                        if exc.status_code not in {404, 405}:
+                            raise
+                        _attach_legacy_build_context_archive(payload, archive)
+                    else:
+                        use_context_reference = True
+                if use_context_reference:
                     _attach_build_context_reference(
                         payload,
                         digest=digest,
@@ -1706,20 +1726,40 @@ class AsyncSandboxClient:
         if context_path is not None:
             with _tar_gz_directory(context_path) as archive:
                 digest, size = _build_context_archive_identity(archive)
+                context_path_url = f"/v1/image-contexts/{digest}"
                 try:
-                    await self._request_json(
-                        "PUT",
-                        f"/v1/image-contexts/{digest}",
-                        body=archive,
-                        body_size=size,
-                        content_type="application/gzip",
+                    existing = await self._request_json(
+                        "GET",
+                        context_path_url,
                         timeout_seconds=_remaining_seconds(deadline),
                     )
                 except SandboxApiError as exc:
                     if exc.status_code not in {404, 405}:
                         raise
-                    _attach_legacy_build_context_archive(payload, archive)
-                else:
+                    existing = None
+
+                use_context_reference = _build_context_reference_matches(
+                    existing,
+                    digest=digest,
+                    size=size,
+                )
+                if not use_context_reference:
+                    try:
+                        await self._request_json(
+                            "PUT",
+                            context_path_url,
+                            body=archive,
+                            body_size=size,
+                            content_type="application/gzip",
+                            timeout_seconds=_remaining_seconds(deadline),
+                        )
+                    except SandboxApiError as exc:
+                        if exc.status_code not in {404, 405}:
+                            raise
+                        _attach_legacy_build_context_archive(payload, archive)
+                    else:
+                        use_context_reference = True
+                if use_context_reference:
                     _attach_build_context_reference(
                         payload,
                         digest=digest,
@@ -2128,6 +2168,23 @@ def _build_context_archive_identity(source: BinaryIO) -> tuple[str, int]:
         size += len(chunk)
     source.seek(0)
     return f"sha256:{digest.hexdigest()}", size
+
+
+def _build_context_reference_matches(
+    value: object,
+    *,
+    digest: str,
+    size: int,
+) -> bool:
+    if not isinstance(value, dict):
+        return False
+    stored_size = value.get("size")
+    return (
+        value.get("digest") == digest
+        and isinstance(stored_size, int)
+        and not isinstance(stored_size, bool)
+        and stored_size == size
+    )
 
 
 def _attach_build_context_reference(

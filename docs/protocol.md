@@ -98,8 +98,15 @@ images is required.
 
 ## Images
 
-For a local build context, the SDK first sends the deterministic compressed
-archive as a raw request body:
+For a local build context, the SDK first probes the deterministic compressed
+archive by digest:
+
+```http
+GET /v1/image-contexts/sha256:<hex>
+```
+
+An exact `digest` and `size` response reuses the stored archive. A missing
+archive is sent as a raw request body:
 
 ```http
 PUT /v1/image-contexts/sha256:<hex>
@@ -107,8 +114,8 @@ Content-Type: application/gzip
 Content-Length: <compressed size>
 ```
 
-The endpoint may return either a newly stored or deduplicated context. The SDK
-then sends `POST /v1/images/build` with a compact reference:
+The upload endpoint may return either a newly stored or deduplicated context.
+The SDK then sends `POST /v1/images/build` with a compact reference:
 
 ```json
 {
