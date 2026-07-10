@@ -39,15 +39,12 @@ class RelayApiError(RuntimeError):
 class ModelRelayConfig:
     relay_url: str
     rollout_id: str
-    api_key: str = "intercepted"
-    path_scoped_base_url: bool = True
+    api_key: str
 
     @property
     def openai_base_url(self) -> str:
         base = self.relay_url.rstrip("/")
-        if self.path_scoped_base_url:
-            return f"{base}/rollouts/{quote(self.rollout_id, safe='')}/v1"
-        return f"{base}/v1"
+        return f"{base}/rollouts/{quote(self.rollout_id, safe='')}/v1"
 
     def env(self) -> dict[str, str]:
         return {
@@ -61,14 +58,12 @@ def model_relay_env(
     relay_url: str,
     rollout_id: str,
     *,
-    api_key: str = "intercepted",
-    path_scoped_base_url: bool = True,
+    api_key: str,
 ) -> dict[str, str]:
     return ModelRelayConfig(
         relay_url=relay_url,
         rollout_id=rollout_id,
         api_key=api_key,
-        path_scoped_base_url=path_scoped_base_url,
     ).env()
 
 
@@ -93,14 +88,19 @@ class RelayRequest:
     def from_payload(cls, payload: Mapping[str, Any]) -> "RelayRequest":
         headers = payload.get("headers")
         body = payload.get("body")
+        if not isinstance(headers, Mapping) or not isinstance(body, dict):
+            raise RelayApiError(
+                "relay returned a request with invalid headers or body",
+                body=dict(payload),
+            )
         relay_request = cls(
             request_id=str(payload.get("request_id") or ""),
             rollout_id=str(payload.get("rollout_id") or ""),
             registration_token=str(payload.get("registration_token") or ""),
             endpoint=str(payload.get("endpoint") or ""),
-            method=str(payload.get("method") or "POST"),
+            method=str(payload.get("method") or ""),
             headers=_string_dict(headers),
-            body=dict(body) if isinstance(body, dict) else {},
+            body=dict(body),
             created_at=_optional_float(payload.get("created_at")),
             delivered_at=_optional_float(payload.get("delivered_at")),
             first_delivered_at=_optional_float(payload.get("first_delivered_at")),
@@ -118,6 +118,8 @@ class RelayRequest:
             not relay_request.request_id
             or not relay_request.rollout_id
             or not relay_request.lease_id
+            or not relay_request.endpoint
+            or not relay_request.method
         ):
             raise RelayApiError(
                 "relay returned a request without request, rollout, or lease identity",
@@ -134,24 +136,30 @@ class RelayPollResult:
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "RelayPollResult":
         raw_requests = payload.get("requests")
-        requests = (
-            [
-                RelayRequest.from_payload(item)
-                for item in raw_requests
-                if isinstance(item, dict)
-            ]
-            if isinstance(raw_requests, list)
-            else []
-        )
+        if not isinstance(raw_requests, list) or any(
+            not isinstance(item, dict) for item in raw_requests
+        ):
+            raise RelayApiError("relay returned an invalid requests payload", body=payload)
+        requests = [RelayRequest.from_payload(item) for item in raw_requests]
         raw_request = payload.get("request")
+        if raw_request is not None and not isinstance(raw_request, dict):
+            raise RelayApiError("relay returned an invalid request payload", body=payload)
         request_item = (
             RelayRequest.from_payload(raw_request)
             if isinstance(raw_request, dict)
             else None
         )
-        if request_item is not None and not requests:
-            requests = [request_item]
-        return cls(request=request_item or (requests[0] if requests else None), requests=requests)
+        first = requests[0] if requests else None
+        if (request_item is None) != (first is None) or (
+            request_item is not None
+            and first is not None
+            and request_item.request_id != first.request_id
+        ):
+            raise RelayApiError(
+                "relay request and requests payloads disagree",
+                body=payload,
+            )
+        return cls(request=first, requests=requests)
 
 
 class _RelayRegistrationCache:
@@ -164,7 +172,7 @@ class _RelayRegistrationCache:
             raise RelayApiError("relay returned an invalid registration payload", body=response)
         token = str(rollout.get("registration_token") or "")
         _validate_registration_token(token)
-        response_rollout_id = str(rollout.get("rollout_id") or rollout_id)
+        response_rollout_id = str(rollout.get("rollout_id") or "")
         if response_rollout_id != rollout_id:
             raise RelayApiError("relay registration rollout_id does not match", body=response)
         self._registration_tokens[rollout_id] = token
@@ -204,13 +212,10 @@ class RelayWorkerClient(_RelayRegistrationCache):
         return self._request_json("GET", "/v1/relay/stats")
 
     def list_rollouts(self) -> list[JsonObject]:
-        payload = self._request_json("GET", "/v1/relay/rollouts")
-        rollouts = payload.get("rollouts")
-        return [
-            dict(item)
-            for item in rollouts
-            if isinstance(item, dict)
-        ] if isinstance(rollouts, list) else []
+        return _relay_object_list(
+            self._request_json("GET", "/v1/relay/rollouts"),
+            "rollouts",
+        )
 
     def register_rollout(
         self,
@@ -528,13 +533,10 @@ class AsyncRelayWorkerClient(_RelayRegistrationCache):
         return await self._request_json("GET", "/v1/relay/stats")
 
     async def list_rollouts(self) -> list[JsonObject]:
-        payload = await self._request_json("GET", "/v1/relay/rollouts")
-        rollouts = payload.get("rollouts")
-        return [
-            dict(item)
-            for item in rollouts
-            if isinstance(item, dict)
-        ] if isinstance(rollouts, list) else []
+        return _relay_object_list(
+            await self._request_json("GET", "/v1/relay/rollouts"),
+            "rollouts",
+        )
 
     async def register_rollout(
         self,
@@ -833,6 +835,15 @@ def _decode_json_error(raw: str) -> object:
     except json.JSONDecodeError:
         return {"error": raw}
     return decoded
+
+
+def _relay_object_list(payload: JsonObject, key: str) -> list[JsonObject]:
+    values = payload.get(key)
+    if not isinstance(values, list) or any(
+        not isinstance(item, dict) for item in values
+    ):
+        raise RelayApiError(f"relay returned an invalid {key} payload", body=payload)
+    return [dict(item) for item in values]
 
 
 def _format_number(value: float) -> str:

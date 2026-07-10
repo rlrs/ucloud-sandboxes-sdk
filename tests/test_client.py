@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 from collections.abc import Iterator
 from contextlib import contextmanager
 import hashlib
@@ -28,6 +27,9 @@ from ucloud_sandboxes_sdk import (
     SandboxSpec,
     sandbox_auth_headers,
 )
+
+
+TEST_BUILD_CONTEXT = Path(__file__).parent
 
 
 class SandboxSdkTests(unittest.TestCase):
@@ -163,6 +165,8 @@ class SandboxSdkTests(unittest.TestCase):
             )
             downloaded = handle.download_file("/workspace/prompt.txt")
             deleted = handle.delete()
+            with self.assertRaises(SandboxApiError) as refresh_error:
+                handle.refresh()
 
         self.assertTrue(health["ok"])
         self.assertEqual(handle.id, "sdk-one")
@@ -175,6 +179,8 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(uploaded["size"], 13)
         self.assertEqual(downloaded, b"prompt bytes\n")
         self.assertEqual(deleted["deleted"]["spec"]["id"], "sdk-one")
+        self.assertEqual(handle.record, {})
+        self.assertEqual(refresh_error.exception.status_code, 404)
 
     def test_sync_client_image_cache_methods(self) -> None:
         with running_gateway() as gateway:
@@ -182,9 +188,9 @@ class SandboxSdkTests(unittest.TestCase):
 
             built = client.build_image(
                 Image.from_dockerfile(
-                    name="python-base",
+                    image_id="python-base",
                     tag="gateway-private-host:5000/python-base:latest",
-                    context_path="/tmp/context",
+                    context_path=TEST_BUILD_CONTEXT,
                 )
             )
             pulled = client.pull_image(
@@ -207,6 +213,8 @@ class SandboxSdkTests(unittest.TestCase):
 
         self.assertEqual(built["image"]["id"], "python-base")
         self.assertTrue(built["image"]["received_push"])
+        self.assertEqual(built["status"], "succeeded")
+        self.assertNotIn("build", built)
         self.assertEqual(pulled["image"]["id"], "busybox")
         self.assertEqual(snapshot["image"]["id"], "snap-one")
         self.assertEqual(
@@ -300,13 +308,14 @@ class SandboxSdkTests(unittest.TestCase):
             lambda _delay: None,
         ):
             sandbox = client.create_sandbox(
+                id="stable-cold-sync",
                 image=Image.from_registry("busybox"),
                 memory_mb=128,
                 start_timeout_seconds=1,
             )
 
         self.assertEqual(len(payload_ids), 3)
-        self.assertTrue(payload_ids[0].startswith("sdk-"))
+        self.assertEqual(payload_ids[0], "stable-cold-sync")
         self.assertEqual(len(set(payload_ids)), 1)
         self.assertEqual(sandbox.id, payload_ids[0])
 
@@ -320,7 +329,7 @@ class SandboxSdkTests(unittest.TestCase):
 
                 built = client.build_image(
                     Image.from_dockerfile(
-                        name="local-context",
+                        image_id="local-context",
                         tag="local/context:latest",
                         context_path=str(context),
                     )
@@ -343,7 +352,7 @@ class SandboxSdkTests(unittest.TestCase):
             context.mkdir()
             (context / "Dockerfile").write_text("FROM busybox\n", encoding="utf-8")
             image = Image.from_dockerfile(
-                name="cold-builder",
+                image_id="cold-builder",
                 tag="registry.invalid/cold-builder:latest",
                 context_path=context,
             )
@@ -392,7 +401,11 @@ class SandboxSdkTests(unittest.TestCase):
                             "build_id": "build-cold",
                             "image_id": "cold-builder",
                             "status": "succeeded",
-                            "image": {"id": "cold-builder"},
+                            "image": {
+                                "id": "cold-builder",
+                                "tag": "registry.invalid/cold-builder:latest",
+                                "pushed": True,
+                            },
                         }
                     }
                 self.fail(f"unexpected request: {method} {path} {kwargs}")
@@ -425,7 +438,7 @@ class SandboxSdkTests(unittest.TestCase):
             with running_gateway() as gateway:
                 client = SandboxClient(gateway.base_url)
                 image = Image.from_dockerfile(
-                    name="deduplicated-context",
+                    image_id="deduplicated-context",
                     tag="local/deduplicated-context:latest",
                     context_path=str(context),
                 )
@@ -440,23 +453,23 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(gateway.state.build_context_upload_results, [True])
         self.assertEqual(len(gateway.state.build_contexts), 1)
 
-    def test_sync_client_falls_back_to_legacy_build_context_json(self) -> None:
+    def test_sync_client_requires_content_addressed_context_upload(self) -> None:
         with TemporaryDirectory() as raw_dir:
             context = Path(raw_dir) / "context"
             context.mkdir()
             (context / "Dockerfile").write_text("FROM busybox\n", encoding="utf-8")
             with running_gateway(build_context_uploads=False) as gateway:
                 client = SandboxClient(gateway.base_url)
-                built = client.build_image(
-                    Image.from_dockerfile(
-                        name="legacy-context",
-                        tag="local/legacy-context:latest",
-                        context_path=str(context),
+                with self.assertRaises(SandboxApiError) as raised:
+                    client.build_image(
+                        Image.from_dockerfile(
+                            image_id="required-context-upload",
+                            tag="local/required-context-upload:latest",
+                            context_path=str(context),
+                        )
                     )
-                )
 
-        self.assertIsNone(built["image"]["received_context_digest"])
-        self.assertGreater(built["image"]["received_archive_bytes"], 0)
+        self.assertEqual(raised.exception.status_code, 404)
 
     def test_sync_client_rejects_build_context_over_file_limit(self) -> None:
         with TemporaryDirectory() as raw_dir:
@@ -484,7 +497,7 @@ class SandboxSdkTests(unittest.TestCase):
                 with self.assertRaisesRegex(SandboxApiError, "request body exceeds"):
                     client.submit_image_build(
                         Image.from_dockerfile(
-                            name="oversized-context",
+                            image_id="oversized-context",
                             tag="local/oversized-context:latest",
                             context_path=str(context),
                         )
@@ -551,7 +564,7 @@ class SandboxSdkTests(unittest.TestCase):
             ):
                 client.submit_image_build(
                     Image.from_dockerfile(
-                        name="retry",
+                        image_id="retry",
                         tag="local/retry:latest",
                         context_path=str(context),
                     )
@@ -572,34 +585,27 @@ class SandboxSdkTests(unittest.TestCase):
             for item in items:
                 os.utime(item, (1_000_000_000, 1_000_000_000))
 
-            first_payload = {
-                "context_path": str(context),
-            }
-            client_module._attach_build_context_archive(first_payload)
+            with client_module._tar_gz_directory(context) as archive:
+                first_archive = archive.read()
 
             # Filesystem timestamps and ownership are not build inputs and must
             # not perturb the compressed context bytes.
             for item in items:
                 os.utime(item, (2_000_000_000, 2_000_000_000))
 
-            second_payload = {
-                "context_path": str(context),
-            }
-            client_module._attach_build_context_archive(second_payload)
             with client_module._tar_gz_directory(context) as archive:
-                digest, size = client_module._build_context_archive_identity(archive)
+                second_archive = archive.read()
 
-        first_archive = str(first_payload["context_archive_base64"])
-        second_archive = str(second_payload["context_archive_base64"])
         self.assertEqual(first_archive, second_archive)
 
-        compressed = base64.b64decode(first_archive)
-        expected_digest = f"sha256:{hashlib.sha256(compressed).hexdigest()}"
+        with io.BytesIO(first_archive) as archive:
+            digest, size = client_module._build_context_archive_identity(archive)
+        expected_digest = f"sha256:{hashlib.sha256(first_archive).hexdigest()}"
         self.assertEqual(digest, expected_digest)
-        self.assertEqual(size, len(compressed))
-        self.assertEqual(compressed[4:8], b"\0\0\0\0")
+        self.assertEqual(size, len(first_archive))
+        self.assertEqual(first_archive[4:8], b"\0\0\0\0")
         with tarfile.open(
-            fileobj=io.BytesIO(compressed),
+            fileobj=io.BytesIO(first_archive),
             mode="r:gz",
         ) as archive:
             members = archive.getmembers()
@@ -643,9 +649,9 @@ class SandboxSdkTests(unittest.TestCase):
 
             submitted = client.submit_image_build(
                 Image.from_dockerfile(
-                    name="python-base",
+                    image_id="python-base",
                     tag="gateway-private-host:5000/python-base:latest",
-                    context_path="/tmp/context",
+                    context_path=TEST_BUILD_CONTEXT,
                 )
             )
             listed = client.list_image_builds()
@@ -684,22 +690,24 @@ class SandboxSdkTests(unittest.TestCase):
                     b'{"build": {"build_id": "build-slow", "image_id": "slow-build", "status": "running"}}'
                 )
             return FakeResponse(
-                b'{"build": {"build_id": "build-slow", "image_id": "slow-build", "status": "succeeded", "image": {"id": "slow-build"}, "command": ["docker", "build"], "exit_code": 0}}'
+                b'{"build": {"build_id": "build-slow", "image_id": "slow-build", "status": "succeeded", "image": {"id": "slow-build", "tag": "registry.invalid/slow-build:latest", "pushed": true}, "command": ["docker", "build"], "exit_code": 0}}'
             )
 
         client = SandboxClient("http://gateway.invalid", timeout_seconds=11)
         with patch.object(client_module, "open_no_redirect", fake_urlopen):
             client.build_image(
                 Image.from_dockerfile(
-                    name="slow-build",
+                    image_id="slow-build",
                     tag="registry.invalid/slow-build:latest",
-                    context_path="/tmp/context",
+                    context_path=TEST_BUILD_CONTEXT,
                 ),
                 timeout_seconds=123,
             )
 
-        self.assertAlmostEqual(float(captured_timeouts[0]), 123, places=2)
-        self.assertAlmostEqual(float(captured_timeouts[1]), 11, places=2)
+        self.assertGreater(float(captured_timeouts[0]), 0)
+        self.assertLessEqual(float(captured_timeouts[0]), 123)
+        self.assertEqual(len(captured_timeouts), 4)
+        self.assertAlmostEqual(float(captured_timeouts[-1]), 11, places=2)
 
     def test_sync_client_surfaces_api_errors(self) -> None:
         with running_gateway() as gateway:
@@ -708,9 +716,9 @@ class SandboxSdkTests(unittest.TestCase):
             with self.assertRaises(SandboxApiError) as raised:
                 client.build_image(
                     Image.from_dockerfile(
-                        name="denied",
+                        image_id="denied",
                         tag="local/denied:latest",
-                        context_path="/tmp/context",
+                        context_path=TEST_BUILD_CONTEXT,
                     )
                 )
 
@@ -793,6 +801,37 @@ class SandboxSdkTests(unittest.TestCase):
                 }
             )
 
+    def test_image_api_uses_explicit_gateway_ids_and_local_build_contexts(self) -> None:
+        image = Image.from_gateway_id("python-base")
+        self.assertEqual(image.image_id, "python-base")
+        self.assertEqual(image.reference, "python-base")
+        self.assertFalse(hasattr(Image, "from_name"))
+        self.assertFalse(hasattr(Image, "from_id"))
+        with self.assertRaises(TypeError):
+            Image("busybox")  # type: ignore[call-arg]
+
+        client = SandboxClient("http://gateway.invalid")
+        with self.assertRaisesRegex(ValueError, "existing local directory"):
+            client.submit_image_build(
+                Image.from_dockerfile(
+                    image_id="missing-context",
+                    tag="registry.invalid/missing-context:v1",
+                    context_path="/definitely/not/a/local/build/context",
+                )
+            )
+
+    def test_sandbox_create_requires_one_explicit_specification(self) -> None:
+        client = SandboxClient("http://gateway.invalid")
+        image = Image.from_registry("busybox")
+
+        with self.assertRaisesRegex(ValueError, "sandbox id is required"):
+            client.create_sandbox(image=image, memory_mb=128)
+        with self.assertRaisesRegex(TypeError, "either SandboxSpec or sandbox fields"):
+            client.create_sandbox(
+                SandboxSpec(id="one", image=image),
+                memory_mb=256,
+            )
+
     def test_sync_client_prepares_capacity(self) -> None:
         with running_gateway() as gateway:
             client = SandboxClient(gateway.base_url)
@@ -850,6 +889,10 @@ class SandboxSdkTests(unittest.TestCase):
                 )
                 downloaded = await handle.download_file("/workspace/out.txt")
                 await handle.delete()
+                with self.assertRaises(SandboxApiError) as refresh_error:
+                    await handle.refresh()
+                self.assertEqual(handle.record, {})
+                self.assertEqual(refresh_error.exception.status_code, 404)
                 return handle.id, result.exit_code, [
                     event["stream"] for event in result.events
                 ], uploaded["size"], downloaded
@@ -870,7 +913,7 @@ class SandboxSdkTests(unittest.TestCase):
             async with AsyncSandboxClient(base_url) as client:
                 return await client.build_image(
                     Image.from_dockerfile(
-                        name="async-context",
+                        image_id="async-context",
                         tag="local/async-context:latest",
                         context_path=str(context),
                     )
@@ -893,7 +936,7 @@ class SandboxSdkTests(unittest.TestCase):
         async def scenario(base_url: str, context: Path) -> tuple[dict, dict]:
             async with AsyncSandboxClient(base_url) as client:
                 image = Image.from_dockerfile(
-                    name="async-deduplicated-context",
+                    image_id="async-deduplicated-context",
                     tag="local/async-deduplicated-context:latest",
                     context_path=str(context),
                 )
@@ -988,7 +1031,7 @@ class SandboxSdkTests(unittest.TestCase):
             with patch.object(client_module.asyncio, "sleep", no_sleep):
                 await client.submit_image_build(
                     Image.from_dockerfile(
-                        name="retry",
+                        image_id="retry",
                         tag="local/retry:latest",
                         context_path=str(context),
                     )
@@ -1071,6 +1114,7 @@ class SandboxSdkTests(unittest.TestCase):
 
             with patch.object(client, "_request_json", side_effect=request_json):
                 sandbox = await client.create_sandbox(
+                    id="stable-cold-async",
                     image=Image.from_registry("busybox"),
                     memory_mb=128,
                     start_timeout_seconds=1,
@@ -1081,6 +1125,7 @@ class SandboxSdkTests(unittest.TestCase):
         sandbox_id, payload_ids = asyncio.run(scenario())
 
         self.assertEqual(len(payload_ids), 2)
+        self.assertEqual(payload_ids[0], "stable-cold-async")
         self.assertEqual(len(set(payload_ids)), 1)
         self.assertEqual(sandbox_id, payload_ids[0])
 
@@ -1110,7 +1155,7 @@ class SandboxSdkTests(unittest.TestCase):
                         '{"build": {"build_id": "build-slow", "image_id": "slow-build", "status": "running"}}'
                     )
                 return FakeResponse(
-                    '{"build": {"build_id": "build-slow", "image_id": "slow-build", "status": "succeeded", "image": {"id": "slow-build"}, "command": ["docker", "build"], "exit_code": 0}}'
+                    '{"build": {"build_id": "build-slow", "image_id": "slow-build", "status": "succeeded", "image": {"id": "slow-build", "tag": "registry.invalid/slow-build:latest", "pushed": true}, "command": ["docker", "build"], "exit_code": 0}}'
                 )
 
         async def scenario() -> list[object]:
@@ -1122,9 +1167,9 @@ class SandboxSdkTests(unittest.TestCase):
             )
             await client.build_image(
                 Image.from_dockerfile(
-                    name="slow-build",
+                    image_id="slow-build",
                     tag="registry.invalid/slow-build:latest",
-                    context_path="/tmp/context",
+                    context_path=TEST_BUILD_CONTEXT,
                 ),
                 timeout_seconds=123,
             )
@@ -1132,8 +1177,10 @@ class SandboxSdkTests(unittest.TestCase):
 
         timeouts = asyncio.run(scenario())
 
-        self.assertAlmostEqual(float(_timeout_total(timeouts[0])), 123, places=2)
-        self.assertAlmostEqual(float(_timeout_total(timeouts[1])), 11, places=2)
+        self.assertGreater(float(_timeout_total(timeouts[0])), 0)
+        self.assertLessEqual(float(_timeout_total(timeouts[0])), 123)
+        self.assertEqual(len(timeouts), 4)
+        self.assertAlmostEqual(float(_timeout_total(timeouts[-1])), 11, places=2)
 
     def test_async_client_retries_ucloud_unavailable_html(self) -> None:
         class FakeResponse:
@@ -1318,9 +1365,6 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
                 return
             self._write_json({"digest": digest, "size": len(content)})
             return
-        if path == "/v1/heartbeat":
-            self._write_json({"node_id": "fake-node"})
-            return
         if path == "/v1/nodes":
             self._write_json({"nodes": [{"node_id": "fake-node"}]})
             return
@@ -1409,10 +1453,12 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
         if sandbox_id is not None and path.endswith("/ssh"):
             self._write_json(
                 {
+                    "sandboxId": sandbox_id,
                     "ssh": {
                         "host": "127.0.0.1",
                         "port": 22000,
                         "user": "sandbox",
+                        "command": "ssh -p 22000 sandbox@127.0.0.1",
                     }
                 }
             )
@@ -1438,7 +1484,6 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
                     status=HTTPStatus.FORBIDDEN,
                 )
                 return
-            archive = payload.get("context_archive_base64")
             context_digest = payload.get("context_archive_digest")
             with self.state.lock:
                 uploaded_archive = self.state.build_contexts.get(
@@ -1451,11 +1496,12 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
                 "received_archive_bytes": (
                     len(uploaded_archive)
                     if uploaded_archive is not None
-                    else len(archive or "")
+                    else 0
                 ),
                 "received_context_digest": context_digest,
                 "received_context_size": payload.get("context_archive_size"),
                 "received_push": bool(payload.get("push")),
+                "pushed": bool(payload.get("push")),
             }
             build = {
                 "build_id": f"build-{image['id']}",

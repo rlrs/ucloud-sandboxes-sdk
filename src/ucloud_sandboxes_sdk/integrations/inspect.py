@@ -380,10 +380,7 @@ class UCloudSandboxEnvironment(SandboxEnvironment):
         del user
         command = ""
         try:
-            target = await self.handle.ssh()
-            ssh = target.get("ssh")
-            if isinstance(ssh, dict):
-                command = str(ssh.get("command") or "")
+            command = (await self.handle.ssh_target()).command
         except SandboxApiError:
             command = ""
         return SandboxConnection(
@@ -426,11 +423,10 @@ async def _sandbox_launch_plan(
             service_name="default",
         )
         image = Image.from_dockerfile(
-            name=image_id,
+            image_id=image_id,
             tag=_generated_build_image_tag(image_id),
             context_path=context_path,
             dockerfile=dockerfile,
-            push=True,
         )
         await _build_image_with_wait(
             client,
@@ -537,11 +533,10 @@ def _compose_build_image(
         tag=str(raw_image) if raw_image else "",
     )
     return Image.from_dockerfile(
-        name=image_id,
+        image_id=image_id,
         tag=str(raw_image) if raw_image else _generated_build_image_tag(image_id),
         context_path=context_path,
         dockerfile=dockerfile,
-        push=True,
         build_args=build_args,
     )
 
@@ -654,7 +649,6 @@ def _hash_text(digest: Any, *parts: str) -> None:
 def _generated_build_image_tag(image_id: str) -> str:
     prefix = (
         os.environ.get("UCLOUD_SANDBOX_BUILD_IMAGE_PREFIX")
-        or os.environ.get("UCLOUD_SANDBOX_REGISTRY_PREFIX")
         or DEFAULT_BUILD_IMAGE_PREFIX
     )
     return f"{prefix.rstrip('/')}/{_docker_repository_component(image_id)}:latest"
@@ -757,11 +751,7 @@ def _parse_memory_mb(value: object) -> int:
 
 
 def _settings_from_env() -> _InspectSettings:
-    base_url = (
-        os.environ.get("UCLOUD_SANDBOX_URL")
-        or os.environ.get("UCLOUD_SANDBOX_API_URL")
-        or os.environ.get("UCLOUD_SANDBOX_BASE_URL")
-    )
+    base_url = os.environ.get("UCLOUD_SANDBOX_URL")
     if not base_url:
         raise ValueError(
             "Set UCLOUD_SANDBOX_URL to the UCloud sandbox gateway URL."
@@ -967,7 +957,7 @@ async def _available_built_image(
     for record in images:
         if not isinstance(record, dict):
             continue
-        if record.get("id") != spec.id or record.get("tag") != spec.tag:
+        if record.get("id") != spec.image_id or record.get("tag") != spec.tag:
             continue
         if _image_record_available_to_sandboxes(record):
             return dict(record)
@@ -990,7 +980,7 @@ async def _active_image_build(
         record
         for record in builds
         if isinstance(record, dict)
-        and record.get("image_id") == spec.id
+        and record.get("image_id") == spec.image_id
         and record.get("tag") == spec.tag
         and not _image_build_terminal(record)
     ]
@@ -1008,11 +998,7 @@ async def _active_image_build(
 
 
 def _image_record_available_to_sandboxes(record: Mapping[str, Any]) -> bool:
-    return (
-        bool(record.get("available_to_sandboxes"))
-        or bool(record.get("pushed"))
-        or record.get("source") == "registry"
-    )
+    return record.get("available_to_sandboxes") is True
 
 
 def _image_build_terminal(record: Mapping[str, Any]) -> bool:
@@ -1042,7 +1028,11 @@ async def _submit_image_build_with_recovery(
         active = await _active_image_build(client, image)
         if active is not None:
             return active
-        known_build_ids = await _known_image_build_ids(client, spec.id, spec.tag)
+        known_build_ids = await _known_image_build_ids(
+            client,
+            spec.image_id,
+            spec.tag,
+        )
         try:
             return await client.submit_image_build(
                 image,
@@ -1055,7 +1045,7 @@ async def _submit_image_build_with_recovery(
             if _build_submit_error_may_be_ambiguous(exc):
                 recovered = await _recover_submitted_image_build(
                     client,
-                    spec.id,
+                    spec.image_id,
                     tag=spec.tag,
                     known_build_ids=known_build_ids,
                     deadline=deadline,
@@ -1072,7 +1062,7 @@ async def _submit_image_build_with_recovery(
             last_error = exc
             recovered = await _recover_submitted_image_build(
                 client,
-                spec.id,
+                spec.image_id,
                 tag=spec.tag,
                 known_build_ids=known_build_ids,
                 deadline=deadline,
@@ -1155,7 +1145,7 @@ async def _known_image_build_ids(
         for build in builds
         if isinstance(build, dict)
         and build.get("image_id") == image_id
-        and (not build.get("tag") or build.get("tag") == tag)
+        and build.get("tag") == tag
         and build.get("build_id")
     }
 
@@ -1170,7 +1160,7 @@ def _recovered_build_matches_attempt(
     if str(build.get("image_id") or "") != image_id:
         return False
     recovered_tag = str(build.get("tag") or "")
-    if recovered_tag and recovered_tag != tag:
+    if recovered_tag != tag:
         return False
     if not _image_build_terminal(build):
         return True
@@ -1207,11 +1197,10 @@ def _harbor_compatible_build_image(image: Image) -> Iterator[Image]:
             encoding="utf-8",
         )
         yield Image.from_dockerfile(
-            name=spec.id,
+            image_id=spec.image_id,
             tag=spec.tag,
             context_path=adapted_context,
             dockerfile=spec.dockerfile,
-            push=spec.push,
             build_args=spec.build_args,
             labels=spec.labels,
         )

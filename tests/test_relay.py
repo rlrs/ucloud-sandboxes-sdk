@@ -12,7 +12,6 @@ from urllib.parse import parse_qs, urlparse
 
 from ucloud_sandboxes_sdk import (
     AsyncRelayWorkerClient,
-    ModelRelayConfig,
     RelayApiError,
     RelayWorkerClient,
     model_relay_env,
@@ -35,16 +34,6 @@ class ModelRelayConfigTests(unittest.TestCase):
             "https://relay.example.org/rollouts/run%3A001/v1",
         )
         self.assertEqual(env["OPENAI_API_KEY"], "sandbox-token")
-
-    def test_can_build_plain_v1_environment_for_custom_header_transport(self) -> None:
-        config = ModelRelayConfig(
-            "https://relay.example.org",
-            "run-001",
-            path_scoped_base_url=False,
-        )
-
-        self.assertEqual(config.openai_base_url, "https://relay.example.org/v1")
-
 
 class RelayWorkerClientTests(unittest.TestCase):
     def test_worker_operations_require_a_current_registration(self) -> None:

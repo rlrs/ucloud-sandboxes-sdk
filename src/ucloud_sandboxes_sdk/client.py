@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 import gzip
@@ -14,8 +13,6 @@ import tempfile
 import time
 from typing import Any, AsyncIterator, BinaryIO, Callable, Iterator, Mapping, Sequence
 from urllib import error, parse, request
-from uuid import uuid4
-import warnings
 
 from ._http import (
     ResponseTooLargeError,
@@ -38,7 +35,6 @@ MAX_FILE_BODY_BYTES = 256 * 1024 * 1024
 MAX_JSON_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_FILE_RESPONSE_BYTES = 256 * 1024 * 1024
 BUILD_CONTEXT_SPOOL_MEMORY_BYTES = 8 * 1024 * 1024
-BUILD_CONTEXT_BASE64_CHUNK_BYTES = 3 * 1024 * 1024
 BUILD_CONTEXT_STREAM_CHUNK_BYTES = 1024 * 1024
 DEFAULT_SCALE_UP_TIMEOUT_SECONDS = 1800.0
 DEFAULT_SCALE_UP_RETRY_INTERVAL_SECONDS = 1.0
@@ -143,17 +139,33 @@ class SandboxSshTarget:
         ssh = payload.get("ssh")
         if not isinstance(ssh, dict):
             raise SandboxApiError("gateway returned an invalid SSH payload", body=payload)
+        response_sandbox_id = payload.get("sandboxId")
         host = ssh.get("host")
         port = ssh.get("port")
-        user = ssh.get("user") or "root"
-        if not isinstance(host, str) or not isinstance(port, int):
-            raise SandboxApiError("gateway SSH payload is missing host/port", body=payload)
+        user = ssh.get("user")
+        command = ssh.get("command")
+        if (
+            response_sandbox_id != sandbox_id
+            or not isinstance(host, str)
+            or not host
+            or not isinstance(port, int)
+            or isinstance(port, bool)
+            or not 1 <= port <= 65535
+            or not isinstance(user, str)
+            or not user
+            or not isinstance(command, str)
+            or not command
+        ):
+            raise SandboxApiError(
+                "gateway returned an invalid SSH target",
+                body=payload,
+            )
         return cls(
-            sandbox_id=str(payload.get("sandboxId") or sandbox_id),
-            user=str(user),
+            sandbox_id=sandbox_id,
+            user=user,
             host=host,
             port=port,
-            command=str(ssh.get("command") or f"ssh -p {port} {user}@{host}"),
+            command=command,
             raw=dict(payload),
         )
 
@@ -199,71 +211,85 @@ class SandboxSpec:
 
 @dataclass(frozen=True)
 class _ImageBuildSpec:
-    id: str
+    image_id: str
     tag: str
     context_path: str
     dockerfile: str = "Dockerfile"
-    push: bool = False
     build_args: Mapping[str, str] = field(default_factory=dict)
     labels: Mapping[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> JsonObject:
         return {
-            "id": self.id,
+            "id": self.image_id,
             "tag": self.tag,
             "context_path": self.context_path,
             "dockerfile": self.dockerfile,
-            "push": self.push,
+            "push": True,
             "build_args": dict(self.build_args),
             "labels": dict(self.labels),
         }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class Image:
     reference: str
-    name: str | None = None
+    image_id: str | None = None
     tag: str | None = None
     build_spec: _ImageBuildSpec | None = None
 
     @classmethod
+    def _from_parts(
+        cls,
+        *,
+        reference: str,
+        image_id: str | None = None,
+        tag: str | None = None,
+        build_spec: _ImageBuildSpec | None = None,
+    ) -> "Image":
+        image = object.__new__(cls)
+        object.__setattr__(image, "reference", reference)
+        object.__setattr__(image, "image_id", image_id)
+        object.__setattr__(image, "tag", tag)
+        object.__setattr__(image, "build_spec", build_spec)
+        return image
+
+    @classmethod
     def from_registry(cls, tag: str) -> "Image":
         tag = _non_empty_string("tag", tag)
-        return cls(reference=tag, tag=tag)
+        return cls._from_parts(reference=tag, tag=tag)
 
     @classmethod
-    def from_name(cls, name: str) -> "Image":
-        name = _non_empty_string("name", name)
-        return cls(reference=name, name=name)
-
-    @classmethod
-    def from_id(cls, image_id: str) -> "Image":
-        return cls.from_name(image_id)
+    def from_gateway_id(cls, image_id: str) -> "Image":
+        image_id = _non_empty_string("image_id", image_id)
+        return cls._from_parts(reference=image_id, image_id=image_id)
 
     @classmethod
     def from_dockerfile(
         cls,
         *,
-        name: str,
+        image_id: str,
         tag: str,
         context_path: str | Path,
         dockerfile: str = "Dockerfile",
-        push: bool = True,
         build_args: Mapping[str, str] | None = None,
         labels: Mapping[str, str] | None = None,
     ) -> "Image":
-        name = _non_empty_string("name", name)
+        image_id = _non_empty_string("image_id", image_id)
         tag = _non_empty_string("tag", tag)
         build_spec = _ImageBuildSpec(
-            id=name,
+            image_id=image_id,
             tag=tag,
             context_path=str(context_path),
             dockerfile=dockerfile,
-            push=push,
             build_args=dict(build_args or {}),
             labels=dict(labels or {}),
         )
-        return cls(reference=name, name=name, tag=tag, build_spec=build_spec)
+        return cls._from_parts(
+            reference=image_id,
+            image_id=image_id,
+            tag=tag,
+            build_spec=build_spec,
+        )
 
     def to_build_spec(self) -> _ImageBuildSpec:
         if self.build_spec is None:
@@ -272,20 +298,6 @@ class Image:
                 "before calling build_image()"
             )
         return self.build_spec
-
-    def to_sandbox_image(self) -> str:
-        return self.reference
-
-    def to_dict(self) -> JsonObject:
-        payload: JsonObject = {"reference": self.reference}
-        if self.name is not None:
-            payload["name"] = self.name
-        if self.tag is not None:
-            payload["tag"] = self.tag
-        if self.build_spec is not None:
-            payload["build"] = self.build_spec.to_dict()
-        return payload
-
 
 @dataclass(frozen=True)
 class SandboxExecResult:
@@ -311,12 +323,19 @@ class SandboxHandle:
 
     def refresh(self) -> "SandboxHandle":
         record = self.client.get_sandbox(self.id)
-        if record is not None:
-            self.record = record
+        if record is None:
+            raise SandboxApiError(
+                f"sandbox not found: {self.id}",
+                status_code=404,
+                body={"sandbox_id": self.id},
+            )
+        self.record = record
         return self
 
     def delete(self) -> JsonObject:
-        return self.client.delete_sandbox(self.id)
+        response = self.client.delete_sandbox(self.id)
+        self.record = {}
+        return response
 
     def start_exec(
         self,
@@ -356,11 +375,8 @@ class SandboxHandle:
             tty=tty,
         )
 
-    def ssh(self) -> JsonObject:
-        return self.client.get_ssh_target(self.id)
-
     def ssh_target(self) -> SandboxSshTarget:
-        return self.client.get_ssh_connection(self.id)
+        return self.client.get_ssh_target(self.id)
 
     def ssh_command(self) -> str:
         return self.ssh_target().command
@@ -514,23 +530,13 @@ class SandboxClient:
         return self._request_json("GET", "/healthz")
 
     def list_nodes(self) -> list[JsonObject]:
-        payload = self._request_json("GET", "/v1/nodes")
-        nodes = payload.get("nodes")
-        return [dict(item) for item in nodes if isinstance(item, dict)] if isinstance(nodes, list) else []
-
-    def heartbeat(self) -> JsonObject:
-        warnings.warn(
-            "SandboxClient.heartbeat() targets the internal node-agent API and is "
-            "deprecated; use the public gateway and list_nodes() instead",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self._request_json("GET", "/v1/heartbeat")
+        return _object_list(self._request_json("GET", "/v1/nodes"), "nodes")
 
     def list_sandboxes(self) -> list[JsonObject]:
-        payload = self._request_json("GET", "/v1/sandboxes")
-        sandboxes = payload.get("sandboxes")
-        return [item for item in sandboxes if isinstance(item, dict)] if isinstance(sandboxes, list) else []
+        return _object_list(
+            self._request_json("GET", "/v1/sandboxes"),
+            "sandboxes",
+        )
 
     def list_prepared_capacity(self) -> JsonObject:
         return self._request_json("GET", "/v1/capacity/prepare")
@@ -538,6 +544,7 @@ class SandboxClient:
     def prepare_capacity(
         self,
         *,
+        prepare_id: str,
         count: int,
         cpus: float | None = None,
         memory_mb: int | None = None,
@@ -545,7 +552,6 @@ class SandboxClient:
         resources: Mapping[str, Any] | None = None,
         image: Image | None = None,
         ttl_seconds: int = 900,
-        prepare_id: str | None = None,
     ) -> JsonObject:
         return self._request_json(
             "POST",
@@ -574,9 +580,9 @@ class SandboxClient:
     def prepare_builder(
         self,
         *,
+        prepare_id: str,
         count: int = 1,
         ttl_seconds: int = 900,
-        prepare_id: str | None = None,
     ) -> JsonObject:
         return self._request_json(
             "POST",
@@ -611,8 +617,6 @@ class SandboxClient:
         **kwargs: Any,
     ) -> SandboxHandle:
         payload = _sandbox_payload(spec, **kwargs)
-        if not str(payload.get("id") or "").strip():
-            payload["id"] = f"sdk-{uuid4().hex}"
         response = self._request_json_with_scale_up_wait(
             "/v1/sandboxes",
             payload,
@@ -667,21 +671,6 @@ class SandboxClient:
                     fallback_seconds=retry_interval_seconds,
                     deadline=deadline,
                 )
-
-    def create_ssh_sandbox(
-        self,
-        *,
-        ssh_user: str = "sandbox",
-        authorized_keys: Sequence[str] = (),
-        **kwargs: Any,
-    ) -> SandboxHandle:
-        kwargs.setdefault("network", "bridge")
-        kwargs["ssh"] = {
-            "enabled": True,
-            "user": ssh_user,
-            "authorized_keys": list(authorized_keys),
-        }
-        return self.create_sandbox(**kwargs)
 
     def delete_sandbox(self, sandbox_id: str) -> JsonObject:
         return self._request_json("DELETE", f"/v1/sandboxes/{_quote_segment(sandbox_id)}")
@@ -810,11 +799,12 @@ class SandboxClient:
     def close_exec_stdin(self, session_id: str) -> JsonObject:
         return self._request_json("POST", f"/v1/exec/{_quote_segment(session_id)}/close-stdin")
 
-    def get_ssh_target(self, sandbox_id: str) -> JsonObject:
-        return self._request_json("GET", f"/v1/sandboxes/{_quote_segment(sandbox_id)}/ssh")
-
-    def get_ssh_connection(self, sandbox_id: str) -> SandboxSshTarget:
-        return SandboxSshTarget.from_payload(sandbox_id, self.get_ssh_target(sandbox_id))
+    def get_ssh_target(self, sandbox_id: str) -> SandboxSshTarget:
+        payload = self._request_json(
+            "GET",
+            f"/v1/sandboxes/{_quote_segment(sandbox_id)}/ssh",
+        )
+        return SandboxSshTarget.from_payload(sandbox_id, payload)
 
     def ssh_proxy_argv(
         self,
@@ -853,14 +843,13 @@ class SandboxClient:
         return f"ssh -o ProxyCommand={shlex.quote(proxy)} sandbox@{sandbox_id}"
 
     def list_images(self) -> list[JsonObject]:
-        payload = self._request_json("GET", "/v1/images")
-        images = payload.get("images")
-        return [item for item in images if isinstance(item, dict)] if isinstance(images, list) else []
+        return _object_list(self._request_json("GET", "/v1/images"), "images")
 
     def list_image_builds(self) -> list[JsonObject]:
-        payload = self._request_json("GET", "/v1/images/builds")
-        builds = payload.get("builds")
-        return [item for item in builds if isinstance(item, dict)] if isinstance(builds, list) else []
+        return _object_list(
+            self._request_json("GET", "/v1/images/builds"),
+            "builds",
+        )
 
     def get_image_build(
         self,
@@ -882,7 +871,6 @@ class SandboxClient:
         self,
         image: Image,
         *,
-        upload_context: bool = True,
         timeout_seconds: float | None = None,
     ) -> JsonObject:
         effective_timeout = (
@@ -891,7 +879,6 @@ class SandboxClient:
         deadline = _deadline(effective_timeout)
         payload = self._prepare_image_build_payload(
             image,
-            upload_context=upload_context,
             deadline=deadline,
         )
         submitted = self._request_json(
@@ -906,53 +893,42 @@ class SandboxClient:
         self,
         image: Image,
         *,
-        upload_context: bool,
         deadline: float | None,
     ) -> JsonObject:
-        payload = _image_build_payload(image, upload_context=False)
-        context_path = _local_build_context_path(payload) if upload_context else None
-        if context_path is not None:
-            with _tar_gz_directory(context_path) as archive:
-                digest, size = _build_context_archive_identity(archive)
-                context_path_url = f"/v1/image-contexts/{digest}"
-                try:
-                    existing = self._request_json(
-                        "GET",
-                        context_path_url,
-                        timeout_seconds=_remaining_seconds(deadline),
-                    )
-                except SandboxApiError as exc:
-                    if exc.status_code not in {404, 405}:
-                        raise
-                    existing = None
-
-                use_context_reference = _build_context_reference_matches(
-                    existing,
-                    digest=digest,
-                    size=size,
+        payload = _image_build_payload(image)
+        context_path = _required_local_build_context_path(payload)
+        with _tar_gz_directory(context_path) as archive:
+            digest, size = _build_context_archive_identity(archive)
+            context_path_url = f"/v1/image-contexts/{digest}"
+            try:
+                existing = self._request_json(
+                    "GET",
+                    context_path_url,
+                    timeout_seconds=_remaining_seconds(deadline),
                 )
-                if not use_context_reference:
-                    try:
-                        self._request_json(
-                            "PUT",
-                            context_path_url,
-                            body=archive,
-                            body_size=size,
-                            content_type="application/gzip",
-                            timeout_seconds=_remaining_seconds(deadline),
-                        )
-                    except SandboxApiError as exc:
-                        if exc.status_code not in {404, 405}:
-                            raise
-                        _attach_legacy_build_context_archive(payload, archive)
-                    else:
-                        use_context_reference = True
-                if use_context_reference:
-                    _attach_build_context_reference(
-                        payload,
-                        digest=digest,
-                        size=size,
-                    )
+            except SandboxApiError as exc:
+                if exc.status_code != 404:
+                    raise
+                existing = None
+
+            if not _build_context_reference_matches(
+                existing,
+                digest=digest,
+                size=size,
+            ):
+                self._request_json(
+                    "PUT",
+                    context_path_url,
+                    body=archive,
+                    body_size=size,
+                    content_type="application/gzip",
+                    timeout_seconds=_remaining_seconds(deadline),
+                )
+            _attach_build_context_reference(
+                payload,
+                digest=digest,
+                size=size,
+            )
         payload["wait"] = False
         return payload
 
@@ -1000,7 +976,6 @@ class SandboxClient:
         self,
         image: Image,
         *,
-        upload_context: bool = True,
         timeout_seconds: float | None = DEFAULT_SCALE_UP_TIMEOUT_SECONDS,
         poll_interval_seconds: float = 5.0,
         retry_interval_seconds: float = DEFAULT_SCALE_UP_RETRY_INTERVAL_SECONDS,
@@ -1014,7 +989,6 @@ class SandboxClient:
         deadline = _deadline(effective_timeout)
         payload = self._prepare_image_build_payload(
             image,
-            upload_context=upload_context,
             deadline=deadline,
         )
         submitted = _submitted_build_record(
@@ -1037,7 +1011,7 @@ class SandboxClient:
                 f"image build failed: {build.get('error') or build.get('status')}",
                 body={"build": build},
             )
-        return _completed_build_payload(build)
+        return _validated_completed_build(build)
 
     def pull_image(
         self,
@@ -1242,12 +1216,19 @@ class AsyncSandboxHandle:
 
     async def refresh(self) -> "AsyncSandboxHandle":
         record = await self.client.get_sandbox(self.id)
-        if record is not None:
-            self.record = record
+        if record is None:
+            raise SandboxApiError(
+                f"sandbox not found: {self.id}",
+                status_code=404,
+                body={"sandbox_id": self.id},
+            )
+        self.record = record
         return self
 
     async def delete(self) -> JsonObject:
-        return await self.client.delete_sandbox(self.id)
+        response = await self.client.delete_sandbox(self.id)
+        self.record = {}
+        return response
 
     async def start_exec(
         self,
@@ -1287,11 +1268,8 @@ class AsyncSandboxHandle:
             tty=tty,
         )
 
-    async def ssh(self) -> JsonObject:
-        return await self.client.get_ssh_target(self.id)
-
     async def ssh_target(self) -> SandboxSshTarget:
-        return await self.client.get_ssh_connection(self.id)
+        return await self.client.get_ssh_target(self.id)
 
     async def ssh_command(self) -> str:
         return (await self.ssh_target()).command
@@ -1460,23 +1438,13 @@ class AsyncSandboxClient:
         return await self._request_json("GET", "/healthz")
 
     async def list_nodes(self) -> list[JsonObject]:
-        payload = await self._request_json("GET", "/v1/nodes")
-        nodes = payload.get("nodes")
-        return [dict(item) for item in nodes if isinstance(item, dict)] if isinstance(nodes, list) else []
-
-    async def heartbeat(self) -> JsonObject:
-        warnings.warn(
-            "AsyncSandboxClient.heartbeat() targets the internal node-agent API "
-            "and is deprecated; use the public gateway and list_nodes() instead",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return await self._request_json("GET", "/v1/heartbeat")
+        return _object_list(await self._request_json("GET", "/v1/nodes"), "nodes")
 
     async def list_sandboxes(self) -> list[JsonObject]:
-        payload = await self._request_json("GET", "/v1/sandboxes")
-        sandboxes = payload.get("sandboxes")
-        return [item for item in sandboxes if isinstance(item, dict)] if isinstance(sandboxes, list) else []
+        return _object_list(
+            await self._request_json("GET", "/v1/sandboxes"),
+            "sandboxes",
+        )
 
     async def list_prepared_capacity(self) -> JsonObject:
         return await self._request_json("GET", "/v1/capacity/prepare")
@@ -1484,6 +1452,7 @@ class AsyncSandboxClient:
     async def prepare_capacity(
         self,
         *,
+        prepare_id: str,
         count: int,
         cpus: float | None = None,
         memory_mb: int | None = None,
@@ -1491,7 +1460,6 @@ class AsyncSandboxClient:
         resources: Mapping[str, Any] | None = None,
         image: Image | None = None,
         ttl_seconds: int = 900,
-        prepare_id: str | None = None,
     ) -> JsonObject:
         return await self._request_json(
             "POST",
@@ -1520,9 +1488,9 @@ class AsyncSandboxClient:
     async def prepare_builder(
         self,
         *,
+        prepare_id: str,
         count: int = 1,
         ttl_seconds: int = 900,
-        prepare_id: str | None = None,
     ) -> JsonObject:
         return await self._request_json(
             "POST",
@@ -1557,8 +1525,6 @@ class AsyncSandboxClient:
         **kwargs: Any,
     ) -> AsyncSandboxHandle:
         payload = _sandbox_payload(spec, **kwargs)
-        if not str(payload.get("id") or "").strip():
-            payload["id"] = f"sdk-{uuid4().hex}"
         response = await self._request_json_with_scale_up_wait(
             "/v1/sandboxes",
             payload,
@@ -1613,21 +1579,6 @@ class AsyncSandboxClient:
                     fallback_seconds=retry_interval_seconds,
                     deadline=deadline,
                 )
-
-    async def create_ssh_sandbox(
-        self,
-        *,
-        ssh_user: str = "sandbox",
-        authorized_keys: Sequence[str] = (),
-        **kwargs: Any,
-    ) -> AsyncSandboxHandle:
-        kwargs.setdefault("network", "bridge")
-        kwargs["ssh"] = {
-            "enabled": True,
-            "user": ssh_user,
-            "authorized_keys": list(authorized_keys),
-        }
-        return await self.create_sandbox(**kwargs)
 
     async def delete_sandbox(self, sandbox_id: str) -> JsonObject:
         return await self._request_json("DELETE", f"/v1/sandboxes/{_quote_segment(sandbox_id)}")
@@ -1756,14 +1707,12 @@ class AsyncSandboxClient:
     async def close_exec_stdin(self, session_id: str) -> JsonObject:
         return await self._request_json("POST", f"/v1/exec/{_quote_segment(session_id)}/close-stdin")
 
-    async def get_ssh_target(self, sandbox_id: str) -> JsonObject:
-        return await self._request_json("GET", f"/v1/sandboxes/{_quote_segment(sandbox_id)}/ssh")
-
-    async def get_ssh_connection(self, sandbox_id: str) -> SandboxSshTarget:
-        return SandboxSshTarget.from_payload(
-            sandbox_id,
-            await self.get_ssh_target(sandbox_id),
+    async def get_ssh_target(self, sandbox_id: str) -> SandboxSshTarget:
+        payload = await self._request_json(
+            "GET",
+            f"/v1/sandboxes/{_quote_segment(sandbox_id)}/ssh",
         )
+        return SandboxSshTarget.from_payload(sandbox_id, payload)
 
     def ssh_proxy_argv(
         self,
@@ -1802,14 +1751,16 @@ class AsyncSandboxClient:
         return f"ssh -o ProxyCommand={shlex.quote(proxy)} sandbox@{sandbox_id}"
 
     async def list_images(self) -> list[JsonObject]:
-        payload = await self._request_json("GET", "/v1/images")
-        images = payload.get("images")
-        return [item for item in images if isinstance(item, dict)] if isinstance(images, list) else []
+        return _object_list(
+            await self._request_json("GET", "/v1/images"),
+            "images",
+        )
 
     async def list_image_builds(self) -> list[JsonObject]:
-        payload = await self._request_json("GET", "/v1/images/builds")
-        builds = payload.get("builds")
-        return [item for item in builds if isinstance(item, dict)] if isinstance(builds, list) else []
+        return _object_list(
+            await self._request_json("GET", "/v1/images/builds"),
+            "builds",
+        )
 
     async def get_image_build(
         self,
@@ -1831,7 +1782,6 @@ class AsyncSandboxClient:
         self,
         image: Image,
         *,
-        upload_context: bool = True,
         timeout_seconds: float | None = None,
     ) -> JsonObject:
         effective_timeout = (
@@ -1840,7 +1790,6 @@ class AsyncSandboxClient:
         deadline = _deadline(effective_timeout)
         payload = await self._prepare_image_build_payload(
             image,
-            upload_context=upload_context,
             deadline=deadline,
         )
         submitted = await self._request_json(
@@ -1855,53 +1804,42 @@ class AsyncSandboxClient:
         self,
         image: Image,
         *,
-        upload_context: bool,
         deadline: float | None,
     ) -> JsonObject:
-        payload = _image_build_payload(image, upload_context=False)
-        context_path = _local_build_context_path(payload) if upload_context else None
-        if context_path is not None:
-            with _tar_gz_directory(context_path) as archive:
-                digest, size = _build_context_archive_identity(archive)
-                context_path_url = f"/v1/image-contexts/{digest}"
-                try:
-                    existing = await self._request_json(
-                        "GET",
-                        context_path_url,
-                        timeout_seconds=_remaining_seconds(deadline),
-                    )
-                except SandboxApiError as exc:
-                    if exc.status_code not in {404, 405}:
-                        raise
-                    existing = None
-
-                use_context_reference = _build_context_reference_matches(
-                    existing,
-                    digest=digest,
-                    size=size,
+        payload = _image_build_payload(image)
+        context_path = _required_local_build_context_path(payload)
+        with _tar_gz_directory(context_path) as archive:
+            digest, size = _build_context_archive_identity(archive)
+            context_path_url = f"/v1/image-contexts/{digest}"
+            try:
+                existing = await self._request_json(
+                    "GET",
+                    context_path_url,
+                    timeout_seconds=_remaining_seconds(deadline),
                 )
-                if not use_context_reference:
-                    try:
-                        await self._request_json(
-                            "PUT",
-                            context_path_url,
-                            body=archive,
-                            body_size=size,
-                            content_type="application/gzip",
-                            timeout_seconds=_remaining_seconds(deadline),
-                        )
-                    except SandboxApiError as exc:
-                        if exc.status_code not in {404, 405}:
-                            raise
-                        _attach_legacy_build_context_archive(payload, archive)
-                    else:
-                        use_context_reference = True
-                if use_context_reference:
-                    _attach_build_context_reference(
-                        payload,
-                        digest=digest,
-                        size=size,
-                    )
+            except SandboxApiError as exc:
+                if exc.status_code != 404:
+                    raise
+                existing = None
+
+            if not _build_context_reference_matches(
+                existing,
+                digest=digest,
+                size=size,
+            ):
+                await self._request_json(
+                    "PUT",
+                    context_path_url,
+                    body=archive,
+                    body_size=size,
+                    content_type="application/gzip",
+                    timeout_seconds=_remaining_seconds(deadline),
+                )
+            _attach_build_context_reference(
+                payload,
+                digest=digest,
+                size=size,
+            )
         payload["wait"] = False
         return payload
 
@@ -1949,7 +1887,6 @@ class AsyncSandboxClient:
         self,
         image: Image,
         *,
-        upload_context: bool = True,
         timeout_seconds: float | None = DEFAULT_SCALE_UP_TIMEOUT_SECONDS,
         poll_interval_seconds: float = 5.0,
         retry_interval_seconds: float = DEFAULT_SCALE_UP_RETRY_INTERVAL_SECONDS,
@@ -1963,7 +1900,6 @@ class AsyncSandboxClient:
         deadline = _deadline(effective_timeout)
         payload = await self._prepare_image_build_payload(
             image,
-            upload_context=upload_context,
             deadline=deadline,
         )
         submitted = _submitted_build_record(
@@ -1986,7 +1922,7 @@ class AsyncSandboxClient:
                 f"image build failed: {build.get('error') or build.get('status')}",
                 body={"build": build},
             )
-        return _completed_build_payload(build)
+        return _validated_completed_build(build)
 
     async def pull_image(
         self,
@@ -2199,15 +2135,23 @@ def _sandbox_payload(
     spec: SandboxSpec | None,
     **kwargs: Any,
 ) -> JsonObject:
-    payload = _object_payload(spec)
-    overrides = {key: value for key, value in kwargs.items() if value is not None}
-    payload.update(overrides)
+    if spec is not None and not isinstance(spec, SandboxSpec):
+        raise TypeError("spec must be a SandboxSpec")
+    if spec is not None and kwargs:
+        raise TypeError("pass either SandboxSpec or sandbox fields, not both")
+    payload = (
+        spec.to_dict()
+        if spec is not None
+        else {key: value for key, value in kwargs.items() if value is not None}
+    )
+    sandbox_id = str(payload.get("id") or "").strip()
+    if not sandbox_id:
+        raise ValueError(
+            "sandbox id is required so retries and cleanup use stable identity"
+        )
+    payload["id"] = sandbox_id
     if "image" in payload:
-        if not (
-            isinstance(spec, SandboxSpec)
-            and "image" not in overrides
-            and isinstance(payload["image"], str)
-        ):
+        if spec is None:
             payload["image"] = _image_reference(payload["image"])
     else:
         raise TypeError("sandbox image is required and must be an Image")
@@ -2216,33 +2160,18 @@ def _sandbox_payload(
 
 def _image_build_payload(
     image: Image,
-    *,
-    upload_context: bool = True,
 ) -> JsonObject:
     if not isinstance(image, Image):
         raise TypeError("build_image() requires an Image from Image.from_dockerfile()")
-    payload = image.to_build_spec().to_dict()
-    if upload_context:
-        _attach_build_context_archive(payload)
-    return payload
-
-
-def _completed_build_payload(build: JsonObject) -> JsonObject:
-    payload: JsonObject = {
-        "build": dict(build),
-        "image": build.get("image") if isinstance(build.get("image"), dict) else {},
-        "command": list(build.get("command") or []),
-        "exitCode": build.get("exit_code"),
-    }
-    if build.get("push_command"):
-        payload["pushCommand"] = list(build.get("push_command") or [])
-        payload["pushExitCode"] = build.get("push_exit_code")
-    return payload
+    return image.to_build_spec().to_dict()
 
 
 def _submitted_build_record(payload: JsonObject) -> JsonObject:
     build = payload.get("build")
-    if not isinstance(build, dict):
+    if not isinstance(build, dict) or not (
+        str(build.get("build_id") or "").strip()
+        or str(build.get("image_id") or "").strip()
+    ):
         raise SandboxApiError(
             "gateway returned an invalid image build payload",
             body=payload,
@@ -2250,10 +2179,37 @@ def _submitted_build_record(payload: JsonObject) -> JsonObject:
     return build
 
 
+def _validated_completed_build(build: JsonObject) -> JsonObject:
+    image = build.get("image")
+    if (
+        not isinstance(image, dict)
+        or not str(image.get("id") or "").strip()
+        or not str(image.get("tag") or "").strip()
+        or image.get("pushed") is not True
+    ):
+        raise SandboxApiError(
+            "gateway returned a successful build without a pushed image",
+            body={"build": build},
+        )
+    return build
+
+
+def _object_list(payload: JsonObject, key: str) -> list[JsonObject]:
+    values = payload.get(key)
+    if not isinstance(values, list) or any(
+        not isinstance(item, dict) for item in values
+    ):
+        raise SandboxApiError(
+            f"gateway returned an invalid {key} payload",
+            body=payload,
+        )
+    return [dict(item) for item in values]
+
+
 def _image_reference(image: object) -> str:
     if not isinstance(image, Image):
         raise TypeError("sandbox image must be an Image")
-    return image.to_sandbox_image()
+    return image.reference
 
 
 def _image_pull_reference(image: Image) -> str:
@@ -2263,21 +2219,12 @@ def _image_pull_reference(image: Image) -> str:
 
 
 def _non_empty_string(name: str, value: object) -> str:
-    text = str(value).strip()
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a string")
+    text = value.strip()
     if not text:
         raise ValueError(f"{name} cannot be empty")
     return text
-
-
-def _object_payload(spec: object | None) -> JsonObject:
-    if spec is None:
-        return {}
-    to_dict = getattr(spec, "to_dict", None)
-    if callable(to_dict):
-        raw = to_dict()
-        if isinstance(raw, Mapping):
-            return dict(raw)
-    raise TypeError("spec must expose to_dict().")
 
 
 def _nested_payload(value: object) -> object:
@@ -2289,27 +2236,16 @@ def _nested_payload(value: object) -> object:
     return value
 
 
-def _attach_build_context_archive(payload: JsonObject) -> None:
-    if payload.get("context_archive_base64"):
-        return
+def _required_local_build_context_path(payload: JsonObject) -> Path:
     context_path = payload.get("context_path")
     if not isinstance(context_path, str) or not context_path:
-        return
+        raise ValueError("build context_path is required")
     path = Path(context_path)
     if not path.is_dir():
-        return
-    with _tar_gz_directory(path) as archive:
-        payload["context_archive_base64"] = _base64_ascii(archive)
-    payload["context_archive_format"] = "tar.gz"
-    payload["context_path"] = "."
-
-
-def _local_build_context_path(payload: JsonObject) -> Path | None:
-    context_path = payload.get("context_path")
-    if not isinstance(context_path, str) or not context_path:
-        return None
-    path = Path(context_path)
-    return path if path.is_dir() else None
+        raise ValueError(
+            f"build context must be an existing local directory: {context_path}"
+        )
+    return path
 
 
 def _build_context_archive_identity(source: BinaryIO) -> tuple[str, int]:
@@ -2346,24 +2282,10 @@ def _attach_build_context_reference(
     digest: str,
     size: int,
 ) -> None:
-    payload.pop("context_archive_base64", None)
     payload["context_archive_digest"] = digest
     payload["context_archive_format"] = "tar.gz"
     payload["context_archive_size"] = size
     payload["context_path"] = "."
-
-
-def _attach_legacy_build_context_archive(
-    payload: JsonObject,
-    source: BinaryIO,
-) -> None:
-    payload.pop("context_archive_digest", None)
-    payload.pop("context_archive_size", None)
-    source.seek(0)
-    payload["context_archive_base64"] = _base64_ascii(source)
-    payload["context_archive_format"] = "tar.gz"
-    payload["context_path"] = "."
-
 
 async def _async_file_chunks(source: BinaryIO) -> AsyncIterator[bytes]:
     while chunk := await asyncio.to_thread(
@@ -2474,17 +2396,6 @@ def _normalize_build_context_tar_info(info: tarfile.TarInfo) -> None:
     info.pax_headers = {}
 
 
-def _base64_ascii(source: BinaryIO) -> str:
-    """Encode a binary stream without first materializing the input bytes."""
-
-    chunks: list[str] = []
-    while chunk := source.read(BUILD_CONTEXT_BASE64_CHUNK_BYTES):
-        # The chunk size is divisible by three, so only the final chunk is
-        # padded and concatenating the independently encoded chunks is valid.
-        chunks.append(base64.b64encode(chunk).decode("ascii"))
-    return "".join(chunks)
-
-
 def _exec_payload(
     command: str | Sequence[str],
     *,
@@ -2511,14 +2422,13 @@ def _prepare_capacity_payload(
     resources: Mapping[str, Any] | None,
     image: Image | None,
     ttl_seconds: int,
-    prepare_id: str | None,
+    prepare_id: str,
 ) -> JsonObject:
     payload: JsonObject = {
+        "id": _non_empty_string("prepare_id", prepare_id),
         "count": count,
         "ttl_seconds": ttl_seconds,
     }
-    if prepare_id is not None:
-        payload["id"] = prepare_id
     if resources is not None:
         payload["resources"] = dict(resources)
     if cpus is not None:
@@ -2565,15 +2475,13 @@ def _prepare_builder_payload(
     *,
     count: int,
     ttl_seconds: int,
-    prepare_id: str | None,
+    prepare_id: str,
 ) -> JsonObject:
-    payload: JsonObject = {
+    return {
+        "id": _non_empty_string("prepare_id", prepare_id),
         "count": count,
         "ttl_seconds": ttl_seconds,
     }
-    if prepare_id is not None:
-        payload["id"] = prepare_id
-    return payload
 
 
 def _command_list(command: str | Sequence[str]) -> list[str]:

@@ -4,13 +4,34 @@ This project uses semantic versioning.
 
 ## Unreleased
 
+- Prepared the breaking `0.3.0` SDK surface: removed the internal-node
+  `heartbeat()` method, replaced ambiguous image-name aliases with
+  `Image.from_gateway_id()`, made Dockerfile image ids explicit, and required
+  stable caller-supplied sandbox and capacity ids.
+- Removed the raw/typed duplicate SSH accessors and the image-dependent
+  `create_ssh_sandbox()` shortcut; `ssh_target()` now returns the typed target.
+- Made sandbox handles clear their cached record after deletion and raise on a
+  refresh miss instead of silently returning stale state.
+- Made list methods reject malformed gateway arrays instead of silently
+  dropping invalid entries or treating a malformed response as an empty list.
+- Removed relay response-shape fallbacks that hid malformed request envelopes,
+  poll batches, rollout registrations, and rollout lists.
+- Tightened SSH target and Inspect image/build parsing to the current gateway
+  schema instead of fabricating defaults from incomplete responses.
+- Made `build_image()` return the canonical tracked build record and reject a
+  nominal success that does not contain a pushed image id and registry tag.
+- Required local, content-addressed build-context uploads and always-pushed
+  registry builds; removed the legacy base64 JSON fallback, remote-context
+  escape hatch, and synthetic camelCase build result wrapper.
+- Removed the unsupported unscoped model-relay URL mode and placeholder API-key
+  default, and standardized Inspect configuration on `UCLOUD_SANDBOX_URL` and
+  `UCLOUD_SANDBOX_BUILD_IMAGE_PREFIX`.
 - Added an opinionated agent/workload guide covering cold build/boot overlap,
   stable operation identity, bounded concurrency, exec ambiguity, and cleanup.
 - Corrected the protocol documentation to distinguish allocation-claimed
   sandbox capacity from one-shot prepared builder signals.
 - Streamed deterministic build contexts to a content-addressed binary upload
-  endpoint before submitting compact build JSON, with transparent fallback to
-  the legacy base64 request for older gateways.
+  endpoint before submitting compact build JSON.
 - Probed content-addressed build contexts before upload so repeated identical
   builds reuse the gateway copy without retransmitting it.
 - Added rollout registration-token fencing to sync and async relay worker
@@ -27,7 +48,7 @@ This project uses semantic versioning.
   or silently forgetting failed deletions.
 - Aligned successful-response validation across sync and async clients and
   documented the public gateway as the SDK lifecycle boundary.
-- Corrected the package `__version__` value to match version 0.2.8.
+- Set package metadata and `__version__` to the next breaking version, `0.3.0`.
 
 ## 0.2.8 - 2026-07-06
 

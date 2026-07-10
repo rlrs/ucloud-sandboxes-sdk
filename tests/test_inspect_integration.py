@@ -25,7 +25,7 @@ class _BuildCaptureClient:
         spec = image.to_build_spec()
         self.context_paths.append(spec.context_path)
         self.dockerfiles.append((Path(spec.context_path) / spec.dockerfile).read_text())
-        return {"build_id": image.name}
+        return {"build_id": image.image_id}
 
     async def wait_for_image_build(self, build_id, **_kwargs):
         return {"status": "succeeded", "image": {"id": build_id}}
@@ -563,7 +563,7 @@ class InspectIntegrationTests(unittest.TestCase):
                 inspect_integration._build_image_with_wait(
                     client,
                     Image.from_dockerfile(
-                        name="timeout-build",
+                        image_id="timeout-build",
                         tag="registry.invalid/timeout-build:latest",
                         context_path="/tmp/context",
                     ),
@@ -604,7 +604,7 @@ class InspectIntegrationTests(unittest.TestCase):
             inspect_integration._build_image_with_wait(
                 client,
                 Image.from_dockerfile(
-                    name="ready-build",
+                    image_id="ready-build",
                     tag="registry.invalid/ready-build:latest",
                     context_path="/tmp/context",
                 ),
@@ -636,6 +636,7 @@ class InspectIntegrationTests(unittest.TestCase):
                 return {
                     "build_id": "accepted-build",
                     "image_id": build_id,
+                    "tag": "registry.invalid/accepted-image:latest",
                     "status": "running",
                 }
 
@@ -650,7 +651,7 @@ class InspectIntegrationTests(unittest.TestCase):
             inspect_integration._build_image_with_wait(
                 client,
                 Image.from_dockerfile(
-                    name="accepted-image",
+                    image_id="accepted-image",
                     tag="registry.invalid/accepted-image:latest",
                     context_path="/tmp/context",
                 ),
@@ -701,7 +702,7 @@ class InspectIntegrationTests(unittest.TestCase):
             inspect_integration._build_image_with_wait(
                 client,
                 Image.from_dockerfile(
-                    name="accepted-after-502",
+                    image_id="accepted-after-502",
                     tag="registry.invalid/accepted-after-502:latest",
                     context_path="/tmp/context",
                 ),
@@ -780,7 +781,7 @@ class InspectIntegrationTests(unittest.TestCase):
             inspect_integration._build_image_with_wait(
                 client,
                 Image.from_dockerfile(
-                    name="not-accepted-image",
+                    image_id="not-accepted-image",
                     tag="registry.invalid/not-accepted-image:latest",
                     context_path="/tmp/context",
                 ),
@@ -834,7 +835,7 @@ class InspectIntegrationTests(unittest.TestCase):
             inspect_integration._build_image_with_wait(
                 client,
                 Image.from_dockerfile(
-                    name="reused-image",
+                    image_id="reused-image",
                     tag="registry.invalid/reused-image:latest",
                     context_path="/tmp/context",
                 ),
@@ -872,7 +873,7 @@ class InspectIntegrationTests(unittest.TestCase):
                 inspect_integration._build_image_with_wait(
                     client,
                     Image.from_dockerfile(
-                        name="disconnect-build",
+                        image_id="disconnect-build",
                         tag="registry.invalid/disconnect-build:latest",
                         context_path="/tmp/context",
                     ),
@@ -896,7 +897,7 @@ class InspectIntegrationTests(unittest.TestCase):
                 inspect_integration._build_image_with_wait(
                     client,
                     Image.from_dockerfile(
-                        name="harbor-build",
+                        image_id="harbor-build",
                         tag="registry.invalid/harbor-build:latest",
                         context_path=context,
                     ),
@@ -985,12 +986,12 @@ class InspectIntegrationTests(unittest.TestCase):
 
         self.assertEqual(len(client.images), 1)
         build = client.images[0].to_build_spec()
-        self.assertLessEqual(len(build.id), 64)
-        self.assertEqual(build.id, expected_id)
+        self.assertLessEqual(len(build.image_id), 64)
+        self.assertEqual(build.image_id, expected_id)
         self.assertEqual(build.tag, inspect_integration._generated_build_image_tag(expected_id))
         self.assertNotEqual(build.context_path, str(context.resolve()))
         self.assertEqual(build.dockerfile, "Dockerfile")
-        self.assertEqual(launch.image.name, client.images[0].name)
+        self.assertEqual(launch.image.image_id, client.images[0].image_id)
         self.assertIn("mkdir -p /tests /logs/agent /logs/verifier /task /oracle", client.dockerfiles[0])
         self.assertEqual(launch.command, ["sh", "-lc", "tail -f /dev/null"])
         self.assertEqual(launch.env, {"HARBOR": "1"})
@@ -1027,7 +1028,7 @@ class InspectIntegrationTests(unittest.TestCase):
 
         first = clients[0].images[0].to_build_spec()
         second = clients[1].images[0].to_build_spec()
-        self.assertEqual(first.id, second.id)
+        self.assertEqual(first.image_id, second.image_id)
         self.assertEqual(first.tag, second.tag)
         self.assertNotIn("inspect-task-a", first.tag)
         self.assertNotIn("inspect-task-b", first.tag)
@@ -1084,7 +1085,7 @@ class InspectIntegrationTests(unittest.TestCase):
         self.assertEqual(build.dockerfile, "Dockerfile.custom")
         self.assertEqual(build.tag, "ucloud-sandbox-registry:5000/test/image:latest")
         self.assertEqual(
-            build.id,
+            build.image_id,
             expected_id,
         )
         self.assertIn("mkdir -p /tests /logs/agent /logs/verifier /task /oracle", client.dockerfiles[0])
@@ -1176,7 +1177,7 @@ class InspectIntegrationTests(unittest.TestCase):
             )
 
         self.assertEqual(client.images, [])
-        self.assertEqual(launch.image.name, image_id)
+        self.assertEqual(launch.image.image_id, image_id)
 
     def test_existing_active_generated_build_skips_duplicate_submit(self) -> None:
         from inspect_ai.util import ComposeBuild, ComposeConfig, ComposeService
@@ -1223,7 +1224,7 @@ class InspectIntegrationTests(unittest.TestCase):
 
         self.assertEqual(client.images, [])
         self.assertEqual(client.context_paths, [])
-        self.assertEqual(launch.image.name, image_id)
+        self.assertEqual(launch.image.image_id, image_id)
 
     def test_multi_service_compose_is_rejected_for_now(self) -> None:
         from inspect_ai.util import ComposeConfig, ComposeService
@@ -1231,7 +1232,7 @@ class InspectIntegrationTests(unittest.TestCase):
 
         class FakeClient:
             async def submit_image_build(self, image, **_kwargs):
-                return {"build_id": image.name}
+                return {"build_id": image.image_id}
 
             async def wait_for_image_build(self, build_id, **_kwargs):
                 return {"status": "succeeded", "image": {"id": build_id}}
