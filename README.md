@@ -78,9 +78,9 @@ finally:
     client.delete_sandbox(sandbox_id)
 ```
 
-`create_sandbox()` waits through retryable cold-capacity responses for up to 30
-minutes by default. When no `id` is supplied, the SDK creates one before the
-first request so every retry remains idempotent. Tune this with
+`create_sandbox()` requires a stable `id` and waits through retryable
+cold-capacity responses for up to 30 minutes by default. The same id and exact
+specification are reused for every attempt. Tune this with
 `start_timeout_seconds` and `retry_interval_seconds`; set
 `start_timeout_seconds=0` for a single attempt.
 
@@ -118,6 +118,7 @@ relay_env = model_relay_env(
 )
 
 sandbox = client.create_sandbox(
+    id="run-001-model-client",
     image=Image.from_registry("registry.example.org/swebench/task:latest"),
     cpus=1,
     memory_mb=2048,
@@ -270,15 +271,14 @@ is safe if the signal was already consumed.
 
 Build images through the gateway and use registry tags as the durable cache
 between build-capable machines and sandbox nodes. With a control-plane-managed
-registry, use the registry's private-network host in the tag and set
-`push=True`.
+registry, use the registry's private-network host in the tag. SDK builds are
+always pushed because builder-local images are not portable.
 
 ```python
 image = Image.from_dockerfile(
-    name="python-base",
+    image_id="python-base",
     tag="ucloud-sandbox-registry:5000/ucloud/python-base:latest",
     context_path="./docker/python-base",
-    push=True,
 )
 client.build_image(
     image,
@@ -290,7 +290,8 @@ client.build_image(
 )
 
 sandbox = client.create_sandbox(
-    image=Image.from_name("python-base"),
+    id="python-base-smoke",
+    image=Image.from_gateway_id("python-base"),
     command=["python", "--version"],
     cpus=1,
     memory_mb=2048,
@@ -304,7 +305,8 @@ content-addressed build request. Use `submit_image_build()` when a one-shot,
 non-waiting submission is desired.
 
 `Image.from_dockerfile(...)` describes a Docker build. `client.build_image(...)`
-uploads `context_path` as a compressed tarball by default, submits a tracked
+requires `context_path` to be a local directory, uploads it as a compressed
+tarball, submits a tracked
 build to the gateway, and polls build status until it succeeds or fails. The
 archive is deterministic for identical content and filesystem modes. Packaging
 streams through a bounded in-memory spool, then uploads the compressed bytes
@@ -317,25 +319,11 @@ authoritative.
 
 The same lower-level flow is available as `submit_image_build(...)`,
 `get_image_build(...)`, `list_image_builds()`, and
-`wait_for_image_build(...)`. If the build context already exists on the gateway
-or builder VM, pass `upload_context=False`:
-
-```python
-client.build_image(
-    Image.from_dockerfile(
-        name="preloaded-context",
-        tag="ucloud-sandbox-registry:5000/ucloud/preloaded-context:latest",
-        context_path="/work/ucloud-sandboxes/build-contexts/preloaded-context",
-        push=True,
-    ),
-    upload_context=False,
-    timeout_seconds=3000,
-)
-```
-
-Use `push=True` with a registry tag for any image that sandbox nodes should run.
-The builder/control-plane Docker daemon and sandbox-node Docker daemons are
-different machines. The registry tag is the durable handoff.
+`wait_for_image_build(...)`. The content-addressed upload endpoint is required;
+the SDK does not fall back to embedding build contexts in JSON or accept remote
+builder filesystem paths. The builder/control-plane Docker daemon and
+sandbox-node Docker daemons are different machines, so the registry tag is the
+durable handoff.
 For large Docker builds, pass `timeout_seconds` to `build_image()` as the
 overall wait deadline and context-upload request timeout. Status polls use the
 client's normal request timeout and return build state, command, node metadata,
@@ -346,6 +334,7 @@ recorded image id:
 
 ```python
 client.create_sandbox(
+    id="python-by-tag",
     image=Image.from_registry("ucloud-sandbox-registry:5000/ucloud/python-base:latest"),
     cpus=1,
     memory_mb=2048,
@@ -353,7 +342,8 @@ client.create_sandbox(
 )
 
 client.create_sandbox(
-    image=Image.from_name("python-base"),
+    id="python-by-gateway-id",
+    image=Image.from_gateway_id("python-base"),
     cpus=1,
     memory_mb=2048,
     disk_mb=10240,
@@ -378,10 +368,8 @@ client.snapshot_sandbox(
 )
 ```
 
-Snapshots should also target a registry tag if another node will need to run the
-image later. Images built or snapshotted without `push=True` are local to the
-builder/control-plane Docker daemon and are not available after a builder VM
-scales down.
+Snapshots should also target a registry tag so another node can run the image
+after the originating VM scales down.
 
 ## Async Client
 
@@ -443,8 +431,8 @@ file, or a Dockerfile. Compose `image`, `build.context`, `build.dockerfile`,
 `network_mode` are mapped into a sandbox spec. `UCLOUD_SANDBOX_NETWORK`
 overrides Compose networking when set. Dockerfile configs and single-service
 Compose builds call `build_image`; local build contexts are uploaded to the
-gateway. Generated build tags use `UCLOUD_SANDBOX_BUILD_IMAGE_PREFIX`, falling back to
-`UCLOUD_SANDBOX_REGISTRY_PREFIX`, then
+gateway. Generated build tags use `UCLOUD_SANDBOX_BUILD_IMAGE_PREFIX`, falling
+back to
 `ucloud-sandbox-registry:5000/ucloud-inspect`. Explicit Compose `image:` values
 are preserved. Generated build image ids and tags are deterministic over the
 Dockerfile, build context, build args, explicit tag, and SDK compatibility

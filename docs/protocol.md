@@ -39,9 +39,8 @@ Credentialed SDK requests do not follow redirects, because forwarding either
 the gateway token or relay worker token to a different origin would disclose
 it. Configure the final HTTPS gateway/relay URL directly.
 
-`GET /v1/heartbeat` is an internal node-agent endpoint. The deprecated
-`heartbeat()` client method remains temporarily for compatibility, but new code
-should use the gateway's `GET /v1/nodes` through `list_nodes()`.
+`GET /v1/heartbeat` is an internal node-agent endpoint and is not exposed by the
+SDK. Use the gateway's `GET /v1/nodes` through `list_nodes()`.
 
 ## Sandbox Resources
 
@@ -58,7 +57,7 @@ Sandbox create requests are individually resource-shaped:
 ```
 
 The SDK requires `image` to be an `Image` helper. `Image.from_registry(...)`
-sends a registry tag, `Image.from_name(...)` sends a gateway image id, and
+sends a registry tag, `Image.from_gateway_id(...)` sends a gateway image id, and
 `Image.from_dockerfile(...)` carries build metadata for `build_image()`.
 The gateway owns placement and may return `503` while nodes are scaling up.
 Repeating a sandbox create with the same id and exact specification is the
@@ -132,11 +131,10 @@ The SDK then sends `POST /v1/images/build` with a compact reference:
 }
 ```
 
-If the upload endpoint returns `404` or `405`, the SDK treats the gateway as an
-older deployment and retries the build using the former
-`context_archive_base64` JSON field. Pass `upload_context=False` to
-`build_image()` when `context_path` already exists on the gateway or builder VM.
-`build_image()` submits with `wait: false`, then polls
+The content-addressed upload endpoint is required. SDK build contexts must be
+existing local directories; the client neither embeds them in JSON nor refers
+to a remote builder filesystem path. `build_image()` submits with `wait: false`,
+then polls
 `GET /v1/images/builds/{build_id_or_image_id}` until the tracked build reaches
 `succeeded` or `failed`. SDK callers can use `on_status` to receive each status
 change and rolling `log_tail`. Large builds should pass `timeout_seconds` as
@@ -159,11 +157,10 @@ GET  /v1/images/builds
 GET  /v1/images/builds/{build_id_or_image_id}
 ```
 
-Builds intended for sandbox nodes should set `push: true` and use a registry
-tag. The gateway records the pushed tag under the image id, so a later sandbox
-create can use either `Image.from_registry("host:5000/repo/name:tag")` or
-`Image.from_name("python-base")`. Unpushed builds are local to the
-builder/control-plane Docker daemon and should not be treated as portable.
+SDK builds always set `push: true` and require a registry tag. The gateway
+records the pushed tag under the image id, so a later sandbox create can use
+either `Image.from_registry("host:5000/repo/name:tag")` or
+`Image.from_gateway_id("python-base")`.
 
 `POST /v1/images/pull` accepts:
 
@@ -285,14 +282,15 @@ claim them or the hint expires.
 Builder nodes are for Docker build and registry push work. They should
 advertise `image-build` and should not advertise `sandbox`. The durable handoff
 from builders to sandbox nodes is a registry tag: build requests that should be
-used by sandboxes should set `push: true` and use a registry tag. Sandbox nodes
-pull and cache registry tags before starting containers; the gateway does not
-copy builder-local Docker images between VMs.
+used by sandboxes must set `push: true` and use a registry tag. SDK build
+requests do this unconditionally. Sandbox nodes pull and cache registry tags
+before starting containers; the gateway does not copy builder-local Docker
+images between VMs.
 
 When the gateway records a pushed image, sandbox creation may use either the
 registry tag or the image id. In the SDK that means
 `Image.from_registry("host:5000/repo/name:tag")` or
-`Image.from_name("name")`. Image-id creation resolves to the recorded tag.
+`Image.from_gateway_id("name")`. Image-id creation resolves to the recorded tag.
 Unpushed image ids must be rejected or surfaced as unavailable because the image
 only exists on the builder/control-plane Docker daemon that built it.
 

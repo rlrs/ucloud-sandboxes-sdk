@@ -61,10 +61,9 @@ async def main() -> None:
     sandboxes = []
 
     image = Image.from_dockerfile(
-        name=f"agent-image-{run_id}",
+        image_id=f"agent-image-{run_id}",
         tag=f"ucloud-sandbox-registry:5000/agents/{run_id}:v1",
         context_path="./image",
-        push=True,
     )
 
     async with AsyncSandboxClient(
@@ -188,8 +187,8 @@ simultaneous exec starts optimize neither latency nor reliability.
 - Let `create_sandbox()` and `build_image()` wait through retryable cold
   capacity within their total timeout. Do not wrap them in an unbounded retry
   loop or generate a new id on every attempt.
-- A custom image build uses a stable logical image name and an immutable,
-  versioned tag. `push=True` is required when another VM will run it.
+- A custom image build uses a stable gateway image id and an immutable,
+  versioned registry tag. SDK builds always push the result.
 - `ExecEventHistoryLostError` means the command's retained event stream has a
   gap. The command may already have performed side effects. Reconcile state or
   use an application-level idempotency key before deciding to run it again.
@@ -222,13 +221,17 @@ so suspended pools are not an acceptable substitute for early capacity hints.
 ## Image Rules
 
 - `Image.from_registry(...)` refers to an existing portable image.
+- `Image.from_gateway_id(...)` refers to a pushed image previously recorded by
+  the gateway; prefer the returned registry digest when it is available.
 - `Image.from_dockerfile(...)` plus `build_image()` builds a context. Keep that
-  context small and use a stable `.dockerignore`; content-addressed upload
-  deduplication saves transfer, not Docker build work.
+  directory physically small. Docker applies `.dockerignore` on the builder,
+  but the SDK uploads every context file so Docker remains authoritative.
+  Content-addressed deduplication saves repeated transfer, not Docker build
+  work.
 - Use the successful build's returned registry tag for sandbox creation and
   prewarming. The service resolves it to an immutable digest for distribution.
-- An unpushed build or snapshot is local to one builder/control-plane Docker
-  daemon and can disappear when that VM scales down.
+- SDK builds are always pushed. Snapshots should also target a registry tag so
+  they survive movement away from the originating node.
 - Registry retention and garbage collection own deletion. There is no public
   SDK image-delete operation because deleting distributed image metadata safely
   requires stronger lifecycle semantics than removing one local record.

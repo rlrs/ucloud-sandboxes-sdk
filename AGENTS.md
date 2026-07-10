@@ -45,9 +45,10 @@ When writing examples, integrations, or generated code, follow
 - Prepared sandbox units survive autoscaler reconciliation until matching
   allocations claim them or their TTL expires. Prepared builder signals are
   one-shot and are consumed after an executing autoscaler cycle reacts.
-- Use `push=True` and a registry tag for images that sandbox nodes must run.
-  Do not add an SDK image-delete operation; registry retention and garbage
-  collection own image storage lifecycle.
+- SDK Dockerfile builds always push to their required registry tag. Do not add
+  an unpushed or remote-builder-context mode. Do not add an SDK image-delete
+  operation; registry retention and garbage collection own image storage
+  lifecycle.
 - Use total cold-start/build budgets measured in minutes. Bound concurrent
   creates and execs; an exec is a remote process lifecycle, not a cheap local
   function call.
