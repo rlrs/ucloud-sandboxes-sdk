@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
-import io
+import gzip
 import json
 from pathlib import Path
 import shlex
 import tarfile
+import tempfile
 import time
-from typing import Any, AsyncIterator, Callable, Iterator, Mapping, Sequence
+from typing import Any, AsyncIterator, BinaryIO, Callable, Iterator, Mapping, Sequence
 from urllib import error, parse, request
 import warnings
 
@@ -33,6 +35,8 @@ MAX_JSON_BODY_BYTES = 16 * 1024 * 1024
 MAX_FILE_BODY_BYTES = 256 * 1024 * 1024
 MAX_JSON_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_FILE_RESPONSE_BYTES = 256 * 1024 * 1024
+BUILD_CONTEXT_SPOOL_MEMORY_BYTES = 8 * 1024 * 1024
+BUILD_CONTEXT_BASE64_CHUNK_BYTES = 3 * 1024 * 1024
 
 
 class SandboxApiError(RuntimeError):
@@ -2016,9 +2020,8 @@ def _attach_build_context_archive(payload: JsonObject) -> None:
     path = Path(context_path)
     if not path.is_dir():
         return
-    payload["context_archive_base64"] = base64.b64encode(
-        _tar_gz_directory(path)
-    ).decode("ascii")
+    with _tar_gz_directory(path) as archive:
+        payload["context_archive_base64"] = _base64_ascii(archive)
     payload["context_archive_format"] = "tar.gz"
     payload["context_path"] = "."
 
@@ -2074,12 +2077,65 @@ def _image_build_timeout_message(
     return f"image build did not finish: {build_id_or_image_id} ({', '.join(details)})"
 
 
-def _tar_gz_directory(path: Path) -> bytes:
-    buffer = io.BytesIO()
-    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
-        for item in sorted(path.rglob("*")):
-            archive.add(item, arcname=item.relative_to(path).as_posix(), recursive=False)
-    return buffer.getvalue()
+@contextmanager
+def _tar_gz_directory(path: Path) -> Iterator[BinaryIO]:
+    """Yield a deterministic compressed context without retaining it in memory."""
+
+    with tempfile.SpooledTemporaryFile(
+        max_size=BUILD_CONTEXT_SPOOL_MEMORY_BYTES,
+        mode="w+b",
+    ) as buffer:
+        # Gzip embeds the current timestamp and source filename by default. Both
+        # must be fixed for identical contexts to produce identical bytes.
+        with gzip.GzipFile(
+            filename="",
+            mode="wb",
+            fileobj=buffer,
+            mtime=0,
+        ) as compressed:
+            # Stream tar data into gzip. This avoids the former uncompressed tar
+            # buffer and lets large compressed archives spill to a temporary file.
+            with tarfile.open(
+                fileobj=compressed,
+                mode="w|",
+                format=tarfile.PAX_FORMAT,
+            ) as archive:
+                for item in sorted(
+                    path.rglob("*"),
+                    key=lambda candidate: candidate.relative_to(path).as_posix(),
+                ):
+                    arcname = item.relative_to(path).as_posix()
+                    info = archive.gettarinfo(str(item), arcname=arcname)
+                    _normalize_build_context_tar_info(info)
+                    if info.isfile():
+                        with item.open("rb") as source:
+                            archive.addfile(info, source)
+                    else:
+                        archive.addfile(info)
+        buffer.seek(0)
+        yield buffer
+
+
+def _normalize_build_context_tar_info(info: tarfile.TarInfo) -> None:
+    """Remove host-specific metadata that is irrelevant to a Docker build."""
+
+    info.uid = 0
+    info.gid = 0
+    info.uname = ""
+    info.gname = ""
+    info.mtime = 0
+    info.pax_headers = {}
+
+
+def _base64_ascii(source: BinaryIO) -> str:
+    """Encode a binary stream without first materializing the input bytes."""
+
+    chunks: list[str] = []
+    while chunk := source.read(BUILD_CONTEXT_BASE64_CHUNK_BYTES):
+        # The chunk size is divisible by three, so only the final chunk is
+        # padded and concatenating the independently encoded chunks is valid.
+        chunks.append(base64.b64encode(chunk).decode("ascii"))
+    return "".join(chunks)
 
 
 def _exec_payload(

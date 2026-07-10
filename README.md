@@ -251,7 +251,13 @@ sandbox = client.create_sandbox(
 `Image.from_dockerfile(...)` describes a Docker build. `client.build_image(...)`
 uploads `context_path` as a compressed tarball by default, submits a tracked
 build to the gateway, and polls build status until it succeeds or fails. The
-same lower-level flow is available as `submit_image_build(...)`,
+archive is deterministic for identical content and filesystem modes. Packaging
+streams through a bounded in-memory spool, but the current JSON protocol still
+requires the final compressed archive to be held as a base64 string. Docker
+applies `.dockerignore` on the builder; the SDK does not pre-filter ignored
+paths before upload, so keep upload contexts small.
+
+The same lower-level flow is available as `submit_image_build(...)`,
 `get_image_build(...)`, `list_image_builds()`, and
 `wait_for_image_build(...)`. If the build context already exists on the gateway
 or builder VM, pass `upload_context=False`:

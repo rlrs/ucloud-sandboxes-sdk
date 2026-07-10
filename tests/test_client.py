@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from collections.abc import Iterator
 from contextlib import contextmanager
 import io
@@ -8,6 +9,8 @@ import json
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import os
+import tarfile
 from tempfile import TemporaryDirectory
 from threading import Lock, Thread
 import unittest
@@ -284,6 +287,51 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(built["image"]["id"], "local-context")
         self.assertEqual(built["image"]["received_context_path"], ".")
         self.assertGreater(built["image"]["received_archive_bytes"], 0)
+
+    def test_build_context_archive_is_deterministic(self) -> None:
+        with TemporaryDirectory() as raw_dir:
+            context = Path(raw_dir) / "context"
+            nested = context / "nested"
+            nested.mkdir(parents=True)
+            (nested / "second.txt").write_text("second\n", encoding="utf-8")
+            (context / "first.txt").write_text("first\n", encoding="utf-8")
+            items = (context, nested, context / "first.txt", nested / "second.txt")
+            for item in items:
+                os.utime(item, (1_000_000_000, 1_000_000_000))
+
+            first_payload = {
+                "context_path": str(context),
+            }
+            client_module._attach_build_context_archive(first_payload)
+
+            # Filesystem timestamps and ownership are not build inputs and must
+            # not perturb the compressed context bytes.
+            for item in items:
+                os.utime(item, (2_000_000_000, 2_000_000_000))
+
+            second_payload = {
+                "context_path": str(context),
+            }
+            client_module._attach_build_context_archive(second_payload)
+
+        first_archive = str(first_payload["context_archive_base64"])
+        second_archive = str(second_payload["context_archive_base64"])
+        self.assertEqual(first_archive, second_archive)
+
+        compressed = base64.b64decode(first_archive)
+        self.assertEqual(compressed[4:8], b"\0\0\0\0")
+        with tarfile.open(
+            fileobj=io.BytesIO(compressed),
+            mode="r:gz",
+        ) as archive:
+            members = archive.getmembers()
+            self.assertEqual(
+                [member.name for member in members],
+                ["first.txt", "nested", "nested/second.txt"],
+            )
+            self.assertTrue(all(member.mtime == 0 for member in members))
+            self.assertTrue(all(member.uid == 0 for member in members))
+            self.assertTrue(all(member.gid == 0 for member in members))
 
     def test_sync_client_can_submit_and_poll_image_builds(self) -> None:
         with running_gateway() as gateway:
