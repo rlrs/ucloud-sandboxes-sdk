@@ -205,8 +205,35 @@ capacity hint. Unclaimed units remain through slow VM boots until their TTL.
 If `image` is set, the gateway also tries to prewarm that image on already-ready
 sandbox nodes that can fit the requested resources. A capacity hint currently
 names one image; issuing one hint per image would also multiply resource demand,
-so the SDK does not fan this operation out as a client-side batch. Cancel it
-early when a run is abandoned:
+so the SDK does not fan this operation out as a client-side batch.
+
+When the image still needs to be built, overlap both cold paths by creating the
+capacity hint without an image first. After the build succeeds, update the same
+prepare id with the image to start cache prewarming; this replaces the hint
+instead of doubling its demand:
+
+```python
+client.prepare_capacity(
+    prepare_id="mbpp-run",
+    count=16,
+    cpus=1,
+    memory_mb=2048,
+    disk_mb=10240,
+    ttl_seconds=900,
+)
+built = client.build_image(python_base)
+client.prepare_capacity(
+    prepare_id="mbpp-run",
+    count=16,
+    cpus=1,
+    memory_mb=2048,
+    disk_mb=10240,
+    image=Image.from_registry(built["image"]["tag"]),
+    ttl_seconds=900,
+)
+```
+
+Cancel the hint early when a run is abandoned:
 
 ```python
 client.delete_prepared_capacity("mbpp-run")
