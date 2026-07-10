@@ -198,11 +198,15 @@ new client process; rollout-scoped methods accept it explicitly. Re-registering
 the same rollout creates a new token and fences delayed operations from the old
 registration.
 
-The signal contributes `count * resources` to gateway demand until the
-executing autoscaler reacts and consumes it. The TTL is a cleanup bound for
-missed cycles or a stopped autoscaler. If `image` is set, the gateway also tries
-to prewarm that image on already-ready sandbox nodes that can fit the requested
-resources. Cancel it early when a run is abandoned:
+The signal contributes `count * resources` to gateway demand. Each newly
+reserved sandbox with the same resource shape and, when set, image atomically
+claims one prepared unit, so real sandbox creation does not double-count its
+capacity hint. Unclaimed units remain through slow VM boots until their TTL.
+If `image` is set, the gateway also tries to prewarm that image on already-ready
+sandbox nodes that can fit the requested resources. A capacity hint currently
+names one image; issuing one hint per image would also multiply resource demand,
+so the SDK does not fan this operation out as a client-side batch. Cancel it
+early when a run is abandoned:
 
 ```python
 client.delete_prepared_capacity("mbpp-run")
