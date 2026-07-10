@@ -31,6 +31,34 @@ developer-facing examples.
 - Do not treat image ids as transferred images. A pushed image id may resolve to
   a recorded registry tag; an unpushed image id is builder-local only.
 
+## Consumer Workflow Invariants
+
+When writing examples, integrations, or generated code, follow
+`docs/agent-guide.md`. In particular:
+
+- Point clients at the public gateway and give every retryable sandbox create a
+  stable id. Retrying that id with a changed spec is a conflict, not an update.
+- For a cold custom-image burst, prepare builder capacity and generic sandbox
+  capacity before starting the build. After the build, update the same sandbox
+  prepare id with the pushed registry tag. A new prepare id adds demand rather
+  than replacing it.
+- Prepared sandbox units survive autoscaler reconciliation until matching
+  allocations claim them or their TTL expires. Prepared builder signals are
+  one-shot and are consumed after an executing autoscaler cycle reacts.
+- Use `push=True` and a registry tag for images that sandbox nodes must run.
+  Do not add an SDK image-delete operation; registry retention and garbage
+  collection own image storage lifecycle.
+- Use total cold-start/build budgets measured in minutes. Bound concurrent
+  creates and execs; an exec is a remote process lifecycle, not a cheap local
+  function call.
+- Never blindly repeat a side-effecting command after
+  `ExecEventHistoryLostError`: the command may have completed even though its
+  retained event history is incomplete.
+- In `finally`, delete every attempted deterministic sandbox id (including
+  creates with ambiguous responses) and any remaining prepared capacity.
+  Suspended UCloud nodes are still billed, so do not recommend suspended pools
+  as a cold-start strategy.
+
 ## Verification
 
 Run from this repository root:

@@ -243,8 +243,12 @@ Inspect `read_file()` and `write_file()` call these endpoints.
 Semantics:
 
 - The signal contributes `count * resources` to autoscaler demand.
-- The executing autoscaler consumes the signal after reacting to it.
-- It expires automatically at `ttl_seconds` if no cycle consumes it.
+- Each matching sandbox allocation atomically claims one prepared unit.
+- Provider VM acceptance and autoscaler reconciliation do not consume it.
+- Unclaimed units remain through slow VM boots until `ttl_seconds` expires.
+- Matching uses the requested resource shape and, when present, image.
+- Posting the same prepare id replaces the stored hint with the supplied count;
+  a different id adds another demand signal.
 - Deleting it removes the demand signal.
 - If `image` is set, the gateway opportunistically pulls that image onto
   already-ready sandbox nodes that can fit the requested resources.
@@ -274,6 +278,10 @@ Semantics:
 - Future image builds still use `POST /v1/images/build` and normal gateway
   routing.
 
+This one-shot behavior is intentionally different from prepared sandbox
+capacity, whose individual units remain until matching sandbox allocations
+claim them or the hint expires.
+
 Builder nodes are for Docker build and registry push work. They should
 advertise `image-build` and should not advertise `sandbox`. The durable handoff
 from builders to sandbox nodes is a registry tag: build requests that should be
@@ -295,9 +303,11 @@ malformed JSON/object payloads. `status_code` is set for HTTP errors, `body`
 contains the decoded JSON error body when possible, and `headers` retains
 response headers such as `Retry-After`.
 
-Inspect retries transient scale-up, explicit `retryable: true`, and ambiguous
-gateway errors using the same sandbox id/spec. It checks for an accepted image
-build before resubmitting an ambiguous build request and retries safe sandbox
-deletion during cleanup. Normal SDK methods surface structured gateway errors
-to callers; the only transparent retry is the UCloud public-link pre-dispatch
-`Job is unavailable` response, bounded by the method's timeout budget.
+`create_sandbox()` and `build_image()` retry explicit cold-capacity responses
+within their total start/build budgets. They preserve the same sandbox id or
+prepared build payload across attempts. Inspect additionally checks for an
+accepted image build before resubmitting an ambiguous build request and retries
+safe sandbox deletion during cleanup. Other structured gateway errors surface
+to callers. The generic request transport only retries the UCloud public-link
+pre-dispatch `Job is unavailable` response, bounded by the method's timeout
+budget.

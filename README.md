@@ -6,6 +6,11 @@ Use this package from benchmark runners, evaluations, and user code that needs
 to create sandboxes, execute commands, stream results, manage images, and signal
 near-term capacity needs through a deployed UCloud sandbox gateway.
 
+For batch runners and code-generating agents, start with the
+[agent and workload guide](docs/agent-guide.md). It gives the recommended
+cold-start sequence, retry rules, concurrency limits, and cleanup contract in
+one place.
+
 ## Install
 
 ```bash
@@ -51,16 +56,17 @@ client = SandboxClient(
     api_token="<token>",
 )
 
-sandbox = client.create_sandbox(
-    id="example",
-    image=Image.from_registry("python:3.12-slim"),
-    command=["sleep", "300"],
-    cpus=1,
-    memory_mb=2048,
-    disk_mb=10240,
-    ttl_seconds=600,
-)
+sandbox_id = "example"
 try:
+    sandbox = client.create_sandbox(
+        id=sandbox_id,
+        image=Image.from_registry("python:3.12-slim"),
+        command=["sleep", "300"],
+        cpus=1,
+        memory_mb=2048,
+        disk_mb=10240,
+        ttl_seconds=600,
+    )
     result = sandbox.exec(
         ["python", "-c", "print('ok')"],
         timeout_seconds=30,
@@ -68,7 +74,8 @@ try:
     assert result.success
     print(result.stdout)
 finally:
-    sandbox.delete()
+    # The id may exist even if the final create response was lost.
+    client.delete_sandbox(sandbox_id)
 ```
 
 `create_sandbox()` waits through retryable cold-capacity responses for up to 30
@@ -174,6 +181,13 @@ for request in poll.requests:
 Use `AsyncRelayWorkerClient` for async workers; it exposes the same methods with
 `await`.
 
+The worker client remembers the latest registration token for each rollout and
+automatically sends it on heartbeat, poll, renew, respond, error, and
+unregister operations. Persist `registration_token` if work will continue in a
+new client process; rollout-scoped methods accept it explicitly. Re-registering
+the same rollout creates a new token and fences delayed operations from the old
+registration.
+
 ## Prepared Capacity
 
 If a runner knows it will soon need a burst of sandboxes, it can send a
@@ -190,13 +204,6 @@ client.prepare_capacity(
     ttl_seconds=900,
 )
 ```
-
-The worker client remembers the latest registration token for each rollout and
-automatically sends it on heartbeat, poll, renew, respond, error, and
-unregister operations. Persist `registration_token` if work will continue in a
-new client process; rollout-scoped methods accept it explicitly. Re-registering
-the same rollout creates a new token and fences delayed operations from the old
-registration.
 
 The signal contributes `count * resources` to gateway demand. Each newly
 reserved sandbox with the same resource shape and, when set, image atomically
@@ -252,6 +259,12 @@ client.prepare_builder(
 
 Builder prepare signals prewarm build-capable VM capacity only. They do not
 reserve a builder, upload a context, or transfer images to sandbox nodes.
+They are one-shot signals consumed after an executing autoscaler cycle reacts;
+ordinary sandbox-capacity hints instead remain until matching allocations claim
+their units or their TTL expires.
+Record the prepare id and call
+`client.delete_prepared_builder("mbpp-builds")` from the run's cleanup path; it
+is safe if the signal was already consumed.
 
 ## Images
 
@@ -379,17 +392,18 @@ async with AsyncSandboxClient(
     "https://app-sandboxes.cloud.sdu.dk",
     api_token="<token>",
 ) as client:
-    sandbox = await client.create_sandbox(
-        id="async-example",
-        image=Image.from_registry("busybox:latest"),
-        cpus=0.5,
-        memory_mb=256,
-        disk_mb=1024,
-    )
+    sandbox_id = "async-example"
     try:
+        sandbox = await client.create_sandbox(
+            id=sandbox_id,
+            image=Image.from_registry("busybox:latest"),
+            cpus=0.5,
+            memory_mb=256,
+            disk_mb=1024,
+        )
         result = await sandbox.exec(["true"], timeout_seconds=30)
     finally:
-        await sandbox.delete()
+        await client.delete_sandbox(sandbox_id)
 ```
 
 The async client mirrors the synchronous gateway operations.

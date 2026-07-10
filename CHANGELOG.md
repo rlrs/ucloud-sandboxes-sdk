@@ -4,6 +4,10 @@ This project uses semantic versioning.
 
 ## Unreleased
 
+- Added an opinionated agent/workload guide covering cold build/boot overlap,
+  stable operation identity, bounded concurrency, exec ambiguity, and cleanup.
+- Corrected the protocol documentation to distinguish allocation-claimed
+  sandbox capacity from one-shot prepared builder signals.
 - Streamed deterministic build contexts to a content-addressed binary upload
   endpoint before submitting compact build JSON, with transparent fallback to
   the legacy base64 request for older gateways.
