@@ -269,6 +269,47 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(sandbox.id, "timeout-one")
         self.assertAlmostEqual(float(captured_timeouts[0]), 7, places=2)
 
+    def test_sync_create_sandbox_waits_for_cold_capacity_with_stable_id(self) -> None:
+        client = SandboxClient("http://gateway.invalid")
+        payload_ids: list[str] = []
+
+        def request_json(
+            _method: str,
+            _path: str,
+            *,
+            payload: dict | None = None,
+            **_kwargs: object,
+        ) -> dict:
+            assert payload is not None
+            payload_ids.append(str(payload["id"]))
+            if len(payload_ids) < 3:
+                raise SandboxApiError(
+                    "cold capacity",
+                    status_code=503,
+                    body={
+                        "error": "no ready node has resources for sandbox request",
+                        "pending_resources": {"vcpu": 1},
+                    },
+                    headers={"Retry-After": "0"},
+                )
+            return {"sandbox": {"spec": dict(payload)}}
+
+        with patch.object(client, "_request_json", side_effect=request_json), patch.object(
+            client_module.time,
+            "sleep",
+            lambda _delay: None,
+        ):
+            sandbox = client.create_sandbox(
+                image=Image.from_registry("busybox"),
+                memory_mb=128,
+                start_timeout_seconds=1,
+            )
+
+        self.assertEqual(len(payload_ids), 3)
+        self.assertTrue(payload_ids[0].startswith("sdk-"))
+        self.assertEqual(len(set(payload_ids)), 1)
+        self.assertEqual(sandbox.id, payload_ids[0])
+
     def test_sync_client_uploads_local_build_context(self) -> None:
         with TemporaryDirectory() as raw_dir:
             context = Path(raw_dir) / "context"
@@ -295,6 +336,86 @@ class SandboxSdkTests(unittest.TestCase):
             built["image"]["received_archive_bytes"],
         )
         self.assertEqual(gateway.state.build_context_upload_results, [True])
+
+    def test_sync_build_wait_packages_and_uploads_context_once(self) -> None:
+        with TemporaryDirectory() as raw_dir:
+            context = Path(raw_dir) / "context"
+            context.mkdir()
+            (context / "Dockerfile").write_text("FROM busybox\n", encoding="utf-8")
+            image = Image.from_dockerfile(
+                name="cold-builder",
+                tag="registry.invalid/cold-builder:latest",
+                context_path=context,
+            )
+            client = SandboxClient("http://gateway.invalid")
+            packaged = 0
+            uploads = 0
+            submissions = 0
+            real_packager = client_module._tar_gz_directory
+
+            @contextmanager
+            def counted_packager(path: Path) -> Iterator[object]:
+                nonlocal packaged
+                packaged += 1
+                with real_packager(path) as archive:
+                    yield archive
+
+            def request_json(method: str, path: str, **kwargs: object) -> dict:
+                nonlocal uploads, submissions
+                if method == "GET" and path.startswith("/v1/image-contexts/"):
+                    raise SandboxApiError("missing", status_code=404, body={})
+                if method == "PUT" and path.startswith("/v1/image-contexts/"):
+                    uploads += 1
+                    return {"stored": True}
+                if method == "POST" and path == "/v1/images/build":
+                    submissions += 1
+                    if submissions < 3:
+                        raise SandboxApiError(
+                            "cold builder",
+                            status_code=503,
+                            body={
+                                "error": "no ready builder node is available",
+                                "pending_image_builds": 1,
+                            },
+                            headers={"Retry-After": "0"},
+                        )
+                    return {
+                        "build": {
+                            "build_id": "build-cold",
+                            "image_id": "cold-builder",
+                            "status": "running",
+                        }
+                    }
+                if method == "GET" and path == "/v1/images/builds/build-cold":
+                    return {
+                        "build": {
+                            "build_id": "build-cold",
+                            "image_id": "cold-builder",
+                            "status": "succeeded",
+                            "image": {"id": "cold-builder"},
+                        }
+                    }
+                self.fail(f"unexpected request: {method} {path} {kwargs}")
+
+            with patch.object(
+                client_module,
+                "_tar_gz_directory",
+                counted_packager,
+            ), patch.object(
+                client,
+                "_request_json",
+                side_effect=request_json,
+            ), patch.object(client_module.time, "sleep", lambda _delay: None):
+                result = client.build_image(
+                    image,
+                    timeout_seconds=1,
+                    retry_interval_seconds=0,
+                )
+
+        self.assertEqual(result["image"]["id"], "cold-builder")
+        self.assertEqual(packaged, 1)
+        self.assertEqual(uploads, 1)
+        self.assertEqual(submissions, 3)
 
     def test_sync_client_accepts_deduplicated_build_context_upload(self) -> None:
         with TemporaryDirectory() as raw_dir:
@@ -924,6 +1045,44 @@ class SandboxSdkTests(unittest.TestCase):
 
         self.assertEqual(sandbox_id, "timeout-one")
         self.assertAlmostEqual(float(_timeout_total(timeouts[0])), 7, places=2)
+
+    def test_async_create_sandbox_waits_for_cold_capacity(self) -> None:
+        async def scenario() -> tuple[str, list[str]]:
+            client = AsyncSandboxClient("http://gateway.invalid")
+            payload_ids: list[str] = []
+
+            async def request_json(
+                _method: str,
+                _path: str,
+                *,
+                payload: dict | None = None,
+                **_kwargs: object,
+            ) -> dict:
+                assert payload is not None
+                payload_ids.append(str(payload["id"]))
+                if len(payload_ids) < 2:
+                    raise SandboxApiError(
+                        "cold capacity",
+                        status_code=503,
+                        body={"error": "no ready node", "pending_resources": {}},
+                        headers={"Retry-After": "0"},
+                    )
+                return {"sandbox": {"spec": dict(payload)}}
+
+            with patch.object(client, "_request_json", side_effect=request_json):
+                sandbox = await client.create_sandbox(
+                    image=Image.from_registry("busybox"),
+                    memory_mb=128,
+                    start_timeout_seconds=1,
+                )
+            await client.close()
+            return sandbox.id, payload_ids
+
+        sandbox_id, payload_ids = asyncio.run(scenario())
+
+        self.assertEqual(len(payload_ids), 2)
+        self.assertEqual(len(set(payload_ids)), 1)
+        self.assertEqual(sandbox_id, payload_ids[0])
 
     def test_async_build_image_accepts_per_call_timeout(self) -> None:
         class FakeResponse:

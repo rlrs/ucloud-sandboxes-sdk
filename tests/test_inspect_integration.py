@@ -254,7 +254,14 @@ class InspectIntegrationTests(unittest.TestCase):
                 self.attempts = 0
                 self.timeouts: list[float | None] = []
 
-            async def create_sandbox(self, payload, *, request_timeout_seconds=None):
+            async def create_sandbox(
+                self,
+                payload,
+                *,
+                request_timeout_seconds=None,
+                start_timeout_seconds=None,
+            ):
+                self.assert_start_timeout = start_timeout_seconds
                 self.attempts += 1
                 self.timeouts.append(request_timeout_seconds)
                 if self.attempts < 3:
@@ -281,6 +288,7 @@ class InspectIntegrationTests(unittest.TestCase):
 
         self.assertEqual(result, {"created": "sandbox-one"})
         self.assertEqual(client.attempts, 3)
+        self.assertEqual(client.assert_start_timeout, 0)
         self.assertEqual(len(client.timeouts), 3)
         self.assertTrue(all(timeout is not None for timeout in client.timeouts))
         self.assertTrue(all(0 < timeout <= 5 for timeout in client.timeouts if timeout is not None))
@@ -292,7 +300,14 @@ class InspectIntegrationTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.attempts = 0
 
-            async def create_sandbox(self, _payload, *, request_timeout_seconds=None):
+            async def create_sandbox(
+                self,
+                _payload,
+                *,
+                request_timeout_seconds=None,
+                start_timeout_seconds=None,
+            ):
+                del start_timeout_seconds
                 del request_timeout_seconds
                 self.attempts += 1
                 raise SandboxApiError(
@@ -322,7 +337,14 @@ class InspectIntegrationTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.attempts = 0
 
-            async def create_sandbox(self, payload, *, request_timeout_seconds=None):
+            async def create_sandbox(
+                self,
+                payload,
+                *,
+                request_timeout_seconds=None,
+                start_timeout_seconds=None,
+            ):
+                del start_timeout_seconds
                 del request_timeout_seconds
                 self.attempts += 1
                 if self.attempts == 1:
@@ -365,7 +387,14 @@ class InspectIntegrationTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.attempts = 0
 
-            async def create_sandbox(self, payload, *, request_timeout_seconds=None):
+            async def create_sandbox(
+                self,
+                payload,
+                *,
+                request_timeout_seconds=None,
+                start_timeout_seconds=None,
+            ):
+                del start_timeout_seconds
                 del request_timeout_seconds
                 self.attempts += 1
                 if self.attempts == 1:
@@ -442,7 +471,14 @@ class InspectIntegrationTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.attempts = 0
 
-            async def create_sandbox(self, payload, *, request_timeout_seconds=None):
+            async def create_sandbox(
+                self,
+                payload,
+                *,
+                request_timeout_seconds=None,
+                start_timeout_seconds=None,
+            ):
+                del start_timeout_seconds
                 del request_timeout_seconds
                 self.attempts += 1
                 if self.attempts == 1:
@@ -471,7 +507,14 @@ class InspectIntegrationTests(unittest.TestCase):
                 self.attempts = 0
                 self.timeouts: list[float | None] = []
 
-            async def create_sandbox(self, payload, *, request_timeout_seconds=None):
+            async def create_sandbox(
+                self,
+                payload,
+                *,
+                request_timeout_seconds=None,
+                start_timeout_seconds=None,
+            ):
+                del start_timeout_seconds
                 self.attempts += 1
                 self.timeouts.append(request_timeout_seconds)
                 if self.attempts == 1:

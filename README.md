@@ -71,6 +71,12 @@ finally:
     sandbox.delete()
 ```
 
+`create_sandbox()` waits through retryable cold-capacity responses for up to 30
+minutes by default. When no `id` is supplied, the SDK creates one before the
+first request so every retry remains idempotent. Tune this with
+`start_timeout_seconds` and `retry_interval_seconds`; set
+`start_timeout_seconds=0` for a single attempt.
+
 `exec()` returns stdout, stderr, exit status, and the ordered event stream. For
 long-lived or interactive commands, call `start_exec()`, then use the returned
 exec handle to write stdin, read events, close stdin, or wait for completion.
@@ -247,6 +253,11 @@ sandbox = client.create_sandbox(
     disk_mb=10240,
 )
 ```
+
+`build_image()` likewise waits up to 30 minutes for builder capacity. It
+packages and uploads the build context once, then retries only the small
+content-addressed build request. Use `submit_image_build()` when a one-shot,
+non-waiting submission is desired.
 
 `Image.from_dockerfile(...)` describes a Docker build. `client.build_image(...)`
 uploads `context_path` as a compressed tarball by default, submits a tracked

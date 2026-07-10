@@ -14,6 +14,7 @@ import tempfile
 import time
 from typing import Any, AsyncIterator, BinaryIO, Callable, Iterator, Mapping, Sequence
 from urllib import error, parse, request
+from uuid import uuid4
 import warnings
 
 from ._http import (
@@ -39,6 +40,8 @@ MAX_FILE_RESPONSE_BYTES = 256 * 1024 * 1024
 BUILD_CONTEXT_SPOOL_MEMORY_BYTES = 8 * 1024 * 1024
 BUILD_CONTEXT_BASE64_CHUNK_BYTES = 3 * 1024 * 1024
 BUILD_CONTEXT_STREAM_CHUNK_BYTES = 1024 * 1024
+DEFAULT_SCALE_UP_TIMEOUT_SECONDS = 1800.0
+DEFAULT_SCALE_UP_RETRY_INTERVAL_SECONDS = 1.0
 
 
 class SandboxApiError(RuntimeError):
@@ -603,14 +606,19 @@ class SandboxClient:
         spec: SandboxSpec | None = None,
         *,
         request_timeout_seconds: float | None = None,
+        start_timeout_seconds: float = DEFAULT_SCALE_UP_TIMEOUT_SECONDS,
+        retry_interval_seconds: float = DEFAULT_SCALE_UP_RETRY_INTERVAL_SECONDS,
         **kwargs: Any,
     ) -> SandboxHandle:
         payload = _sandbox_payload(spec, **kwargs)
-        response = self._request_json(
-            "POST",
+        if not str(payload.get("id") or "").strip():
+            payload["id"] = f"sdk-{uuid4().hex}"
+        response = self._request_json_with_scale_up_wait(
             "/v1/sandboxes",
-            payload=payload,
-            timeout_seconds=request_timeout_seconds,
+            payload,
+            timeout_seconds=start_timeout_seconds,
+            request_timeout_seconds=request_timeout_seconds,
+            retry_interval_seconds=retry_interval_seconds,
         )
         record = response.get("sandbox")
         if not isinstance(record, dict):
@@ -620,6 +628,45 @@ class SandboxClient:
         if not isinstance(sandbox_id, str) or not sandbox_id:
             raise SandboxApiError("gateway sandbox payload is missing spec.id", body=response)
         return SandboxHandle(self, sandbox_id, record=record, create_response=response)
+
+    def _request_json_with_scale_up_wait(
+        self,
+        path: str,
+        payload: JsonObject,
+        *,
+        timeout_seconds: float,
+        request_timeout_seconds: float | None,
+        retry_interval_seconds: float,
+    ) -> JsonObject:
+        deadline = _deadline(max(0.0, timeout_seconds))
+        last_error: SandboxApiError | None = None
+        attempts = 0
+        while True:
+            remaining = _remaining_seconds(deadline)
+            if attempts > 0 and remaining is not None and remaining <= 0:
+                raise TimeoutError(_scale_up_timeout_message(path, last_error)) from last_error
+            attempts += 1
+            try:
+                return self._request_json(
+                    "POST",
+                    path,
+                    payload=payload,
+                    timeout_seconds=_request_timeout_seconds(
+                        remaining,
+                        self.timeout_seconds
+                        if request_timeout_seconds is None
+                        else request_timeout_seconds,
+                    ),
+                )
+            except SandboxApiError as exc:
+                if not _is_retryable_scale_up_error(exc):
+                    raise
+                last_error = exc
+                _sleep_for_scale_up_retry(
+                    exc,
+                    fallback_seconds=retry_interval_seconds,
+                    deadline=deadline,
+                )
 
     def create_ssh_sandbox(
         self,
@@ -838,11 +885,31 @@ class SandboxClient:
         upload_context: bool = True,
         timeout_seconds: float | None = None,
     ) -> JsonObject:
-        payload = _image_build_payload(image, upload_context=False)
         effective_timeout = (
             self.timeout_seconds if timeout_seconds is None else timeout_seconds
         )
         deadline = _deadline(effective_timeout)
+        payload = self._prepare_image_build_payload(
+            image,
+            upload_context=upload_context,
+            deadline=deadline,
+        )
+        submitted = self._request_json(
+            "POST",
+            "/v1/images/build",
+            payload=payload,
+            timeout_seconds=_remaining_seconds(deadline),
+        )
+        return _submitted_build_record(submitted)
+
+    def _prepare_image_build_payload(
+        self,
+        image: Image,
+        *,
+        upload_context: bool,
+        deadline: float | None,
+    ) -> JsonObject:
+        payload = _image_build_payload(image, upload_context=False)
         context_path = _local_build_context_path(payload) if upload_context else None
         if context_path is not None:
             with _tar_gz_directory(context_path) as archive:
@@ -887,16 +954,7 @@ class SandboxClient:
                         size=size,
                     )
         payload["wait"] = False
-        submitted = self._request_json(
-            "POST",
-            "/v1/images/build",
-            payload=payload,
-            timeout_seconds=_remaining_seconds(deadline),
-        )
-        build = submitted.get("build")
-        if not isinstance(build, dict):
-            raise SandboxApiError("gateway returned an invalid image build payload", body=submitted)
-        return build
+        return payload
 
     def wait_for_image_build(
         self,
@@ -943,15 +1001,30 @@ class SandboxClient:
         image: Image,
         *,
         upload_context: bool = True,
-        timeout_seconds: float | None = None,
+        timeout_seconds: float | None = DEFAULT_SCALE_UP_TIMEOUT_SECONDS,
         poll_interval_seconds: float = 5.0,
+        retry_interval_seconds: float = DEFAULT_SCALE_UP_RETRY_INTERVAL_SECONDS,
         on_status: Callable[[JsonObject], object] | None = None,
     ) -> JsonObject:
-        deadline = _deadline(timeout_seconds)
-        submitted = self.submit_image_build(
+        effective_timeout = (
+            DEFAULT_SCALE_UP_TIMEOUT_SECONDS
+            if timeout_seconds is None
+            else max(0.0, timeout_seconds)
+        )
+        deadline = _deadline(effective_timeout)
+        payload = self._prepare_image_build_payload(
             image,
             upload_context=upload_context,
-            timeout_seconds=timeout_seconds,
+            deadline=deadline,
+        )
+        submitted = _submitted_build_record(
+            self._request_json_with_scale_up_wait(
+                "/v1/images/build",
+                payload,
+                timeout_seconds=max(0.0, _remaining_seconds(deadline) or 0.0),
+                request_timeout_seconds=effective_timeout,
+                retry_interval_seconds=retry_interval_seconds,
+            )
         )
         build = self.wait_for_image_build(
             str(submitted.get("build_id") or submitted.get("image_id") or ""),
@@ -1479,14 +1552,19 @@ class AsyncSandboxClient:
         spec: SandboxSpec | None = None,
         *,
         request_timeout_seconds: float | None = None,
+        start_timeout_seconds: float = DEFAULT_SCALE_UP_TIMEOUT_SECONDS,
+        retry_interval_seconds: float = DEFAULT_SCALE_UP_RETRY_INTERVAL_SECONDS,
         **kwargs: Any,
     ) -> AsyncSandboxHandle:
         payload = _sandbox_payload(spec, **kwargs)
-        response = await self._request_json(
-            "POST",
+        if not str(payload.get("id") or "").strip():
+            payload["id"] = f"sdk-{uuid4().hex}"
+        response = await self._request_json_with_scale_up_wait(
             "/v1/sandboxes",
-            payload=payload,
-            timeout_seconds=request_timeout_seconds,
+            payload,
+            timeout_seconds=start_timeout_seconds,
+            request_timeout_seconds=request_timeout_seconds,
+            retry_interval_seconds=retry_interval_seconds,
         )
         record = response.get("sandbox")
         if not isinstance(record, dict):
@@ -1496,6 +1574,45 @@ class AsyncSandboxClient:
         if not isinstance(sandbox_id, str) or not sandbox_id:
             raise SandboxApiError("gateway sandbox payload is missing spec.id", body=response)
         return AsyncSandboxHandle(self, sandbox_id, record=record, create_response=response)
+
+    async def _request_json_with_scale_up_wait(
+        self,
+        path: str,
+        payload: JsonObject,
+        *,
+        timeout_seconds: float,
+        request_timeout_seconds: float | None,
+        retry_interval_seconds: float,
+    ) -> JsonObject:
+        deadline = _deadline(max(0.0, timeout_seconds))
+        last_error: SandboxApiError | None = None
+        attempts = 0
+        while True:
+            remaining = _remaining_seconds(deadline)
+            if attempts > 0 and remaining is not None and remaining <= 0:
+                raise TimeoutError(_scale_up_timeout_message(path, last_error)) from last_error
+            attempts += 1
+            try:
+                return await self._request_json(
+                    "POST",
+                    path,
+                    payload=payload,
+                    timeout_seconds=_request_timeout_seconds(
+                        remaining,
+                        self.timeout_seconds
+                        if request_timeout_seconds is None
+                        else request_timeout_seconds,
+                    ),
+                )
+            except SandboxApiError as exc:
+                if not _is_retryable_scale_up_error(exc):
+                    raise
+                last_error = exc
+                await _async_sleep_for_scale_up_retry(
+                    exc,
+                    fallback_seconds=retry_interval_seconds,
+                    deadline=deadline,
+                )
 
     async def create_ssh_sandbox(
         self,
@@ -1717,11 +1834,31 @@ class AsyncSandboxClient:
         upload_context: bool = True,
         timeout_seconds: float | None = None,
     ) -> JsonObject:
-        payload = _image_build_payload(image, upload_context=False)
         effective_timeout = (
             self.timeout_seconds if timeout_seconds is None else timeout_seconds
         )
         deadline = _deadline(effective_timeout)
+        payload = await self._prepare_image_build_payload(
+            image,
+            upload_context=upload_context,
+            deadline=deadline,
+        )
+        submitted = await self._request_json(
+            "POST",
+            "/v1/images/build",
+            payload=payload,
+            timeout_seconds=_remaining_seconds(deadline),
+        )
+        return _submitted_build_record(submitted)
+
+    async def _prepare_image_build_payload(
+        self,
+        image: Image,
+        *,
+        upload_context: bool,
+        deadline: float | None,
+    ) -> JsonObject:
+        payload = _image_build_payload(image, upload_context=False)
         context_path = _local_build_context_path(payload) if upload_context else None
         if context_path is not None:
             with _tar_gz_directory(context_path) as archive:
@@ -1766,16 +1903,7 @@ class AsyncSandboxClient:
                         size=size,
                     )
         payload["wait"] = False
-        submitted = await self._request_json(
-            "POST",
-            "/v1/images/build",
-            payload=payload,
-            timeout_seconds=_remaining_seconds(deadline),
-        )
-        build = submitted.get("build")
-        if not isinstance(build, dict):
-            raise SandboxApiError("gateway returned an invalid image build payload", body=submitted)
-        return build
+        return payload
 
     async def wait_for_image_build(
         self,
@@ -1822,15 +1950,30 @@ class AsyncSandboxClient:
         image: Image,
         *,
         upload_context: bool = True,
-        timeout_seconds: float | None = None,
+        timeout_seconds: float | None = DEFAULT_SCALE_UP_TIMEOUT_SECONDS,
         poll_interval_seconds: float = 5.0,
+        retry_interval_seconds: float = DEFAULT_SCALE_UP_RETRY_INTERVAL_SECONDS,
         on_status: Callable[[JsonObject], object] | None = None,
     ) -> JsonObject:
-        deadline = _deadline(timeout_seconds)
-        submitted = await self.submit_image_build(
+        effective_timeout = (
+            DEFAULT_SCALE_UP_TIMEOUT_SECONDS
+            if timeout_seconds is None
+            else max(0.0, timeout_seconds)
+        )
+        deadline = _deadline(effective_timeout)
+        payload = await self._prepare_image_build_payload(
             image,
             upload_context=upload_context,
-            timeout_seconds=timeout_seconds,
+            deadline=deadline,
+        )
+        submitted = _submitted_build_record(
+            await self._request_json_with_scale_up_wait(
+                "/v1/images/build",
+                payload,
+                timeout_seconds=max(0.0, _remaining_seconds(deadline) or 0.0),
+                request_timeout_seconds=effective_timeout,
+                retry_interval_seconds=retry_interval_seconds,
+            )
         )
         build = await self.wait_for_image_build(
             str(submitted.get("build_id") or submitted.get("image_id") or ""),
@@ -2095,6 +2238,16 @@ def _completed_build_payload(build: JsonObject) -> JsonObject:
         payload["pushCommand"] = list(build.get("push_command") or [])
         payload["pushExitCode"] = build.get("push_exit_code")
     return payload
+
+
+def _submitted_build_record(payload: JsonObject) -> JsonObject:
+    build = payload.get("build")
+    if not isinstance(build, dict):
+        raise SandboxApiError(
+            "gateway returned an invalid image build payload",
+            body=payload,
+        )
+    return build
 
 
 def _image_reference(image: object) -> str:
@@ -2506,6 +2659,76 @@ def _sleep_for_retry(delay_seconds: float, deadline: float | None) -> bool:
         return False
     time.sleep(delay_seconds)
     return True
+
+
+def _is_retryable_scale_up_error(exc: SandboxApiError) -> bool:
+    if not isinstance(exc.body, dict):
+        return False
+    if (
+        exc.status_code in {408, 425, 429, 500, 502, 503, 504}
+        and exc.body.get("retryable") is True
+    ):
+        return True
+    if exc.status_code != 503:
+        return False
+    message = str(exc.body.get("error") or "").lower()
+    return bool(
+        "pending_resources" in exc.body
+        or "pending_image_builds" in exc.body
+        or "no ready node" in message
+        or "no ready builder" in message
+    )
+
+
+def _scale_up_retry_delay(exc: SandboxApiError, fallback_seconds: float) -> float:
+    raw = next(
+        (
+            value
+            for key, value in exc.headers.items()
+            if key.lower() == "retry-after"
+        ),
+        None,
+    )
+    if raw is not None:
+        try:
+            return max(0.0, min(60.0, float(raw)))
+        except (TypeError, ValueError):
+            pass
+    return max(0.0, float(fallback_seconds))
+
+
+def _sleep_for_scale_up_retry(
+    exc: SandboxApiError,
+    *,
+    fallback_seconds: float,
+    deadline: float | None,
+) -> None:
+    delay = _scale_up_retry_delay(exc, fallback_seconds)
+    remaining = _remaining_seconds(deadline)
+    if remaining is not None:
+        delay = min(delay, max(0.0, remaining))
+    time.sleep(delay)
+
+
+async def _async_sleep_for_scale_up_retry(
+    exc: SandboxApiError,
+    *,
+    fallback_seconds: float,
+    deadline: float | None,
+) -> None:
+    delay = _scale_up_retry_delay(exc, fallback_seconds)
+    remaining = _remaining_seconds(deadline)
+    if remaining is not None:
+        delay = min(delay, max(0.0, remaining))
+    await asyncio.sleep(delay)
+
+
+def _scale_up_timeout_message(
+    path: str,
+    last_error: SandboxApiError | None,
+) -> str:
+    label = "sandbox capacity" if path == "/v1/sandboxes" else "builder capacity"
+    return f"timed out waiting for {label}: {last_error or 'no response'}"
 
 
 def _exec_event_payloads(session_id: str, value: object) -> list[JsonObject]:

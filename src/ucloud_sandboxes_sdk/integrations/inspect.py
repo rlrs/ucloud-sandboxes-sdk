@@ -876,6 +876,7 @@ async def _create_sandbox_with_wait(
                 DEFAULT_SCALE_UP_REQUEST_TIMEOUT_SECONDS,
                 timeout_seconds,
             ),
+            start_timeout_seconds=0,
         ),
     )
 
