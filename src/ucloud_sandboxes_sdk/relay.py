@@ -6,8 +6,18 @@ from typing import Any, Mapping
 from urllib import error, parse, request
 from urllib.parse import quote
 
+from ._http import (
+    ResponseTooLargeError,
+    open_no_redirect,
+    read_async_response,
+    read_sync_response,
+    response_headers,
+)
+
 
 JsonObject = dict[str, Any]
+MAX_RELAY_JSON_BYTES = 32 * 1024 * 1024
+RELAY_POLL_TIMEOUT_GRACE_SECONDS = 5.0
 
 
 class RelayApiError(RuntimeError):
@@ -17,10 +27,12 @@ class RelayApiError(RuntimeError):
         *,
         status_code: int | None = None,
         body: object | None = None,
+        headers: Mapping[str, str] | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.body = body
+        self.headers = dict(headers or {})
 
 
 @dataclass(frozen=True)
@@ -64,6 +76,7 @@ def model_relay_env(
 class RelayRequest:
     request_id: str
     rollout_id: str
+    registration_token: str
     endpoint: str
     method: str
     headers: dict[str, str]
@@ -80,9 +93,10 @@ class RelayRequest:
     def from_payload(cls, payload: Mapping[str, Any]) -> "RelayRequest":
         headers = payload.get("headers")
         body = payload.get("body")
-        return cls(
+        relay_request = cls(
             request_id=str(payload.get("request_id") or ""),
             rollout_id=str(payload.get("rollout_id") or ""),
+            registration_token=str(payload.get("registration_token") or ""),
             endpoint=str(payload.get("endpoint") or ""),
             method=str(payload.get("method") or "POST"),
             headers=_string_dict(headers),
@@ -99,6 +113,17 @@ class RelayRequest:
             ),
             delivery_count=_int(payload.get("delivery_count"), default=0),
         )
+        _validate_registration_token(relay_request.registration_token)
+        if (
+            not relay_request.request_id
+            or not relay_request.rollout_id
+            or not relay_request.lease_id
+        ):
+            raise RelayApiError(
+                "relay returned a request without request, rollout, or lease identity",
+                body=dict(payload),
+            )
+        return relay_request
 
 
 @dataclass(frozen=True)
@@ -129,7 +154,34 @@ class RelayPollResult:
         return cls(request=request_item or (requests[0] if requests else None), requests=requests)
 
 
-class RelayWorkerClient:
+class _RelayRegistrationCache:
+    def __init__(self) -> None:
+        self._registration_tokens: dict[str, str] = {}
+
+    def _remember_registration(self, rollout_id: str, response: JsonObject) -> None:
+        rollout = response.get("rollout")
+        if not isinstance(rollout, Mapping):
+            raise RelayApiError("relay returned an invalid registration payload", body=response)
+        token = str(rollout.get("registration_token") or "")
+        _validate_registration_token(token)
+        response_rollout_id = str(rollout.get("rollout_id") or rollout_id)
+        if response_rollout_id != rollout_id:
+            raise RelayApiError("relay registration rollout_id does not match", body=response)
+        self._registration_tokens[rollout_id] = token
+
+    def _registration_token(
+        self,
+        rollout_id: str,
+        registration_token: str | None,
+    ) -> str:
+        token = registration_token or self._registration_tokens.get(rollout_id, "")
+        _validate_registration_token(token)
+        if registration_token is not None:
+            self._registration_tokens[rollout_id] = token
+        return token
+
+
+class RelayWorkerClient(_RelayRegistrationCache):
     def __init__(
         self,
         relay_url: str,
@@ -138,6 +190,7 @@ class RelayWorkerClient:
         timeout_seconds: float = 30.0,
         headers: Mapping[str, str] | None = None,
     ) -> None:
+        super().__init__()
         self.relay_url = relay_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
         self.headers = dict(headers or {})
@@ -168,23 +221,42 @@ class RelayWorkerClient:
         payload: JsonObject = {"rollout_id": rollout_id}
         if metadata is not None:
             payload["metadata"] = dict(metadata)
-        return self._request_json("POST", "/register_rollout", payload=payload)
+        response = self._request_json("POST", "/register_rollout", payload=payload)
+        self._remember_registration(rollout_id, response)
+        return response
 
-    def unregister_rollout(self, rollout_id: str) -> JsonObject:
-        return self._request_json(
+    def unregister_rollout(
+        self,
+        rollout_id: str,
+        *,
+        registration_token: str | None = None,
+    ) -> JsonObject:
+        token = self._registration_token(rollout_id, registration_token)
+        response = self._request_json(
             "POST",
             "/unregister_rollout",
-            payload={"rollout_id": rollout_id},
+            payload={"rollout_id": rollout_id, "registration_token": token},
         )
+        if self._registration_tokens.get(rollout_id) == token:
+            self._registration_tokens.pop(rollout_id, None)
+        return response
 
     def heartbeat(
         self,
         rollout_id: str,
         worker_id: str,
         *,
+        registration_token: str | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> JsonObject:
-        payload: JsonObject = {"rollout_id": rollout_id, "worker_id": worker_id}
+        payload: JsonObject = {
+            "rollout_id": rollout_id,
+            "registration_token": self._registration_token(
+                rollout_id,
+                registration_token,
+            ),
+            "worker_id": worker_id,
+        }
         if metadata is not None:
             payload["metadata"] = dict(metadata)
         return self._request_json("POST", "/worker/heartbeat", payload=payload)
@@ -193,12 +265,19 @@ class RelayWorkerClient:
         self,
         rollout_id: str,
         *,
+        registration_token: str | None = None,
         worker_id: str | None = None,
         timeout_seconds: float | None = None,
         limit: int | None = None,
         lease_seconds: float | None = None,
     ) -> RelayPollResult:
-        query: dict[str, str] = {"rollout_id": rollout_id}
+        query: dict[str, str] = {
+            "rollout_id": rollout_id,
+            "registration_token": self._registration_token(
+                rollout_id,
+                registration_token,
+            ),
+        }
         if worker_id is not None:
             query["worker_id"] = worker_id
         if timeout_seconds is not None:
@@ -207,7 +286,18 @@ class RelayWorkerClient:
             query["limit"] = str(limit)
         if lease_seconds is not None:
             query["lease_seconds"] = _format_number(lease_seconds)
-        payload = self._request_json("GET", f"/worker/poll?{parse.urlencode(query)}")
+        payload = self._request_json(
+            "GET",
+            f"/worker/poll?{parse.urlencode(query)}",
+            timeout_seconds=(
+                max(
+                    self.timeout_seconds,
+                    timeout_seconds + RELAY_POLL_TIMEOUT_GRACE_SECONDS,
+                )
+                if timeout_seconds is not None
+                else None
+            ),
+        )
         return RelayPollResult.from_payload(payload)
 
     def renew(
@@ -215,10 +305,16 @@ class RelayWorkerClient:
         request_id: str,
         lease_id: str,
         *,
+        registration_token: str,
         worker_id: str | None = None,
         lease_seconds: float | None = None,
     ) -> RelayRequest:
-        payload: JsonObject = {"request_id": request_id, "lease_id": lease_id}
+        _validate_registration_token(registration_token)
+        payload: JsonObject = {
+            "registration_token": registration_token,
+            "request_id": request_id,
+            "lease_id": lease_id,
+        }
         if worker_id is not None:
             payload["worker_id"] = worker_id
         if lease_seconds is not None:
@@ -239,6 +335,7 @@ class RelayWorkerClient:
         return self.renew(
             relay_request.request_id,
             relay_request.lease_id,
+            registration_token=relay_request.registration_token,
             worker_id=worker_id,
             lease_seconds=lease_seconds,
         )
@@ -249,10 +346,13 @@ class RelayWorkerClient:
         lease_id: str,
         response: object,
         *,
+        registration_token: str,
         status: int = 200,
         headers: Mapping[str, str] | None = None,
     ) -> JsonObject:
+        _validate_registration_token(registration_token)
         payload: JsonObject = {
+            "registration_token": registration_token,
             "request_id": request_id,
             "lease_id": lease_id,
             "status": status,
@@ -274,6 +374,7 @@ class RelayWorkerClient:
             relay_request.request_id,
             relay_request.lease_id,
             response,
+            registration_token=relay_request.registration_token,
             status=status,
             headers=headers,
         )
@@ -284,12 +385,15 @@ class RelayWorkerClient:
         lease_id: str,
         message: str,
         *,
+        registration_token: str,
         status: int = 502,
     ) -> JsonObject:
+        _validate_registration_token(registration_token)
         return self._request_json(
             "POST",
             "/worker/error",
             payload={
+                "registration_token": registration_token,
                 "request_id": request_id,
                 "lease_id": lease_id,
                 "status": status,
@@ -308,6 +412,7 @@ class RelayWorkerClient:
             relay_request.request_id,
             relay_request.lease_id,
             message,
+            registration_token=relay_request.registration_token,
             status=status,
         )
 
@@ -317,8 +422,13 @@ class RelayWorkerClient:
         path: str,
         *,
         payload: JsonObject | None = None,
+        timeout_seconds: float | None = None,
     ) -> JsonObject:
         raw_body = json.dumps(payload).encode("utf-8") if payload is not None else None
+        if raw_body is not None and len(raw_body) > MAX_RELAY_JSON_BYTES:
+            raise RelayApiError(
+                f"relay request body exceeds the {MAX_RELAY_JSON_BYTES} byte limit"
+            )
         headers = dict(self.headers)
         if payload is not None:
             headers["Content-Type"] = "application/json"
@@ -329,26 +439,58 @@ class RelayWorkerClient:
             headers=headers,
         )
         try:
-            with request.urlopen(req, timeout=self.timeout_seconds) as response:
-                raw = response.read().decode("utf-8")
-                decoded = json.loads(raw) if raw else {}
+            with open_no_redirect(
+                req,
+                timeout=(
+                    self.timeout_seconds
+                    if timeout_seconds is None
+                    else timeout_seconds
+                ),
+            ) as response:
+                raw = read_sync_response(
+                    response,
+                    limit=MAX_RELAY_JSON_BYTES,
+                ).decode("utf-8")
+                try:
+                    decoded = json.loads(raw) if raw else {}
+                except json.JSONDecodeError as exc:
+                    raise RelayApiError(
+                        f"relay returned invalid JSON: {exc}",
+                        status_code=int(getattr(response, "status", 200)),
+                        body={"error": raw},
+                        headers=response_headers(response),
+                    ) from exc
         except error.HTTPError as exc:
-            raw = exc.read().decode("utf-8", errors="replace")
-            exc.close()
+            try:
+                raw = read_sync_response(
+                    exc,
+                    limit=MAX_RELAY_JSON_BYTES,
+                ).decode("utf-8", errors="replace")
+            except ResponseTooLargeError as size_exc:
+                api_error = RelayApiError(
+                    str(size_exc),
+                    status_code=exc.code,
+                    headers=response_headers(exc),
+                )
+                exc.close()
+                raise api_error from size_exc
             decoded = _decode_json_error(raw)
-            raise RelayApiError(
+            api_error = RelayApiError(
                 f"relay request failed ({exc.code}): {decoded}",
                 status_code=exc.code,
                 body=decoded,
-            ) from exc
-        except (OSError, json.JSONDecodeError) as exc:
+                headers=response_headers(exc),
+            )
+            exc.close()
+            raise api_error from exc
+        except (OSError, ResponseTooLargeError) as exc:
             raise RelayApiError(f"relay request failed: {exc}") from exc
         if not isinstance(decoded, dict):
             raise RelayApiError("relay returned a non-object JSON payload", body=decoded)
         return decoded
 
 
-class AsyncRelayWorkerClient:
+class AsyncRelayWorkerClient(_RelayRegistrationCache):
     def __init__(
         self,
         relay_url: str,
@@ -358,6 +500,7 @@ class AsyncRelayWorkerClient:
         headers: Mapping[str, str] | None = None,
         session: Any | None = None,
     ) -> None:
+        super().__init__()
         self.relay_url = relay_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
         self.headers = dict(headers or {})
@@ -402,23 +545,42 @@ class AsyncRelayWorkerClient:
         payload: JsonObject = {"rollout_id": rollout_id}
         if metadata is not None:
             payload["metadata"] = dict(metadata)
-        return await self._request_json("POST", "/register_rollout", payload=payload)
+        response = await self._request_json("POST", "/register_rollout", payload=payload)
+        self._remember_registration(rollout_id, response)
+        return response
 
-    async def unregister_rollout(self, rollout_id: str) -> JsonObject:
-        return await self._request_json(
+    async def unregister_rollout(
+        self,
+        rollout_id: str,
+        *,
+        registration_token: str | None = None,
+    ) -> JsonObject:
+        token = self._registration_token(rollout_id, registration_token)
+        response = await self._request_json(
             "POST",
             "/unregister_rollout",
-            payload={"rollout_id": rollout_id},
+            payload={"rollout_id": rollout_id, "registration_token": token},
         )
+        if self._registration_tokens.get(rollout_id) == token:
+            self._registration_tokens.pop(rollout_id, None)
+        return response
 
     async def heartbeat(
         self,
         rollout_id: str,
         worker_id: str,
         *,
+        registration_token: str | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> JsonObject:
-        payload: JsonObject = {"rollout_id": rollout_id, "worker_id": worker_id}
+        payload: JsonObject = {
+            "rollout_id": rollout_id,
+            "registration_token": self._registration_token(
+                rollout_id,
+                registration_token,
+            ),
+            "worker_id": worker_id,
+        }
         if metadata is not None:
             payload["metadata"] = dict(metadata)
         return await self._request_json("POST", "/worker/heartbeat", payload=payload)
@@ -427,12 +589,19 @@ class AsyncRelayWorkerClient:
         self,
         rollout_id: str,
         *,
+        registration_token: str | None = None,
         worker_id: str | None = None,
         timeout_seconds: float | None = None,
         limit: int | None = None,
         lease_seconds: float | None = None,
     ) -> RelayPollResult:
-        query: dict[str, str] = {"rollout_id": rollout_id}
+        query: dict[str, str] = {
+            "rollout_id": rollout_id,
+            "registration_token": self._registration_token(
+                rollout_id,
+                registration_token,
+            ),
+        }
         if worker_id is not None:
             query["worker_id"] = worker_id
         if timeout_seconds is not None:
@@ -441,7 +610,18 @@ class AsyncRelayWorkerClient:
             query["limit"] = str(limit)
         if lease_seconds is not None:
             query["lease_seconds"] = _format_number(lease_seconds)
-        payload = await self._request_json("GET", f"/worker/poll?{parse.urlencode(query)}")
+        payload = await self._request_json(
+            "GET",
+            f"/worker/poll?{parse.urlencode(query)}",
+            timeout_seconds=(
+                max(
+                    self.timeout_seconds,
+                    timeout_seconds + RELAY_POLL_TIMEOUT_GRACE_SECONDS,
+                )
+                if timeout_seconds is not None
+                else None
+            ),
+        )
         return RelayPollResult.from_payload(payload)
 
     async def renew(
@@ -449,10 +629,16 @@ class AsyncRelayWorkerClient:
         request_id: str,
         lease_id: str,
         *,
+        registration_token: str,
         worker_id: str | None = None,
         lease_seconds: float | None = None,
     ) -> RelayRequest:
-        payload: JsonObject = {"request_id": request_id, "lease_id": lease_id}
+        _validate_registration_token(registration_token)
+        payload: JsonObject = {
+            "registration_token": registration_token,
+            "request_id": request_id,
+            "lease_id": lease_id,
+        }
         if worker_id is not None:
             payload["worker_id"] = worker_id
         if lease_seconds is not None:
@@ -473,6 +659,7 @@ class AsyncRelayWorkerClient:
         return await self.renew(
             relay_request.request_id,
             relay_request.lease_id,
+            registration_token=relay_request.registration_token,
             worker_id=worker_id,
             lease_seconds=lease_seconds,
         )
@@ -483,10 +670,13 @@ class AsyncRelayWorkerClient:
         lease_id: str,
         response: object,
         *,
+        registration_token: str,
         status: int = 200,
         headers: Mapping[str, str] | None = None,
     ) -> JsonObject:
+        _validate_registration_token(registration_token)
         payload: JsonObject = {
+            "registration_token": registration_token,
             "request_id": request_id,
             "lease_id": lease_id,
             "status": status,
@@ -508,6 +698,7 @@ class AsyncRelayWorkerClient:
             relay_request.request_id,
             relay_request.lease_id,
             response,
+            registration_token=relay_request.registration_token,
             status=status,
             headers=headers,
         )
@@ -518,12 +709,15 @@ class AsyncRelayWorkerClient:
         lease_id: str,
         message: str,
         *,
+        registration_token: str,
         status: int = 502,
     ) -> JsonObject:
+        _validate_registration_token(registration_token)
         return await self._request_json(
             "POST",
             "/worker/error",
             payload={
+                "registration_token": registration_token,
                 "request_id": request_id,
                 "lease_id": lease_id,
                 "status": status,
@@ -542,6 +736,7 @@ class AsyncRelayWorkerClient:
             relay_request.request_id,
             relay_request.lease_id,
             message,
+            registration_token=relay_request.registration_token,
             status=status,
         )
 
@@ -567,7 +762,14 @@ class AsyncRelayWorkerClient:
         path: str,
         *,
         payload: JsonObject | None = None,
+        timeout_seconds: float | None = None,
     ) -> JsonObject:
+        if payload is not None:
+            encoded = json.dumps(payload).encode("utf-8")
+            if len(encoded) > MAX_RELAY_JSON_BYTES:
+                raise RelayApiError(
+                    f"relay request body exceeds the {MAX_RELAY_JSON_BYTES} byte limit"
+                )
         client = await self._client()
         headers = dict(self.headers)
         async with client.request(
@@ -575,21 +777,54 @@ class AsyncRelayWorkerClient:
             self.relay_url + path,
             json=payload,
             headers=headers,
+            allow_redirects=False,
+            timeout=(
+                self.timeout_seconds if timeout_seconds is None else timeout_seconds
+            ),
         ) as response:
-            raw = await response.text()
+            try:
+                raw = (
+                    await read_async_response(
+                        response,
+                        limit=MAX_RELAY_JSON_BYTES,
+                    )
+                ).decode("utf-8")
+            except ResponseTooLargeError as exc:
+                raise RelayApiError(
+                    str(exc),
+                    status_code=response.status,
+                    headers=response_headers(response),
+                ) from exc
             try:
                 decoded = json.loads(raw) if raw else {}
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as exc:
+                if 200 <= response.status < 300:
+                    raise RelayApiError(
+                        f"relay returned invalid JSON: {exc}",
+                        status_code=response.status,
+                        body={"error": raw},
+                        headers=response_headers(response),
+                    ) from exc
                 decoded = {"error": raw}
-            if response.status >= 400:
+            if not 200 <= response.status < 300:
                 raise RelayApiError(
                     f"relay request failed ({response.status}): {decoded}",
                     status_code=response.status,
                     body=decoded,
+                    headers=response_headers(response),
                 )
         if not isinstance(decoded, dict):
             raise RelayApiError("relay returned a non-object JSON payload", body=decoded)
         return decoded
+
+
+def _validate_registration_token(value: object) -> None:
+    token = value if isinstance(value, str) else ""
+    if len(token) != 32 or any(character not in "0123456789abcdef" for character in token):
+        raise RelayApiError(
+            "registration_token must be the 32-character token returned by "
+            "register_rollout"
+        )
 
 
 def _decode_json_error(raw: str) -> object:

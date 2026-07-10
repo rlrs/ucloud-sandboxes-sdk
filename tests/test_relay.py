@@ -18,6 +18,8 @@ from ucloud_sandboxes_sdk import (
     model_relay_env,
 )
 
+REGISTRATION_TOKEN = "a" * 32
+
 
 class ModelRelayConfigTests(unittest.TestCase):
     def test_builds_path_scoped_openai_environment(self) -> None:
@@ -45,6 +47,34 @@ class ModelRelayConfigTests(unittest.TestCase):
 
 
 class RelayWorkerClientTests(unittest.TestCase):
+    def test_worker_operations_require_a_current_registration(self) -> None:
+        client = RelayWorkerClient(
+            "https://relay.invalid",
+            worker_token="worker-token",
+        )
+
+        with self.assertRaises(RelayApiError) as raised:
+            client.poll("not-registered")
+
+        self.assertIn("registration_token", str(raised.exception))
+
+    def test_registration_token_can_seed_a_restarted_worker_client(self) -> None:
+        with running_relay() as relay:
+            first = RelayWorkerClient(relay.base_url, worker_token="worker-token")
+            registered = first.register_rollout("restart-run")
+            token = registered["rollout"]["registration_token"]
+
+            restarted = RelayWorkerClient(relay.base_url, worker_token="worker-token")
+            poll = restarted.poll(
+                "restart-run",
+                registration_token=token,
+                timeout_seconds=0,
+            )
+            heartbeat = restarted.heartbeat("restart-run", "worker-after-restart")
+
+        self.assertIsNotNone(poll.request)
+        self.assertEqual(heartbeat["worker"]["worker_id"], "worker-after-restart")
+
     def test_sync_worker_client_supports_full_lease_lifecycle(self) -> None:
         with running_relay() as relay:
             client = RelayWorkerClient(relay.base_url, worker_token="worker-token")
@@ -99,6 +129,14 @@ class RelayWorkerClientTests(unittest.TestCase):
         self.assertTrue(unregistered["existed"])
         self.assertEqual(relay.state.last_poll_query["limit"], ["8"])
         self.assertEqual(relay.state.last_poll_query["lease_seconds"], ["600"])
+        self.assertEqual(
+            relay.state.last_poll_query["registration_token"],
+            [REGISTRATION_TOKEN],
+        )
+        self.assertEqual(
+            relay.state.last_renew_payload["registration_token"],
+            REGISTRATION_TOKEN,
+        )
         self.assertEqual(relay.state.last_renew_payload["lease_seconds"], 900)
         self.assertEqual(relay.state.last_respond_payload["headers"], {"X-Model": "local"})
         self.assertEqual(relay.state.last_error_payload["status"], 503)
@@ -205,10 +243,15 @@ class FakeRelayHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/worker/poll":
             query = parse_qs(parsed.query)
+            rollout_id = query.get("rollout_id", [""])[0]
+            registration_token = query.get("registration_token", [""])[0]
+            if not self._check_registration(rollout_id, registration_token):
+                return
             with self.state.lock:
                 self.state.last_poll_query = query
             request = _relay_request(
-                rollout_id=query.get("rollout_id", [""])[0],
+                rollout_id=rollout_id,
+                registration_token=registration_token,
                 leased_by=query.get("worker_id", [""])[0],
             )
             self._write_json({"request": request, "requests": [request]})
@@ -224,6 +267,7 @@ class FakeRelayHandler(BaseHTTPRequestHandler):
             rollout_id = str(payload.get("rollout_id") or "")
             record = {
                 "rollout_id": rollout_id,
+                "registration_token": REGISTRATION_TOKEN,
                 "metadata": dict(payload.get("metadata") or {}),
             }
             with self.state.lock:
@@ -232,11 +276,21 @@ class FakeRelayHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/unregister_rollout":
             rollout_id = str(payload.get("rollout_id") or "")
+            if not self._check_registration(
+                rollout_id,
+                str(payload.get("registration_token") or ""),
+            ):
+                return
             with self.state.lock:
                 existed = self.state.rollouts.pop(rollout_id, None) is not None
             self._write_json({"ok": True, "rollout_id": rollout_id, "existed": existed})
             return
         if parsed.path == "/worker/heartbeat":
+            if not self._check_registration(
+                str(payload.get("rollout_id") or ""),
+                str(payload.get("registration_token") or ""),
+            ):
+                return
             self._write_json(
                 {
                     "ok": True,
@@ -249,13 +303,20 @@ class FakeRelayHandler(BaseHTTPRequestHandler):
             )
             return
         if parsed.path == "/worker/renew":
+            rollout_id = self._rollout_for_token(
+                str(payload.get("registration_token") or "")
+            )
+            if rollout_id is None:
+                self._write_json({"error": "stale registration"}, status=HTTPStatus.CONFLICT)
+                return
             with self.state.lock:
                 self.state.last_renew_payload = dict(payload)
             self._write_json(
                 {
                     "ok": True,
                     "request": _relay_request(
-                        rollout_id="run-001",
+                        rollout_id=rollout_id,
+                        registration_token=str(payload["registration_token"]),
                         leased_by=str(payload.get("worker_id") or ""),
                         lease_expires_at=456.0,
                     ),
@@ -263,6 +324,9 @@ class FakeRelayHandler(BaseHTTPRequestHandler):
             )
             return
         if parsed.path == "/worker/respond":
+            if self._rollout_for_token(str(payload.get("registration_token") or "")) is None:
+                self._write_json({"error": "stale registration"}, status=HTTPStatus.CONFLICT)
+                return
             with self.state.lock:
                 self.state.last_respond_payload = dict(payload)
             self._write_json(
@@ -274,6 +338,9 @@ class FakeRelayHandler(BaseHTTPRequestHandler):
             )
             return
         if parsed.path == "/worker/error":
+            if self._rollout_for_token(str(payload.get("registration_token") or "")) is None:
+                self._write_json({"error": "stale registration"}, status=HTTPStatus.CONFLICT)
+                return
             with self.state.lock:
                 self.state.last_error_payload = dict(payload)
             self._write_json(
@@ -291,6 +358,26 @@ class FakeRelayHandler(BaseHTTPRequestHandler):
             return True
         self._write_json({"error": "unauthorized"}, status=HTTPStatus.UNAUTHORIZED)
         return False
+
+    def _check_registration(self, rollout_id: str, token: str) -> bool:
+        with self.state.lock:
+            record = self.state.rollouts.get(rollout_id)
+            valid = isinstance(record, dict) and record.get("registration_token") == token
+        if valid:
+            return True
+        self._write_json({"error": "stale registration"}, status=HTTPStatus.CONFLICT)
+        return False
+
+    def _rollout_for_token(self, token: str) -> str | None:
+        with self.state.lock:
+            return next(
+                (
+                    rollout_id
+                    for rollout_id, record in self.state.rollouts.items()
+                    if record.get("registration_token") == token
+                ),
+                None,
+            )
 
     def _read_json(self) -> dict:
         raw = self.rfile.read(int(self.headers.get("Content-Length") or "0"))
@@ -314,12 +401,14 @@ class FakeRelayHandler(BaseHTTPRequestHandler):
 def _relay_request(
     *,
     rollout_id: str,
+    registration_token: str,
     leased_by: str,
     lease_expires_at: float = 123.0,
 ) -> dict:
     return {
         "request_id": "req-1",
         "rollout_id": rollout_id,
+        "registration_token": registration_token,
         "endpoint": "/v1/chat/completions",
         "method": "POST",
         "headers": {"X-Relay": "yes"},
