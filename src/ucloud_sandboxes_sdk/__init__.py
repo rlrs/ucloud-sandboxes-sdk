@@ -4,6 +4,7 @@ from .client import (
     AsyncExecHandle,
     AsyncSandboxClient,
     AsyncSandboxHandle,
+    ExecEventHistoryLostError,
     Image,
     SandboxApiError,
     SandboxClient,
@@ -26,13 +27,14 @@ from .relay import (
     model_relay_env,
 )
 
-__version__ = "0.2.7"
+__version__ = "0.2.8"
 
 __all__ = [
     "AsyncExecHandle",
     "AsyncRelayWorkerClient",
     "AsyncSandboxClient",
     "AsyncSandboxHandle",
+    "ExecEventHistoryLostError",
     "Image",
     "SandboxApiError",
     "SandboxClient",

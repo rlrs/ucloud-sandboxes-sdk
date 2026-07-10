@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 import ucloud_sandboxes_sdk.client as client_module
 from ucloud_sandboxes_sdk import (
     AsyncSandboxClient,
+    ExecEventHistoryLostError,
     Image,
     SandboxApiError,
     SandboxClient,
@@ -31,8 +32,10 @@ class SandboxSdkTests(unittest.TestCase):
             client = SandboxClient(gateway.base_url, api_token="secret-token")
 
             health = client.health()
+            nodes = client.list_nodes()
 
         self.assertTrue(health["ok"])
+        self.assertEqual(nodes[0]["node_id"], "fake-node")
         lower_headers = {
             key.lower(): value for key, value in gateway.state.last_headers.items()
         }
@@ -45,6 +48,94 @@ class SandboxSdkTests(unittest.TestCase):
             sandbox_auth_headers(" secret-token "),
             {"X-UCloud-Sandbox-Token": "secret-token"},
         )
+
+    def test_credentialed_clients_reject_redirects(self) -> None:
+        with running_redirect_gateway() as gateway:
+            sync_client = SandboxClient(gateway.base_url, api_token="secret-token")
+            with self.assertRaises(SandboxApiError) as sync_raised:
+                sync_client.health()
+
+            async def scenario() -> None:
+                async with AsyncSandboxClient(
+                    gateway.base_url,
+                    api_token="secret-token",
+                ) as async_client:
+                    with self.assertRaises(SandboxApiError) as async_raised:
+                        await async_client.health()
+                    self.assertEqual(async_raised.exception.status_code, 302)
+
+            asyncio.run(scenario())
+
+        self.assertEqual(sync_raised.exception.status_code, 302)
+        self.assertEqual(gateway.state.redirected_hits, 0)
+        self.assertEqual(gateway.state.initial_tokens, ["secret-token", "secret-token"])
+
+    def test_exec_wait_rejects_evicted_event_history(self) -> None:
+        class GapClient:
+            def read_exec_events(self, *_args: object, **_kwargs: object) -> dict:
+                return {
+                    "events": [{"sequence": 2, "stream": "stdout", "data": "tail"}],
+                    "session": {"status": "exited", "exit_code": 0},
+                }
+
+        handle = client_module.ExecHandle(GapClient(), "exec-gap", "sandbox-one")
+
+        with self.assertRaises(ExecEventHistoryLostError) as raised:
+            handle.wait(timeout_seconds=1)
+
+        self.assertEqual(raised.exception.expected_sequence, 1)
+        self.assertEqual(raised.exception.received_sequence, 2)
+
+    def test_async_exec_wait_rejects_evicted_event_history(self) -> None:
+        class GapClient:
+            async def read_exec_events(
+                self,
+                *_args: object,
+                **_kwargs: object,
+            ) -> dict:
+                return {
+                    "events": [{"sequence": 4, "stream": "stderr", "data": "tail"}],
+                    "session": {"status": "failed", "exit_code": 1},
+                }
+
+        async def scenario() -> None:
+            handle = client_module.AsyncExecHandle(
+                GapClient(),
+                "exec-async-gap",
+                "sandbox-one",
+            )
+            with self.assertRaises(ExecEventHistoryLostError) as raised:
+                await handle.wait(timeout_seconds=1)
+            self.assertEqual(raised.exception.expected_sequence, 1)
+            self.assertEqual(raised.exception.received_sequence, 4)
+
+        asyncio.run(scenario())
+
+    def test_async_client_rejects_malformed_success_json(self) -> None:
+        class FakeResponse:
+            status = 200
+            headers: dict[str, str] = {}
+
+            async def __aenter__(self) -> "FakeResponse":
+                return self
+
+            async def __aexit__(self, *args: object) -> None:
+                del args
+
+            async def text(self) -> str:
+                return "<html>not json</html>"
+
+        class FakeSession:
+            def request(self, *_args: object, **_kwargs: object) -> FakeResponse:
+                return FakeResponse()
+
+        async def scenario() -> None:
+            client = AsyncSandboxClient("http://gateway.invalid", session=FakeSession())
+            with self.assertRaises(SandboxApiError) as raised:
+                await client.health()
+            self.assertEqual(raised.exception.status_code, 200)
+
+        asyncio.run(scenario())
 
     def test_sync_client_lifecycle_and_exec(self) -> None:
         with running_gateway() as gateway:
@@ -163,7 +254,7 @@ class SandboxSdkTests(unittest.TestCase):
             )
 
         client = SandboxClient("http://gateway.invalid", timeout_seconds=11)
-        with patch.object(client_module.request, "urlopen", fake_urlopen):
+        with patch.object(client_module, "open_no_redirect", fake_urlopen):
             sandbox = client.create_sandbox(
                 id="timeout-one",
                 image=Image.from_registry("busybox"),
@@ -172,7 +263,7 @@ class SandboxSdkTests(unittest.TestCase):
             )
 
         self.assertEqual(sandbox.id, "timeout-one")
-        self.assertEqual(captured_timeouts, [7])
+        self.assertAlmostEqual(float(captured_timeouts[0]), 7, places=2)
 
     def test_sync_client_uploads_local_build_context(self) -> None:
         with TemporaryDirectory() as raw_dir:
@@ -246,7 +337,7 @@ class SandboxSdkTests(unittest.TestCase):
             )
 
         client = SandboxClient("http://gateway.invalid", timeout_seconds=11)
-        with patch.object(client_module.request, "urlopen", fake_urlopen):
+        with patch.object(client_module, "open_no_redirect", fake_urlopen):
             client.build_image(
                 Image.from_dockerfile(
                     name="slow-build",
@@ -256,7 +347,8 @@ class SandboxSdkTests(unittest.TestCase):
                 timeout_seconds=123,
             )
 
-        self.assertEqual(captured_timeouts, [123, 11])
+        self.assertAlmostEqual(float(captured_timeouts[0]), 123, places=2)
+        self.assertAlmostEqual(float(captured_timeouts[1]), 11, places=2)
 
     def test_sync_client_surfaces_api_errors(self) -> None:
         with running_gateway() as gateway:
@@ -301,7 +393,7 @@ class SandboxSdkTests(unittest.TestCase):
             return FakeResponse()
 
         client = SandboxClient("http://gateway.invalid")
-        with patch.object(client_module.request, "urlopen", fake_urlopen), patch.object(
+        with patch.object(client_module, "open_no_redirect", fake_urlopen), patch.object(
             client_module.time,
             "sleep",
             lambda _delay: None,
@@ -325,7 +417,7 @@ class SandboxSdkTests(unittest.TestCase):
             )
 
         client = SandboxClient("http://gateway.invalid")
-        with patch.object(client_module.request, "urlopen", fake_urlopen):
+        with patch.object(client_module, "open_no_redirect", fake_urlopen):
             with self.assertRaises(SandboxApiError) as raised:
                 client.health()
 
@@ -461,7 +553,7 @@ class SandboxSdkTests(unittest.TestCase):
         sandbox_id, timeouts = asyncio.run(scenario())
 
         self.assertEqual(sandbox_id, "timeout-one")
-        self.assertEqual([_timeout_total(timeout) for timeout in timeouts], [7])
+        self.assertAlmostEqual(float(_timeout_total(timeouts[0])), 7, places=2)
 
     def test_async_build_image_accepts_per_call_timeout(self) -> None:
         class FakeResponse:
@@ -511,7 +603,8 @@ class SandboxSdkTests(unittest.TestCase):
 
         timeouts = asyncio.run(scenario())
 
-        self.assertEqual([_timeout_total(timeout) for timeout in timeouts], [123, 11])
+        self.assertAlmostEqual(float(_timeout_total(timeouts[0])), 123, places=2)
+        self.assertAlmostEqual(float(_timeout_total(timeouts[1])), 11, places=2)
 
     def test_async_client_retries_ucloud_unavailable_html(self) -> None:
         class FakeResponse:
@@ -559,6 +652,57 @@ class SandboxSdkTests(unittest.TestCase):
 
 def _timeout_total(timeout: object) -> object:
     return getattr(timeout, "total", timeout)
+
+
+class RedirectGatewayState:
+    def __init__(self) -> None:
+        self.initial_tokens: list[str] = []
+        self.redirected_hits = 0
+
+
+class RedirectGatewayHandle:
+    def __init__(self, base_url: str, state: RedirectGatewayState) -> None:
+        self.base_url = base_url
+        self.state = state
+
+
+@contextmanager
+def running_redirect_gateway() -> Iterator[RedirectGatewayHandle]:
+    state = RedirectGatewayState()
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, _format: str, *_args: object) -> None:
+            return
+
+        def do_GET(self) -> None:
+            if self.path == "/healthz":
+                state.initial_tokens.append(
+                    self.headers.get("X-UCloud-Sandbox-Token") or ""
+                )
+                self.send_response(HTTPStatus.FOUND)
+                self.send_header("Location", "/redirected")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if self.path == "/redirected":
+                state.redirected_hits += 1
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "12")
+                self.end_headers()
+                self.wfile.write(b'{"ok": true}')
+                return
+            self.send_error(HTTPStatus.NOT_FOUND)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        yield RedirectGatewayHandle(f"http://{host}:{port}", state)
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 @contextmanager
@@ -622,6 +766,9 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
             return
         if path == "/v1/heartbeat":
             self._write_json({"node_id": "fake-node"})
+            return
+        if path == "/v1/nodes":
+            self._write_json({"nodes": [{"node_id": "fake-node"}]})
             return
         if path == "/v1/sandboxes":
             with self.state.lock:

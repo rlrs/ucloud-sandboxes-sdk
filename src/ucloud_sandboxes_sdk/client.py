@@ -11,6 +11,15 @@ import tarfile
 import time
 from typing import Any, AsyncIterator, Callable, Iterator, Mapping, Sequence
 from urllib import error, parse, request
+import warnings
+
+from ._http import (
+    ResponseTooLargeError,
+    open_no_redirect,
+    read_async_response,
+    read_sync_response,
+    response_headers,
+)
 
 
 JsonObject = dict[str, Any]
@@ -20,6 +29,10 @@ UCLOUD_UNAVAILABLE_STATUS = 503
 UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS = 6
 UCLOUD_UNAVAILABLE_RETRY_BASE_DELAY_SECONDS = 0.25
 UCLOUD_UNAVAILABLE_RETRY_MAX_DELAY_SECONDS = 4.0
+MAX_JSON_BODY_BYTES = 16 * 1024 * 1024
+MAX_FILE_BODY_BYTES = 256 * 1024 * 1024
+MAX_JSON_RESPONSE_BYTES = 16 * 1024 * 1024
+MAX_FILE_RESPONSE_BYTES = 256 * 1024 * 1024
 
 
 class SandboxApiError(RuntimeError):
@@ -29,10 +42,34 @@ class SandboxApiError(RuntimeError):
         *,
         status_code: int | None = None,
         body: object | None = None,
+        headers: Mapping[str, str] | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.body = body
+        self.headers = dict(headers or {})
+
+
+class ExecEventHistoryLostError(SandboxApiError):
+    def __init__(
+        self,
+        session_id: str,
+        *,
+        expected_sequence: int,
+        received_sequence: int,
+    ) -> None:
+        super().__init__(
+            f"exec event history was truncated for {session_id}: expected sequence "
+            f"{expected_sequence}, received {received_sequence}",
+            body={
+                "session_id": session_id,
+                "expected_sequence": expected_sequence,
+                "received_sequence": received_sequence,
+            },
+        )
+        self.session_id = session_id
+        self.expected_sequence = expected_sequence
+        self.received_sequence = received_sequence
 
 
 def sandbox_auth_headers(api_token: str | None) -> dict[str, str]:
@@ -390,11 +427,13 @@ class ExecHandle:
                 wait_seconds=wait_seconds,
             )
             raw_events = payload.get("events")
-            events = raw_events if isinstance(raw_events, list) else []
+            events = _exec_event_payloads(self.session_id, raw_events)
             for event in events:
-                if not isinstance(event, dict):
-                    continue
-                self.last_sequence = max(self.last_sequence, int(event.get("sequence") or 0))
+                self.last_sequence = _next_exec_sequence(
+                    self.session_id,
+                    self.last_sequence,
+                    event,
+                )
                 yield event
             session = payload.get("session")
             if isinstance(session, dict):
@@ -427,9 +466,13 @@ class ExecHandle:
                 wait_seconds=wait_seconds,
             )
             raw_events = payload.get("events")
-            new_events = [item for item in raw_events if isinstance(item, dict)] if isinstance(raw_events, list) else []
+            new_events = _exec_event_payloads(self.session_id, raw_events)
             for event in new_events:
-                self.last_sequence = max(self.last_sequence, int(event.get("sequence") or 0))
+                self.last_sequence = _next_exec_sequence(
+                    self.session_id,
+                    self.last_sequence,
+                    event,
+                )
                 events.append(event)
             session = payload.get("session")
             if isinstance(session, dict):
@@ -461,7 +504,18 @@ class SandboxClient:
     def health(self) -> JsonObject:
         return self._request_json("GET", "/healthz")
 
+    def list_nodes(self) -> list[JsonObject]:
+        payload = self._request_json("GET", "/v1/nodes")
+        nodes = payload.get("nodes")
+        return [dict(item) for item in nodes if isinstance(item, dict)] if isinstance(nodes, list) else []
+
     def heartbeat(self) -> JsonObject:
+        warnings.warn(
+            "SandboxClient.heartbeat() targets the internal node-agent API and is "
+            "deprecated; use the public gateway and list_nodes() instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return self._request_json("GET", "/v1/heartbeat")
 
     def list_sandboxes(self) -> list[JsonObject]:
@@ -554,11 +608,11 @@ class SandboxClient:
         )
         record = response.get("sandbox")
         if not isinstance(record, dict):
-            raise SandboxApiError("node-agent returned an invalid sandbox payload", body=response)
+            raise SandboxApiError("gateway returned an invalid sandbox payload", body=response)
         sandbox_spec = record.get("spec")
         sandbox_id = sandbox_spec.get("id") if isinstance(sandbox_spec, dict) else None
         if not isinstance(sandbox_id, str) or not sandbox_id:
-            raise SandboxApiError("node-agent sandbox payload is missing spec.id", body=response)
+            raise SandboxApiError("gateway sandbox payload is missing spec.id", body=response)
         return SandboxHandle(self, sandbox_id, record=record, create_response=response)
 
     def create_ssh_sandbox(
@@ -601,7 +655,7 @@ class SandboxClient:
         return self.upload_file(
             sandbox_id,
             container_path,
-            Path(local_path).read_bytes(),
+            _read_file_bytes(Path(local_path), limit=MAX_FILE_BODY_BYTES),
         )
 
     def download_file(self, sandbox_id: str, container_path: str) -> bytes:
@@ -641,7 +695,7 @@ class SandboxClient:
         )
         session = response.get("session")
         if not isinstance(session, dict) or not isinstance(session.get("id"), str):
-            raise SandboxApiError("node-agent returned an invalid exec session payload", body=response)
+            raise SandboxApiError("gateway returned an invalid exec session payload", body=response)
         return ExecHandle(self, session["id"], sandbox_id, session=session)
 
     def exec(
@@ -910,12 +964,16 @@ class SandboxClient:
         timeout_seconds: float | None = None,
     ) -> JsonObject:
         raw_body = json.dumps(payload).encode("utf-8") if payload is not None else body
+        body_limit = MAX_JSON_BODY_BYTES if payload is not None else MAX_FILE_BODY_BYTES
+        if raw_body is not None and len(raw_body) > body_limit:
+            raise SandboxApiError(f"request body exceeds the {body_limit} byte limit")
         headers = dict(self.headers)
         if payload is not None:
             headers["Content-Type"] = "application/json"
         elif content_type is not None:
             headers["Content-Type"] = content_type
         timeout = self.timeout_seconds if timeout_seconds is None else timeout_seconds
+        deadline = _deadline(timeout)
         for attempt in range(UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS):
             req = request.Request(
                 self.base_url + path,
@@ -924,29 +982,67 @@ class SandboxClient:
                 headers=headers,
             )
             try:
-                with request.urlopen(req, timeout=timeout) as response:
-                    raw = response.read().decode("utf-8")
-                    decoded = json.loads(raw) if raw else {}
+                with open_no_redirect(
+                    req,
+                    timeout=_request_timeout_seconds(
+                        _remaining_seconds(deadline),
+                        timeout,
+                    ),
+                ) as response:
+                    raw = read_sync_response(
+                        response,
+                        limit=MAX_JSON_RESPONSE_BYTES,
+                    ).decode("utf-8")
+                    try:
+                        decoded = json.loads(raw) if raw else {}
+                    except json.JSONDecodeError as exc:
+                        raise SandboxApiError(
+                            f"gateway returned invalid JSON: {exc}",
+                            status_code=int(getattr(response, "status", 200)),
+                            body={"error": raw},
+                            headers=response_headers(response),
+                        ) from exc
             except error.HTTPError as exc:
-                raw = exc.read().decode("utf-8", errors="replace")
-                exc.close()
+                try:
+                    raw = read_sync_response(
+                        exc,
+                        limit=MAX_JSON_RESPONSE_BYTES,
+                    ).decode("utf-8", errors="replace")
+                except ResponseTooLargeError as size_exc:
+                    api_error = SandboxApiError(
+                        str(size_exc),
+                        status_code=exc.code,
+                        headers=response_headers(exc),
+                    )
+                    exc.close()
+                    raise api_error from size_exc
                 decoded = _decode_json_error(raw)
-                if _should_retry_ucloud_unavailable(exc.code, decoded, attempt):
-                    time.sleep(_ucloud_unavailable_retry_delay(attempt))
-                    continue
-                raise SandboxApiError(
-                    f"node-agent request failed ({exc.code}): {decoded}",
+                api_error = SandboxApiError(
+                    f"gateway request failed ({exc.code}): {decoded}",
                     status_code=exc.code,
                     body=decoded,
-                ) from exc
-            except (OSError, json.JSONDecodeError) as exc:
-                raise SandboxApiError(f"node-agent request failed: {exc}") from exc
+                    headers=response_headers(exc),
+                )
+                exc.close()
+                if _should_retry_ucloud_unavailable(exc.code, decoded, attempt):
+                    if _sleep_for_retry(
+                        _ucloud_unavailable_retry_delay(attempt),
+                        deadline,
+                    ):
+                        continue
+                raise api_error from exc
+            except (OSError, ResponseTooLargeError) as exc:
+                raise SandboxApiError(f"gateway request failed: {exc}") from exc
             if not isinstance(decoded, dict):
-                raise SandboxApiError("node-agent returned a non-object JSON payload", body=decoded)
+                raise SandboxApiError(
+                    "gateway returned a non-object JSON payload",
+                    body=decoded,
+                )
             return decoded
         raise AssertionError("unreachable UCloud unavailable retry state")
 
     def _request_bytes(self, method: str, path: str) -> bytes:
+        deadline = _deadline(self.timeout_seconds)
         for attempt in range(UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS):
             req = request.Request(
                 self.base_url + path,
@@ -954,22 +1050,48 @@ class SandboxClient:
                 headers=dict(self.headers),
             )
             try:
-                with request.urlopen(req, timeout=self.timeout_seconds) as response:
-                    return response.read()
+                with open_no_redirect(
+                    req,
+                    timeout=_request_timeout_seconds(
+                        _remaining_seconds(deadline),
+                        self.timeout_seconds,
+                    ),
+                ) as response:
+                    return read_sync_response(
+                        response,
+                        limit=MAX_FILE_RESPONSE_BYTES,
+                    )
             except error.HTTPError as exc:
-                raw = exc.read().decode("utf-8", errors="replace")
-                exc.close()
+                try:
+                    raw = read_sync_response(
+                        exc,
+                        limit=MAX_JSON_RESPONSE_BYTES,
+                    ).decode("utf-8", errors="replace")
+                except ResponseTooLargeError as size_exc:
+                    api_error = SandboxApiError(
+                        str(size_exc),
+                        status_code=exc.code,
+                        headers=response_headers(exc),
+                    )
+                    exc.close()
+                    raise api_error from size_exc
                 decoded = _decode_json_error(raw)
-                if _should_retry_ucloud_unavailable(exc.code, decoded, attempt):
-                    time.sleep(_ucloud_unavailable_retry_delay(attempt))
-                    continue
-                raise SandboxApiError(
-                    f"node-agent request failed ({exc.code}): {decoded}",
+                api_error = SandboxApiError(
+                    f"gateway request failed ({exc.code}): {decoded}",
                     status_code=exc.code,
                     body=decoded,
-                ) from exc
-            except OSError as exc:
-                raise SandboxApiError(f"node-agent request failed: {exc}") from exc
+                    headers=response_headers(exc),
+                )
+                exc.close()
+                if _should_retry_ucloud_unavailable(exc.code, decoded, attempt):
+                    if _sleep_for_retry(
+                        _ucloud_unavailable_retry_delay(attempt),
+                        deadline,
+                    ):
+                        continue
+                raise api_error from exc
+            except (OSError, ResponseTooLargeError) as exc:
+                raise SandboxApiError(f"gateway request failed: {exc}") from exc
         raise AssertionError("unreachable UCloud unavailable retry state")
 
 
@@ -1107,11 +1229,13 @@ class AsyncExecHandle:
                 wait_seconds=wait_seconds,
             )
             raw_events = payload.get("events")
-            events = raw_events if isinstance(raw_events, list) else []
+            events = _exec_event_payloads(self.session_id, raw_events)
             for event in events:
-                if not isinstance(event, dict):
-                    continue
-                self.last_sequence = max(self.last_sequence, int(event.get("sequence") or 0))
+                self.last_sequence = _next_exec_sequence(
+                    self.session_id,
+                    self.last_sequence,
+                    event,
+                )
                 yield event
             session = payload.get("session")
             if isinstance(session, dict):
@@ -1144,9 +1268,13 @@ class AsyncExecHandle:
                 wait_seconds=wait_seconds,
             )
             raw_events = payload.get("events")
-            new_events = [item for item in raw_events if isinstance(item, dict)] if isinstance(raw_events, list) else []
+            new_events = _exec_event_payloads(self.session_id, raw_events)
             for event in new_events:
-                self.last_sequence = max(self.last_sequence, int(event.get("sequence") or 0))
+                self.last_sequence = _next_exec_sequence(
+                    self.session_id,
+                    self.last_sequence,
+                    event,
+                )
                 events.append(event)
             session = payload.get("session")
             if isinstance(session, dict):
@@ -1193,7 +1321,18 @@ class AsyncSandboxClient:
     async def health(self) -> JsonObject:
         return await self._request_json("GET", "/healthz")
 
+    async def list_nodes(self) -> list[JsonObject]:
+        payload = await self._request_json("GET", "/v1/nodes")
+        nodes = payload.get("nodes")
+        return [dict(item) for item in nodes if isinstance(item, dict)] if isinstance(nodes, list) else []
+
     async def heartbeat(self) -> JsonObject:
+        warnings.warn(
+            "AsyncSandboxClient.heartbeat() targets the internal node-agent API "
+            "and is deprecated; use the public gateway and list_nodes() instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return await self._request_json("GET", "/v1/heartbeat")
 
     async def list_sandboxes(self) -> list[JsonObject]:
@@ -1286,11 +1425,11 @@ class AsyncSandboxClient:
         )
         record = response.get("sandbox")
         if not isinstance(record, dict):
-            raise SandboxApiError("node-agent returned an invalid sandbox payload", body=response)
+            raise SandboxApiError("gateway returned an invalid sandbox payload", body=response)
         sandbox_spec = record.get("spec")
         sandbox_id = sandbox_spec.get("id") if isinstance(sandbox_spec, dict) else None
         if not isinstance(sandbox_id, str) or not sandbox_id:
-            raise SandboxApiError("node-agent sandbox payload is missing spec.id", body=response)
+            raise SandboxApiError("gateway sandbox payload is missing spec.id", body=response)
         return AsyncSandboxHandle(self, sandbox_id, record=record, create_response=response)
 
     async def create_ssh_sandbox(
@@ -1333,7 +1472,7 @@ class AsyncSandboxClient:
         return await self.upload_file(
             sandbox_id,
             container_path,
-            Path(local_path).read_bytes(),
+            _read_file_bytes(Path(local_path), limit=MAX_FILE_BODY_BYTES),
         )
 
     async def download_file(self, sandbox_id: str, container_path: str) -> bytes:
@@ -1373,7 +1512,7 @@ class AsyncSandboxClient:
         )
         session = response.get("session")
         if not isinstance(session, dict) or not isinstance(session.get("id"), str):
-            raise SandboxApiError("node-agent returned an invalid exec session payload", body=response)
+            raise SandboxApiError("gateway returned an invalid exec session payload", body=response)
         return AsyncExecHandle(self, session["id"], sandbox_id, session=session)
 
     async def exec(
@@ -1658,13 +1797,16 @@ class AsyncSandboxClient:
         content_type: str | None = None,
         timeout_seconds: float | None = None,
     ) -> JsonObject:
+        raw_body = json.dumps(payload).encode("utf-8") if payload is not None else body
+        body_limit = MAX_JSON_BODY_BYTES if payload is not None else MAX_FILE_BODY_BYTES
+        if raw_body is not None and len(raw_body) > body_limit:
+            raise SandboxApiError(f"request body exceeds the {body_limit} byte limit")
         headers = dict(self.headers)
         if content_type is not None and payload is None:
             headers["Content-Type"] = content_type
         client = await self._client()
-        timeout = _aiohttp_timeout(
-            self.timeout_seconds if timeout_seconds is None else timeout_seconds
-        )
+        timeout = self.timeout_seconds if timeout_seconds is None else timeout_seconds
+        deadline = _deadline(timeout)
         for attempt in range(UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS):
             async with client.request(
                 method,
@@ -1672,56 +1814,111 @@ class AsyncSandboxClient:
                 json=payload,
                 data=body,
                 headers=headers,
-                timeout=timeout,
+                timeout=_aiohttp_timeout(
+                    _request_timeout_seconds(
+                        _remaining_seconds(deadline),
+                        timeout,
+                    )
+                ),
+                allow_redirects=False,
             ) as response:
-                raw = await response.text()
+                try:
+                    raw = (
+                        await read_async_response(
+                            response,
+                            limit=MAX_JSON_RESPONSE_BYTES,
+                        )
+                    ).decode("utf-8")
+                except ResponseTooLargeError as exc:
+                    raise SandboxApiError(
+                        str(exc),
+                        status_code=response.status,
+                        headers=response_headers(response),
+                    ) from exc
                 try:
                     decoded = json.loads(raw) if raw else {}
-                except json.JSONDecodeError:
+                except json.JSONDecodeError as exc:
+                    if 200 <= response.status < 300:
+                        raise SandboxApiError(
+                            f"gateway returned invalid JSON: {exc}",
+                            status_code=response.status,
+                            body={"error": raw},
+                            headers=response_headers(response),
+                        ) from exc
                     decoded = {"error": raw}
-                if response.status >= 400:
+                if not 200 <= response.status < 300:
+                    api_error = SandboxApiError(
+                        f"gateway request failed ({response.status}): {decoded}",
+                        status_code=response.status,
+                        body=decoded,
+                        headers=response_headers(response),
+                    )
                     if _should_retry_ucloud_unavailable(
                         response.status,
                         decoded,
                         attempt,
                     ):
-                        await asyncio.sleep(_ucloud_unavailable_retry_delay(attempt))
-                        continue
-                    raise SandboxApiError(
-                        f"node-agent request failed ({response.status}): {decoded}",
-                        status_code=response.status,
-                        body=decoded,
-                    )
+                        delay = _ucloud_unavailable_retry_delay(attempt)
+                        remaining = _remaining_seconds(deadline)
+                        if remaining is None or remaining > delay:
+                            await asyncio.sleep(delay)
+                            continue
+                    raise api_error
             if not isinstance(decoded, dict):
-                raise SandboxApiError("node-agent returned a non-object JSON payload", body=decoded)
+                raise SandboxApiError(
+                    "gateway returned a non-object JSON payload",
+                    body=decoded,
+                )
             return decoded
         raise AssertionError("unreachable UCloud unavailable retry state")
 
     async def _request_bytes(self, method: str, path: str) -> bytes:
         client = await self._client()
+        deadline = _deadline(self.timeout_seconds)
         for attempt in range(UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS):
             async with client.request(
                 method,
                 self.base_url + path,
                 headers=dict(self.headers),
-                timeout=_aiohttp_timeout(self.timeout_seconds),
+                timeout=_aiohttp_timeout(
+                    _request_timeout_seconds(
+                        _remaining_seconds(deadline),
+                        self.timeout_seconds,
+                    )
+                ),
+                allow_redirects=False,
             ) as response:
-                raw = await response.read()
-                if response.status >= 400:
+                try:
+                    raw = await read_async_response(
+                        response,
+                        limit=MAX_FILE_RESPONSE_BYTES,
+                    )
+                except ResponseTooLargeError as exc:
+                    raise SandboxApiError(
+                        str(exc),
+                        status_code=response.status,
+                        headers=response_headers(response),
+                    ) from exc
+                if not 200 <= response.status < 300:
                     text = raw.decode("utf-8", errors="replace")
                     decoded = _decode_json_error(text)
+                    api_error = SandboxApiError(
+                        f"gateway request failed ({response.status}): {decoded}",
+                        status_code=response.status,
+                        body=decoded,
+                        headers=response_headers(response),
+                    )
                     if _should_retry_ucloud_unavailable(
                         response.status,
                         decoded,
                         attempt,
                     ):
-                        await asyncio.sleep(_ucloud_unavailable_retry_delay(attempt))
-                        continue
-                    raise SandboxApiError(
-                        f"node-agent request failed ({response.status}): {decoded}",
-                        status_code=response.status,
-                        body=decoded,
-                    )
+                        delay = _ucloud_unavailable_retry_delay(attempt)
+                        remaining = _remaining_seconds(deadline)
+                        if remaining is None or remaining > delay:
+                            await asyncio.sleep(delay)
+                            continue
+                    raise api_error
                 return raw
         raise AssertionError("unreachable UCloud unavailable retry state")
 
@@ -2005,6 +2202,16 @@ def _bytes_payload(data: str | bytes) -> bytes:
     return data.encode("utf-8")
 
 
+def _read_file_bytes(path: Path, *, limit: int) -> bytes:
+    size = path.stat().st_size
+    if size > limit:
+        raise SandboxApiError(f"file exceeds the {limit} byte upload limit")
+    data = path.read_bytes()
+    if len(data) > limit:
+        raise SandboxApiError(f"file exceeds the {limit} byte upload limit")
+    return data
+
+
 def _decode_json_error(raw: str) -> object:
     try:
         return json.loads(raw) if raw else {}
@@ -2041,6 +2248,49 @@ def _ucloud_unavailable_error_text(body: object) -> str:
 def _ucloud_unavailable_retry_delay(attempt: int) -> float:
     delay = UCLOUD_UNAVAILABLE_RETRY_BASE_DELAY_SECONDS * (2**attempt)
     return min(UCLOUD_UNAVAILABLE_RETRY_MAX_DELAY_SECONDS, delay)
+
+
+def _sleep_for_retry(delay_seconds: float, deadline: float | None) -> bool:
+    remaining = _remaining_seconds(deadline)
+    if remaining is not None and remaining <= delay_seconds:
+        return False
+    time.sleep(delay_seconds)
+    return True
+
+
+def _exec_event_payloads(session_id: str, value: object) -> list[JsonObject]:
+    if not isinstance(value, list):
+        raise SandboxApiError(
+            "gateway returned an invalid exec event payload",
+            body={"session_id": session_id, "events": value},
+        )
+    if not all(isinstance(item, dict) for item in value):
+        raise SandboxApiError(
+            "gateway returned a malformed exec event",
+            body={"session_id": session_id, "events": value},
+        )
+    return [dict(item) for item in value]
+
+
+def _next_exec_sequence(
+    session_id: str,
+    previous_sequence: int,
+    event: Mapping[str, Any],
+) -> int:
+    raw_sequence = event.get("sequence")
+    if isinstance(raw_sequence, bool) or not isinstance(raw_sequence, int):
+        raise SandboxApiError(
+            "gateway returned an exec event with an invalid sequence",
+            body={"session_id": session_id, "event": dict(event)},
+        )
+    expected = previous_sequence + 1
+    if raw_sequence != expected:
+        raise ExecEventHistoryLostError(
+            session_id,
+            expected_sequence=expected,
+            received_sequence=raw_sequence,
+        )
+    return raw_sequence
 
 
 def _exec_result(
