@@ -2,6 +2,24 @@
 
 This project uses semantic versioning.
 
+## Unreleased
+
+- Added rollout registration-token fencing to sync and async relay worker
+  clients and carried the token on leased requests.
+- Rejected credentialed HTTP and SSH-websocket redirects instead of forwarding
+  gateway or worker credentials to redirect targets.
+- Detected gaps in bounded exec event history and raised
+  `ExecEventHistoryLostError` instead of returning incomplete output as final.
+- Preserved response headers on API errors, honored explicit gateway
+  `retryable` responses and `Retry-After`, and kept transparent public-link
+  retries within the caller's timeout budget.
+- Recovered ambiguous HTTP image-build submissions before resubmitting and
+  made Inspect sandbox cleanup retry-safe without leaking interrupted clients
+  or silently forgetting failed deletions.
+- Aligned successful-response validation across sync and async clients and
+  documented the public gateway as the SDK lifecycle boundary.
+- Corrected the package `__version__` value to match version 0.2.8.
+
 ## 0.2.8 - 2026-07-06
 
 - Retried transient UCloud public-link `503` responses that return the

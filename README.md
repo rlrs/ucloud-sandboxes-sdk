@@ -36,6 +36,11 @@ client = SandboxClient(
 Raw HTTP callers should send the same token as
 `X-UCloud-Sandbox-Token: <token>`.
 
+Point SDK clients at the public gateway, not an individual node agent. The
+gateway owns durable sandbox generations, retry identity, placement, and the
+separate node-control credential. Generation and operation headers are an
+internal gateway-to-node protocol and are deliberately not exposed by this SDK.
+
 ## Sandboxes
 
 ```python
@@ -127,7 +132,8 @@ relay = RelayWorkerClient(
     worker_token="<worker-relay-token>",
 )
 
-relay.register_rollout("run-001")
+registration = relay.register_rollout("run-001")
+registration_token = registration["rollout"]["registration_token"]
 poll = relay.poll(
     "run-001",
     worker_id="lumi-worker-1",
@@ -178,6 +184,13 @@ client.prepare_capacity(
     ttl_seconds=900,
 )
 ```
+
+The worker client remembers the latest registration token for each rollout and
+automatically sends it on heartbeat, poll, renew, respond, error, and
+unregister operations. Persist `registration_token` if work will continue in a
+new client process; rollout-scoped methods accept it explicitly. Re-registering
+the same rollout creates a new token and fences delayed operations from the old
+registration.
 
 The signal contributes `count * resources` to gateway demand until the
 executing autoscaler reacts and consumes it. The TTL is a cleanup bound for

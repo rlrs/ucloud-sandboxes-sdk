@@ -1,11 +1,14 @@
 # Gateway Protocol Notes
 
-The SDK wraps the public gateway/node-agent HTTP API. Keep this document aligned
-with `src/ucloud_sandboxes_sdk/client.py` when endpoints are added.
+The SDK wraps the public gateway HTTP API. Keep this document aligned with
+`src/ucloud_sandboxes_sdk/client.py` when endpoints are added. Direct node-agent
+lifecycle calls are intentionally outside the public SDK: the gateway owns
+placement, durable generations, operation identity, and node authentication.
 
 ## Core Endpoints
 
 - `GET /healthz`
+- `GET /v1/nodes`
 - `GET /v1/sandboxes`
 - `POST /v1/sandboxes`
 - `DELETE /v1/sandboxes/<sandbox-id>`
@@ -32,6 +35,13 @@ Protected sandbox gateways expect the token in `X-UCloud-Sandbox-Token`.
 The Python clients set this when constructed with `api_token=...`. Avoid
 standard `Authorization` for UCloud public-link sandbox gateway calls because
 that header can be consumed before the request reaches the gateway service.
+Credentialed SDK requests do not follow redirects, because forwarding either
+the gateway token or relay worker token to a different origin would disclose
+it. Configure the final HTTPS gateway/relay URL directly.
+
+`GET /v1/heartbeat` is an internal node-agent endpoint. The deprecated
+`heartbeat()` client method remains temporarily for compatibility, but new code
+should use the gateway's `GET /v1/nodes` through `list_nodes()`.
 
 ## Sandbox Resources
 
@@ -51,6 +61,28 @@ The SDK requires `image` to be an `Image` helper. `Image.from_registry(...)`
 sends a registry tag, `Image.from_name(...)` sends a gateway image id, and
 `Image.from_dockerfile(...)` carries build metadata for `build_image()`.
 The gateway owns placement and may return `503` while nodes are scaling up.
+Repeating a sandbox create with the same id and exact specification is the
+supported recovery operation after a timeout or disconnect. The gateway keeps
+the same durable generation, operation id, and target node. The SDK must not
+invent or send node generation headers itself.
+
+## Model Relay Worker Fencing
+
+`POST /register_rollout` returns a random, 32-character `registration_token`.
+Every rollout-scoped worker operation must echo it:
+
+- `POST /unregister_rollout`
+- `POST /worker/heartbeat`
+- `GET /worker/poll`
+- `POST /worker/renew`
+- `POST /worker/respond`
+- `POST /worker/error`
+
+Worker clients remember the latest token per rollout. `RelayRequest` also
+carries the token so `renew_request()`, `respond_to()`, and `error_request()`
+remain fenced. A new client process must be given the persisted token
+explicitly. Re-registering a rollout invalidates delayed traffic carrying the
+old token.
 
 The Inspect AI provider reads sandbox security settings from environment
 variables and passes them as `security` on `POST /v1/sandboxes`. Use
@@ -142,6 +174,11 @@ Exec is session based. `POST /v1/sandboxes/<id>/exec` starts a session and
 returns a session object. The SDK then polls `GET /v1/exec/<session>/events`.
 Events are ordered by integer `sequence`; clients pass `after` to avoid
 re-reading events.
+
+The service bounds retained event history. If the first returned sequence is
+not exactly the next expected sequence, the SDK raises
+`ExecEventHistoryLostError`; it never returns a partial stdout/stderr tail as a
+complete command result.
 
 Terminal statuses are:
 
@@ -236,8 +273,13 @@ only exists on the builder/control-plane Docker daemon that built it.
 ## Error Handling
 
 Sync and async clients raise `SandboxApiError` for non-2xx HTTP responses and
-malformed JSON/object payloads. `status_code` is set for HTTP errors, and
-`body` contains the decoded JSON error body when possible.
+malformed JSON/object payloads. `status_code` is set for HTTP errors, `body`
+contains the decoded JSON error body when possible, and `headers` retains
+response headers such as `Retry-After`.
 
-Inspect integration retries transient scale-up and gateway errors. Normal SDK
-methods make one gateway request per method call.
+Inspect retries transient scale-up, explicit `retryable: true`, and ambiguous
+gateway errors using the same sandbox id/spec. It checks for an accepted image
+build before resubmitting an ambiguous build request and retries safe sandbox
+deletion during cleanup. Normal SDK methods surface structured gateway errors
+to callers; the only transparent retry is the UCloud public-link pre-dispatch
+`Job is unavailable` response, bounded by the method's timeout budget.
