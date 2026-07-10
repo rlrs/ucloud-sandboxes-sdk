@@ -23,8 +23,9 @@ This project uses semantic versioning.
 - Required local, content-addressed build-context uploads and always-pushed
   registry builds; removed the legacy base64 JSON fallback, remote-context
   escape hatch, and synthetic camelCase build result wrapper.
-- Removed the unsupported unscoped model-relay URL mode and placeholder API-key
-  default, and standardized Inspect configuration on `UCLOUD_SANDBOX_URL` and
+- Removed the alternate unscoped model-relay mode from SDK-generated
+  environments and the placeholder API-key default, and standardized Inspect
+  configuration on `UCLOUD_SANDBOX_URL` and
   `UCLOUD_SANDBOX_BUILD_IMAGE_PREFIX`.
 - Added an opinionated agent/workload guide covering cold build/boot overlap,
   stable operation identity, bounded concurrency, exec ambiguity, and cleanup.
