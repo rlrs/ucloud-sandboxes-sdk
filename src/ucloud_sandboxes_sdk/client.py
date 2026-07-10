@@ -5,6 +5,7 @@ import base64
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 import gzip
+import hashlib
 import json
 from pathlib import Path
 import shlex
@@ -37,6 +38,7 @@ MAX_JSON_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_FILE_RESPONSE_BYTES = 256 * 1024 * 1024
 BUILD_CONTEXT_SPOOL_MEMORY_BYTES = 8 * 1024 * 1024
 BUILD_CONTEXT_BASE64_CHUNK_BYTES = 3 * 1024 * 1024
+BUILD_CONTEXT_STREAM_CHUNK_BYTES = 1024 * 1024
 
 
 class SandboxApiError(RuntimeError):
@@ -836,13 +838,40 @@ class SandboxClient:
         upload_context: bool = True,
         timeout_seconds: float | None = None,
     ) -> JsonObject:
-        payload = _image_build_payload(image, upload_context=upload_context)
+        payload = _image_build_payload(image, upload_context=False)
+        effective_timeout = (
+            self.timeout_seconds if timeout_seconds is None else timeout_seconds
+        )
+        deadline = _deadline(effective_timeout)
+        context_path = _local_build_context_path(payload) if upload_context else None
+        if context_path is not None:
+            with _tar_gz_directory(context_path) as archive:
+                digest, size = _build_context_archive_identity(archive)
+                try:
+                    self._request_json(
+                        "PUT",
+                        f"/v1/image-contexts/{digest}",
+                        body=archive,
+                        body_size=size,
+                        content_type="application/gzip",
+                        timeout_seconds=_remaining_seconds(deadline),
+                    )
+                except SandboxApiError as exc:
+                    if exc.status_code not in {404, 405}:
+                        raise
+                    _attach_legacy_build_context_archive(payload, archive)
+                else:
+                    _attach_build_context_reference(
+                        payload,
+                        digest=digest,
+                        size=size,
+                    )
         payload["wait"] = False
         submitted = self._request_json(
             "POST",
             "/v1/images/build",
             payload=payload,
-            timeout_seconds=timeout_seconds,
+            timeout_seconds=_remaining_seconds(deadline),
         )
         build = submitted.get("build")
         if not isinstance(build, dict):
@@ -963,22 +992,34 @@ class SandboxClient:
         path: str,
         *,
         payload: JsonObject | None = None,
-        body: bytes | None = None,
+        body: bytes | BinaryIO | None = None,
+        body_size: int | None = None,
         content_type: str | None = None,
         timeout_seconds: float | None = None,
     ) -> JsonObject:
         raw_body = json.dumps(payload).encode("utf-8") if payload is not None else body
         body_limit = MAX_JSON_BODY_BYTES if payload is not None else MAX_FILE_BODY_BYTES
-        if raw_body is not None and len(raw_body) > body_limit:
+        known_body_size = (
+            len(raw_body)
+            if isinstance(raw_body, bytes)
+            else body_size
+        )
+        if raw_body is not None and known_body_size is None:
+            raise TypeError("body_size is required for streamed request bodies")
+        if known_body_size is not None and known_body_size > body_limit:
             raise SandboxApiError(f"request body exceeds the {body_limit} byte limit")
         headers = dict(self.headers)
         if payload is not None:
             headers["Content-Type"] = "application/json"
         elif content_type is not None:
             headers["Content-Type"] = content_type
+        if raw_body is not None and not isinstance(raw_body, bytes):
+            headers["Content-Length"] = str(known_body_size)
         timeout = self.timeout_seconds if timeout_seconds is None else timeout_seconds
         deadline = _deadline(timeout)
         for attempt in range(UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS):
+            if raw_body is not None and not isinstance(raw_body, bytes):
+                raw_body.seek(0)
             req = request.Request(
                 self.base_url + path,
                 data=raw_body,
@@ -1656,13 +1697,40 @@ class AsyncSandboxClient:
         upload_context: bool = True,
         timeout_seconds: float | None = None,
     ) -> JsonObject:
-        payload = _image_build_payload(image, upload_context=upload_context)
+        payload = _image_build_payload(image, upload_context=False)
+        effective_timeout = (
+            self.timeout_seconds if timeout_seconds is None else timeout_seconds
+        )
+        deadline = _deadline(effective_timeout)
+        context_path = _local_build_context_path(payload) if upload_context else None
+        if context_path is not None:
+            with _tar_gz_directory(context_path) as archive:
+                digest, size = _build_context_archive_identity(archive)
+                try:
+                    await self._request_json(
+                        "PUT",
+                        f"/v1/image-contexts/{digest}",
+                        body=archive,
+                        body_size=size,
+                        content_type="application/gzip",
+                        timeout_seconds=_remaining_seconds(deadline),
+                    )
+                except SandboxApiError as exc:
+                    if exc.status_code not in {404, 405}:
+                        raise
+                    _attach_legacy_build_context_archive(payload, archive)
+                else:
+                    _attach_build_context_reference(
+                        payload,
+                        digest=digest,
+                        size=size,
+                    )
         payload["wait"] = False
         submitted = await self._request_json(
             "POST",
             "/v1/images/build",
             payload=payload,
-            timeout_seconds=timeout_seconds,
+            timeout_seconds=_remaining_seconds(deadline),
         )
         build = submitted.get("build")
         if not isinstance(build, dict):
@@ -1797,26 +1865,43 @@ class AsyncSandboxClient:
         path: str,
         *,
         payload: JsonObject | None = None,
-        body: bytes | None = None,
+        body: bytes | BinaryIO | None = None,
+        body_size: int | None = None,
         content_type: str | None = None,
         timeout_seconds: float | None = None,
     ) -> JsonObject:
         raw_body = json.dumps(payload).encode("utf-8") if payload is not None else body
         body_limit = MAX_JSON_BODY_BYTES if payload is not None else MAX_FILE_BODY_BYTES
-        if raw_body is not None and len(raw_body) > body_limit:
+        known_body_size = (
+            len(raw_body)
+            if isinstance(raw_body, bytes)
+            else body_size
+        )
+        if raw_body is not None and known_body_size is None:
+            raise TypeError("body_size is required for streamed request bodies")
+        if known_body_size is not None and known_body_size > body_limit:
             raise SandboxApiError(f"request body exceeds the {body_limit} byte limit")
         headers = dict(self.headers)
         if content_type is not None and payload is None:
             headers["Content-Type"] = content_type
+        streamed_body = raw_body is not None and not isinstance(raw_body, bytes)
+        if streamed_body:
+            headers["Content-Length"] = str(known_body_size)
         client = await self._client()
         timeout = self.timeout_seconds if timeout_seconds is None else timeout_seconds
         deadline = _deadline(timeout)
         for attempt in range(UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS):
+            if streamed_body:
+                raw_body.seek(0)
             async with client.request(
                 method,
                 self.base_url + path,
                 json=payload,
-                data=body,
+                data=(
+                    _async_file_chunks(raw_body)
+                    if streamed_body
+                    else body
+                ),
                 headers=headers,
                 timeout=_aiohttp_timeout(
                     _request_timeout_seconds(
@@ -2024,6 +2109,58 @@ def _attach_build_context_archive(payload: JsonObject) -> None:
         payload["context_archive_base64"] = _base64_ascii(archive)
     payload["context_archive_format"] = "tar.gz"
     payload["context_path"] = "."
+
+
+def _local_build_context_path(payload: JsonObject) -> Path | None:
+    context_path = payload.get("context_path")
+    if not isinstance(context_path, str) or not context_path:
+        return None
+    path = Path(context_path)
+    return path if path.is_dir() else None
+
+
+def _build_context_archive_identity(source: BinaryIO) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    size = 0
+    source.seek(0)
+    while chunk := source.read(BUILD_CONTEXT_STREAM_CHUNK_BYTES):
+        digest.update(chunk)
+        size += len(chunk)
+    source.seek(0)
+    return f"sha256:{digest.hexdigest()}", size
+
+
+def _attach_build_context_reference(
+    payload: JsonObject,
+    *,
+    digest: str,
+    size: int,
+) -> None:
+    payload.pop("context_archive_base64", None)
+    payload["context_archive_digest"] = digest
+    payload["context_archive_format"] = "tar.gz"
+    payload["context_archive_size"] = size
+    payload["context_path"] = "."
+
+
+def _attach_legacy_build_context_archive(
+    payload: JsonObject,
+    source: BinaryIO,
+) -> None:
+    payload.pop("context_archive_digest", None)
+    payload.pop("context_archive_size", None)
+    source.seek(0)
+    payload["context_archive_base64"] = _base64_ascii(source)
+    payload["context_archive_format"] = "tar.gz"
+    payload["context_path"] = "."
+
+
+async def _async_file_chunks(source: BinaryIO) -> AsyncIterator[bytes]:
+    while chunk := await asyncio.to_thread(
+        source.read,
+        BUILD_CONTEXT_STREAM_CHUNK_BYTES,
+    ):
+        yield chunk
 
 
 def _aiohttp_timeout(timeout_seconds: float | None) -> object:

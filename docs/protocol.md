@@ -98,15 +98,26 @@ images is required.
 
 ## Images
 
-`POST /v1/images/build` accepts:
+For a local build context, the SDK first sends the deterministic compressed
+archive as a raw request body:
+
+```http
+PUT /v1/image-contexts/sha256:<hex>
+Content-Type: application/gzip
+Content-Length: <compressed size>
+```
+
+The endpoint may return either a newly stored or deduplicated context. The SDK
+then sends `POST /v1/images/build` with a compact reference:
 
 ```json
 {
   "id": "python-base",
   "tag": "ucloud-sandbox-registry:5000/ucloud/python-base:latest",
   "context_path": ".",
-  "context_archive_base64": "<tar.gz bytes encoded as base64>",
+  "context_archive_digest": "sha256:<hex>",
   "context_archive_format": "tar.gz",
+  "context_archive_size": 12345,
   "dockerfile": "Dockerfile",
   "push": true,
   "build_args": {},
@@ -114,10 +125,10 @@ images is required.
 }
 ```
 
-The SDK attaches `context_archive_base64` by default when
-`Image.from_dockerfile(...).build_spec.context_path` points at a local
-directory. Pass `upload_context=False` to `build_image()` when `context_path`
-already exists on the gateway or builder VM.
+If the upload endpoint returns `404` or `405`, the SDK treats the gateway as an
+older deployment and retries the build using the former
+`context_archive_base64` JSON field. Pass `upload_context=False` to
+`build_image()` when `context_path` already exists on the gateway or builder VM.
 `build_image()` submits with `wait: false`, then polls
 `GET /v1/images/builds/{build_id_or_image_id}` until the tracked build reaches
 `succeeded` or `failed`. SDK callers can use `on_status` to receive each status

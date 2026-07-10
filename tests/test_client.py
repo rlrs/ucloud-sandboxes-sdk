@@ -4,6 +4,7 @@ import asyncio
 import base64
 from collections.abc import Iterator
 from contextlib import contextmanager
+import hashlib
 import io
 import json
 from http import HTTPStatus
@@ -287,6 +288,133 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(built["image"]["id"], "local-context")
         self.assertEqual(built["image"]["received_context_path"], ".")
         self.assertGreater(built["image"]["received_archive_bytes"], 0)
+        digest = built["image"]["received_context_digest"]
+        self.assertRegex(digest, r"^sha256:[0-9a-f]{64}$")
+        self.assertEqual(
+            built["image"]["received_context_size"],
+            built["image"]["received_archive_bytes"],
+        )
+        self.assertEqual(gateway.state.build_context_upload_results, [True])
+
+    def test_sync_client_accepts_deduplicated_build_context_upload(self) -> None:
+        with TemporaryDirectory() as raw_dir:
+            context = Path(raw_dir) / "context"
+            context.mkdir()
+            (context / "Dockerfile").write_text("FROM busybox\n", encoding="utf-8")
+            with running_gateway() as gateway:
+                client = SandboxClient(gateway.base_url)
+                image = Image.from_dockerfile(
+                    name="deduplicated-context",
+                    tag="local/deduplicated-context:latest",
+                    context_path=str(context),
+                )
+
+                first = client.build_image(image)
+                second = client.build_image(image)
+
+        self.assertEqual(
+            first["image"]["received_context_digest"],
+            second["image"]["received_context_digest"],
+        )
+        self.assertEqual(gateway.state.build_context_upload_results, [True, False])
+        self.assertEqual(len(gateway.state.build_contexts), 1)
+
+    def test_sync_client_falls_back_to_legacy_build_context_json(self) -> None:
+        with TemporaryDirectory() as raw_dir:
+            context = Path(raw_dir) / "context"
+            context.mkdir()
+            (context / "Dockerfile").write_text("FROM busybox\n", encoding="utf-8")
+            with running_gateway(build_context_uploads=False) as gateway:
+                client = SandboxClient(gateway.base_url)
+                built = client.build_image(
+                    Image.from_dockerfile(
+                        name="legacy-context",
+                        tag="local/legacy-context:latest",
+                        context_path=str(context),
+                    )
+                )
+
+        self.assertIsNone(built["image"]["received_context_digest"])
+        self.assertGreater(built["image"]["received_archive_bytes"], 0)
+
+    def test_sync_client_rejects_build_context_over_file_limit(self) -> None:
+        with TemporaryDirectory() as raw_dir:
+            context = Path(raw_dir) / "context"
+            context.mkdir()
+            (context / "Dockerfile").write_text("FROM busybox\n", encoding="utf-8")
+            client = SandboxClient("http://gateway.invalid")
+
+            with patch.object(client_module, "MAX_FILE_BODY_BYTES", 1):
+                with self.assertRaisesRegex(SandboxApiError, "request body exceeds"):
+                    client.submit_image_build(
+                        Image.from_dockerfile(
+                            name="oversized-context",
+                            tag="local/oversized-context:latest",
+                            context_path=str(context),
+                        )
+                    )
+
+    def test_sync_build_context_retry_rewinds_stream(self) -> None:
+        class FakeResponse:
+            status = 200
+            headers: dict[str, str] = {}
+
+            def __init__(self, body: bytes) -> None:
+                self.body = body
+
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                del args
+
+            def read(self) -> bytes:
+                return self.body
+
+        uploads: list[bytes] = []
+
+        def fake_urlopen(req: object, timeout: object = None) -> FakeResponse:
+            del timeout
+            url = str(getattr(req, "full_url", ""))
+            if "/v1/image-contexts/" in url:
+                source = getattr(req, "data")
+                uploads.append(source.read())
+                if len(uploads) == 1:
+                    raise client_module.error.HTTPError(
+                        url,
+                        503,
+                        "Service Unavailable",
+                        {},
+                        io.BytesIO(
+                            b"<!doctype html><title>Job is unavailable | UCloud</title>"
+                        ),
+                    )
+                return FakeResponse(b'{"stored": false}')
+            return FakeResponse(
+                b'{"build": {"build_id": "build-retry", "image_id": "retry", "status": "running"}}'
+            )
+
+        with TemporaryDirectory() as raw_dir:
+            context = Path(raw_dir) / "context"
+            context.mkdir()
+            (context / "Dockerfile").write_text("FROM busybox\n", encoding="utf-8")
+            client = SandboxClient("http://gateway.invalid")
+            with patch.object(client_module, "open_no_redirect", fake_urlopen), patch.object(
+                client_module.time,
+                "sleep",
+                lambda _delay: None,
+            ):
+                client.submit_image_build(
+                    Image.from_dockerfile(
+                        name="retry",
+                        tag="local/retry:latest",
+                        context_path=str(context),
+                    )
+                )
+
+        self.assertEqual(len(uploads), 2)
+        self.assertGreater(len(uploads[0]), 0)
+        self.assertEqual(uploads[0], uploads[1])
 
     def test_build_context_archive_is_deterministic(self) -> None:
         with TemporaryDirectory() as raw_dir:
@@ -313,12 +441,17 @@ class SandboxSdkTests(unittest.TestCase):
                 "context_path": str(context),
             }
             client_module._attach_build_context_archive(second_payload)
+            with client_module._tar_gz_directory(context) as archive:
+                digest, size = client_module._build_context_archive_identity(archive)
 
         first_archive = str(first_payload["context_archive_base64"])
         second_archive = str(second_payload["context_archive_base64"])
         self.assertEqual(first_archive, second_archive)
 
         compressed = base64.b64decode(first_archive)
+        expected_digest = f"sha256:{hashlib.sha256(compressed).hexdigest()}"
+        self.assertEqual(digest, expected_digest)
+        self.assertEqual(size, len(compressed))
         self.assertEqual(compressed[4:8], b"\0\0\0\0")
         with tarfile.open(
             fileobj=io.BytesIO(compressed),
@@ -562,6 +695,115 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(size, 12)
         self.assertEqual(downloaded, b"async bytes\n")
 
+    def test_async_client_streams_local_build_context(self) -> None:
+        async def scenario(base_url: str, context: Path) -> dict:
+            async with AsyncSandboxClient(base_url) as client:
+                return await client.build_image(
+                    Image.from_dockerfile(
+                        name="async-context",
+                        tag="local/async-context:latest",
+                        context_path=str(context),
+                    )
+                )
+
+        with TemporaryDirectory() as raw_dir:
+            context = Path(raw_dir) / "context"
+            context.mkdir()
+            (context / "Dockerfile").write_text("FROM busybox\n", encoding="utf-8")
+            with running_gateway() as gateway:
+                built = asyncio.run(scenario(gateway.base_url, context))
+
+        self.assertRegex(
+            built["image"]["received_context_digest"],
+            r"^sha256:[0-9a-f]{64}$",
+        )
+        self.assertEqual(gateway.state.build_context_upload_results, [True])
+
+    def test_async_build_context_retry_rewinds_stream(self) -> None:
+        class FakeResponse:
+            headers: dict[str, str] = {}
+
+            def __init__(
+                self,
+                session: "FakeSession",
+                status: int,
+                body: str,
+                data: object,
+            ) -> None:
+                self.session = session
+                self.status = status
+                self.body = body
+                self.data = data
+
+            async def __aenter__(self) -> "FakeResponse":
+                if hasattr(self.data, "__aiter__"):
+                    chunks = [chunk async for chunk in self.data]
+                    self.session.uploads.append(b"".join(chunks))
+                return self
+
+            async def __aexit__(self, *args: object) -> None:
+                del args
+
+            async def text(self) -> str:
+                return self.body
+
+        class FakeSession:
+            def __init__(self) -> None:
+                self.upload_attempts = 0
+                self.uploads: list[bytes] = []
+
+            def request(self, _method: object, url: object, **kwargs: object) -> FakeResponse:
+                if "/v1/image-contexts/" in str(url):
+                    self.upload_attempts += 1
+                    if self.upload_attempts == 1:
+                        return FakeResponse(
+                            self,
+                            503,
+                            "<!doctype html><title>Job is unavailable | UCloud</title>",
+                            kwargs.get("data"),
+                        )
+                    return FakeResponse(
+                        self,
+                        200,
+                        '{"stored": false}',
+                        kwargs.get("data"),
+                    )
+                return FakeResponse(
+                    self,
+                    202,
+                    '{"build": {"build_id": "build-retry", "image_id": "retry", "status": "running"}}',
+                    kwargs.get("data"),
+                )
+
+        async def no_sleep(_delay: float) -> None:
+            return None
+
+        async def scenario(context: Path) -> list[bytes]:
+            session = FakeSession()
+            client = AsyncSandboxClient(
+                "http://gateway.invalid",
+                session=session,
+            )
+            with patch.object(client_module.asyncio, "sleep", no_sleep):
+                await client.submit_image_build(
+                    Image.from_dockerfile(
+                        name="retry",
+                        tag="local/retry:latest",
+                        context_path=str(context),
+                    )
+                )
+            return session.uploads
+
+        with TemporaryDirectory() as raw_dir:
+            context = Path(raw_dir) / "context"
+            context.mkdir()
+            (context / "Dockerfile").write_text("FROM busybox\n", encoding="utf-8")
+            uploads = asyncio.run(scenario(context))
+
+        self.assertEqual(len(uploads), 2)
+        self.assertGreater(len(uploads[0]), 0)
+        self.assertEqual(uploads[0], uploads[1])
+
     def test_async_create_sandbox_accepts_per_call_request_timeout(self) -> None:
         class FakeResponse:
             status = 200
@@ -754,8 +996,11 @@ def running_redirect_gateway() -> Iterator[RedirectGatewayHandle]:
 
 
 @contextmanager
-def running_gateway() -> Iterator["GatewayHandle"]:
-    state = FakeGatewayState()
+def running_gateway(
+    *,
+    build_context_uploads: bool = True,
+) -> Iterator["GatewayHandle"]:
+    state = FakeGatewayState(build_context_uploads=build_context_uploads)
 
     class Handler(FakeGatewayHandler):
         pass
@@ -779,8 +1024,11 @@ class GatewayHandle:
 
 
 class FakeGatewayState:
-    def __init__(self) -> None:
+    def __init__(self, *, build_context_uploads: bool) -> None:
         self.lock = Lock()
+        self.build_context_uploads = build_context_uploads
+        self.build_contexts: dict[str, bytes] = {}
+        self.build_context_upload_results: list[bool] = []
         self.sandboxes: dict[str, dict] = {}
         self.images: dict[str, dict] = {}
         self.builds: dict[str, dict] = {}
@@ -933,11 +1181,22 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
                 )
                 return
             archive = payload.get("context_archive_base64")
+            context_digest = payload.get("context_archive_digest")
+            with self.state.lock:
+                uploaded_archive = self.state.build_contexts.get(
+                    str(context_digest or "")
+                )
             image = {
                 "id": str(payload.get("id") or payload.get("tag") or "image"),
                 "tag": str(payload.get("tag") or ""),
                 "received_context_path": payload.get("context_path"),
-                "received_archive_bytes": len(archive or ""),
+                "received_archive_bytes": (
+                    len(uploaded_archive)
+                    if uploaded_archive is not None
+                    else len(archive or "")
+                ),
+                "received_context_digest": context_digest,
+                "received_context_size": payload.get("context_archive_size"),
                 "received_push": bool(payload.get("push")),
             }
             build = {
@@ -1050,6 +1309,38 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
         self._record_headers()
         parsed = urlparse(self.path)
         path = parsed.path
+        context_prefix = "/v1/image-contexts/"
+        if path.startswith(context_prefix):
+            if not self.state.build_context_uploads:
+                self._write_json(
+                    {"error": "not found"},
+                    status=HTTPStatus.NOT_FOUND,
+                )
+                return
+            digest = unquote(path[len(context_prefix):])
+            content = self._read_body()
+            actual_digest = f"sha256:{hashlib.sha256(content).hexdigest()}"
+            if digest != actual_digest:
+                self._write_json(
+                    {"error": "digest mismatch"},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
+            if self.headers.get("Content-Type") != "application/gzip":
+                self._write_json(
+                    {"error": "invalid content type"},
+                    status=HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+                )
+                return
+            with self.state.lock:
+                stored = digest not in self.state.build_contexts
+                self.state.build_contexts.setdefault(digest, content)
+                self.state.build_context_upload_results.append(stored)
+            self._write_json(
+                {"digest": digest, "size": len(content), "stored": stored},
+                status=HTTPStatus.CREATED if stored else HTTPStatus.OK,
+            )
+            return
         sandbox_id = _sandbox_id_from_path(path)
         if sandbox_id is not None and path.endswith("/files"):
             file_path = _file_path(parsed)
