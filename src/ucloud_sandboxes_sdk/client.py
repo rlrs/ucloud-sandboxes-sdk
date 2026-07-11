@@ -1122,10 +1122,22 @@ class SandboxClient:
                     decoded = json.loads(raw) if raw else {}
             except error.HTTPError as exc:
                 raw = exc.read().decode("utf-8", errors="replace")
+                response_headers = getattr(exc, "headers", {})
                 exc.close()
                 decoded = _decode_json_error(raw)
-                if _should_retry_ucloud_unavailable(exc.code, decoded, attempt):
-                    time.sleep(_ucloud_unavailable_retry_delay(attempt))
+                if _should_retry_ucloud_unavailable(
+                    exc.code,
+                    decoded,
+                    attempt,
+                    method=method,
+                    path=path,
+                ):
+                    time.sleep(
+                        _ucloud_unavailable_retry_delay(
+                            attempt,
+                            response_headers,
+                        )
+                    )
                     continue
                 raise SandboxApiError(
                     f"node-agent request failed ({exc.code}): {decoded}",
@@ -1151,10 +1163,22 @@ class SandboxClient:
                     return response.read()
             except error.HTTPError as exc:
                 raw = exc.read().decode("utf-8", errors="replace")
+                response_headers = getattr(exc, "headers", {})
                 exc.close()
                 decoded = _decode_json_error(raw)
-                if _should_retry_ucloud_unavailable(exc.code, decoded, attempt):
-                    time.sleep(_ucloud_unavailable_retry_delay(attempt))
+                if _should_retry_ucloud_unavailable(
+                    exc.code,
+                    decoded,
+                    attempt,
+                    method=method,
+                    path=path,
+                ):
+                    time.sleep(
+                        _ucloud_unavailable_retry_delay(
+                            attempt,
+                            response_headers,
+                        )
+                    )
                     continue
                 raise SandboxApiError(
                     f"node-agent request failed ({exc.code}): {decoded}",
@@ -1979,8 +2003,15 @@ class AsyncSandboxClient:
                         response.status,
                         decoded,
                         attempt,
+                        method=method,
+                        path=path,
                     ):
-                        await asyncio.sleep(_ucloud_unavailable_retry_delay(attempt))
+                        await asyncio.sleep(
+                            _ucloud_unavailable_retry_delay(
+                                attempt,
+                                getattr(response, "headers", {}),
+                            )
+                        )
                         continue
                     raise SandboxApiError(
                         f"node-agent request failed ({response.status}): {decoded}",
@@ -2009,8 +2040,15 @@ class AsyncSandboxClient:
                         response.status,
                         decoded,
                         attempt,
+                        method=method,
+                        path=path,
                     ):
-                        await asyncio.sleep(_ucloud_unavailable_retry_delay(attempt))
+                        await asyncio.sleep(
+                            _ucloud_unavailable_retry_delay(
+                                attempt,
+                                getattr(response, "headers", {}),
+                            )
+                        )
                         continue
                     raise SandboxApiError(
                         f"node-agent request failed ({response.status}): {decoded}",
@@ -2453,9 +2491,23 @@ def _should_retry_ucloud_unavailable(
     status_code: int,
     body: object,
     attempt: int,
+    *,
+    method: str = "GET",
+    path: str = "",
 ) -> bool:
     if attempt >= UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS - 1:
         return False
+    normalized_method = method.upper()
+    if (
+        status_code in {408, 425, 429, 500, 502, 503, 504}
+        and isinstance(body, dict)
+        and body.get("retryable") is True
+        and (
+            normalized_method in {"GET", "HEAD", "OPTIONS"}
+            or (normalized_method == "POST" and path == "/v1/sandboxes")
+        )
+    ):
+        return True
     if status_code != UCLOUD_UNAVAILABLE_STATUS:
         return False
     text = _ucloud_unavailable_error_text(body).lower()
@@ -2475,7 +2527,25 @@ def _ucloud_unavailable_error_text(body: object) -> str:
     return ""
 
 
-def _ucloud_unavailable_retry_delay(attempt: int) -> float:
+def _ucloud_unavailable_retry_delay(
+    attempt: int,
+    headers: object | None = None,
+) -> float:
+    items = getattr(headers, "items", None)
+    if callable(items):
+        raw_retry_after = next(
+            (
+                value
+                for key, value in items()
+                if str(key).lower() == "retry-after"
+            ),
+            None,
+        )
+        if raw_retry_after is not None:
+            try:
+                return max(0.0, min(60.0, float(raw_retry_after)))
+            except (TypeError, ValueError):
+                pass
     delay = UCLOUD_UNAVAILABLE_RETRY_BASE_DELAY_SECONDS * (2**attempt)
     return min(UCLOUD_UNAVAILABLE_RETRY_MAX_DELAY_SECONDS, delay)
 

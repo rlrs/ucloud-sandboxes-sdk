@@ -2,6 +2,13 @@
 
 This project uses semantic versioning.
 
+## 0.4.1 - 2026-07-11
+
+- Retried structured retryable capacity responses for safe reads and stable-id
+  sandbox creation, while leaving exec, fork, and relay side effects
+  single-shot.
+- Honored the gateway's `Retry-After` response header for transient retries.
+
 ## 0.4.0 - 2026-07-11
 
 - Added general buffered HTTP tunnel configuration and worker APIs, including
