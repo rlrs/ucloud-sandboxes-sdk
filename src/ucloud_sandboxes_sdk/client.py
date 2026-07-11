@@ -20,6 +20,8 @@ UCLOUD_UNAVAILABLE_STATUS = 503
 UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS = 6
 UCLOUD_UNAVAILABLE_RETRY_BASE_DELAY_SECONDS = 0.25
 UCLOUD_UNAVAILABLE_RETRY_MAX_DELAY_SECONDS = 4.0
+DEFAULT_FORK_TIMEOUT_SECONDS = 3600.0
+MAX_FORK_BATCH_SIZE = 64
 
 
 class SandboxApiError(RuntimeError):
@@ -33,6 +35,31 @@ class SandboxApiError(RuntimeError):
         super().__init__(message)
         self.status_code = status_code
         self.body = body
+
+    @property
+    def retryable(self) -> bool | None:
+        if not isinstance(self.body, dict) or not isinstance(
+            self.body.get("retryable"), bool
+        ):
+            return None
+        return self.body["retryable"]
+
+    @property
+    def intent_persisted(self) -> bool | None:
+        if not isinstance(self.body, dict) or not isinstance(
+            self.body.get("intent_persisted"), bool
+        ):
+            return None
+        return self.body["intent_persisted"]
+
+    @property
+    def intents(self) -> tuple[JsonObject, ...]:
+        if not isinstance(self.body, dict):
+            return ()
+        raw = self.body.get("intents")
+        if not isinstance(raw, list):
+            return ()
+        return tuple(dict(item) for item in raw if isinstance(item, dict))
 
 
 def sandbox_auth_headers(api_token: str | None) -> dict[str, str]:
@@ -116,6 +143,63 @@ class SandboxSshTarget:
 
 
 @dataclass(frozen=True)
+class SandboxForkProtocolSpec:
+    prepare_command: Sequence[str]
+    ready_command: Sequence[str]
+    version: str = "agent-v1"
+    timeout_seconds: int = 30
+
+    def to_dict(self) -> JsonObject:
+        if self.version != "agent-v1":
+            raise ValueError("fork protocol version must be 'agent-v1'")
+        if isinstance(self.prepare_command, (str, bytes)) or isinstance(
+            self.ready_command, (str, bytes)
+        ):
+            raise TypeError("fork protocol commands must be sequences of arguments")
+        prepare = [str(item) for item in self.prepare_command]
+        ready = [str(item) for item in self.ready_command]
+        if not prepare or not ready or any(not item for item in (*prepare, *ready)):
+            raise ValueError("fork protocol prepare and ready commands are required")
+        if not 1 <= self.timeout_seconds <= 60:
+            raise ValueError("fork protocol timeout_seconds must be in [1, 60]")
+        return {
+            "version": self.version,
+            "prepare_command": prepare,
+            "ready_command": ready,
+            "timeout_seconds": self.timeout_seconds,
+        }
+
+
+@dataclass(frozen=True)
+class SandboxForkSpec:
+    id: str
+    env: Mapping[str, str] = field(default_factory=dict)
+    labels: Mapping[str, str] = field(default_factory=dict)
+    ttl_seconds: int | None = None
+    memory_mb: int | None = None
+    cpus: float | None = None
+
+    def to_dict(self) -> JsonObject:
+        sandbox_id = self.id.strip()
+        if not sandbox_id:
+            raise ValueError("fork sandbox id cannot be empty")
+        payload: JsonObject = {"id": sandbox_id}
+        if self.env:
+            payload["env"] = {str(key): str(value) for key, value in self.env.items()}
+        if self.labels:
+            payload["labels"] = {
+                str(key): str(value) for key, value in self.labels.items()
+            }
+        if self.ttl_seconds is not None:
+            payload["ttl_seconds"] = self.ttl_seconds
+        if self.memory_mb is not None:
+            payload["memory_mb"] = self.memory_mb
+        if self.cpus is not None:
+            payload["cpus"] = self.cpus
+        return payload
+
+
+@dataclass(frozen=True)
 class SandboxSpec:
     id: str
     image: "Image"
@@ -131,9 +215,11 @@ class SandboxSpec:
     security: SandboxSecuritySpec | Mapping[str, Any] | None = SandboxSecuritySpec()
     filesystem: SandboxFilesystemSpec | Mapping[str, Any] | None = SandboxFilesystemSpec()
     labels: Mapping[str, str] = field(default_factory=dict)
+    forkable: bool = False
+    fork_protocol: SandboxForkProtocolSpec | Mapping[str, Any] | None = None
 
     def to_dict(self) -> JsonObject:
-        return {
+        payload: JsonObject = {
             "id": self.id,
             "image": _image_reference(self.image),
             "command": [str(item) for item in self.command],
@@ -149,6 +235,11 @@ class SandboxSpec:
             "filesystem": _nested_payload(self.filesystem),
             "labels": dict(self.labels),
         }
+        if self.forkable:
+            payload["forkable"] = True
+        if self.fork_protocol is not None:
+            payload["fork_protocol"] = _nested_payload(self.fork_protocol)
+        return payload
 
 
 @dataclass(frozen=True)
@@ -262,6 +353,7 @@ class SandboxHandle:
     id: str
     record: JsonObject = field(default_factory=dict)
     create_response: JsonObject = field(default_factory=dict)
+    fork_metadata: JsonObject = field(default_factory=dict)
 
     def refresh(self) -> "SandboxHandle":
         record = self.client.get_sandbox(self.id)
@@ -350,6 +442,42 @@ class SandboxHandle:
         local_path: str | Path,
     ) -> Path:
         return self.client.download_file_to_path(self.id, container_path, local_path)
+
+    def fork(
+        self,
+        spec: SandboxForkSpec | None = None,
+        *,
+        id: str | None = None,
+        env: Mapping[str, str] | None = None,
+        labels: Mapping[str, str] | None = None,
+        ttl_seconds: int | None = None,
+        memory_mb: int | None = None,
+        cpus: float | None = None,
+        timeout_seconds: float = DEFAULT_FORK_TIMEOUT_SECONDS,
+    ) -> "SandboxHandle":
+        return self.client.fork_sandbox(
+            self.id,
+            spec,
+            id=id,
+            env=env,
+            labels=labels,
+            ttl_seconds=ttl_seconds,
+            memory_mb=memory_mb,
+            cpus=cpus,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def fork_many(
+        self,
+        sandboxes: Sequence[SandboxForkSpec],
+        *,
+        timeout_seconds: float = DEFAULT_FORK_TIMEOUT_SECONDS,
+    ) -> tuple["SandboxHandle", ...]:
+        return self.client.fork_sandboxes(
+            self.id,
+            sandboxes,
+            timeout_seconds=timeout_seconds,
+        )
 
     def snapshot(self, image: Image, *, image_id: str | None = None) -> JsonObject:
         return self.client.snapshot_sandbox(self.id, image, image_id=image_id)
@@ -560,6 +688,71 @@ class SandboxClient:
         if not isinstance(sandbox_id, str) or not sandbox_id:
             raise SandboxApiError("node-agent sandbox payload is missing spec.id", body=response)
         return SandboxHandle(self, sandbox_id, record=record, create_response=response)
+
+    def fork_sandbox(
+        self,
+        source_sandbox_id: str,
+        spec: SandboxForkSpec | None = None,
+        *,
+        id: str | None = None,
+        env: Mapping[str, str] | None = None,
+        labels: Mapping[str, str] | None = None,
+        ttl_seconds: int | None = None,
+        memory_mb: int | None = None,
+        cpus: float | None = None,
+        timeout_seconds: float = DEFAULT_FORK_TIMEOUT_SECONDS,
+    ) -> SandboxHandle:
+        target = _fork_sandbox_payload(
+            spec,
+            id=id,
+            env=env,
+            labels=labels,
+            ttl_seconds=ttl_seconds,
+            memory_mb=memory_mb,
+            cpus=cpus,
+        )
+        response = self._request_json(
+            "POST",
+            f"/v1/sandboxes/{_quote_segment(source_sandbox_id)}/forks",
+            payload={"sandbox": target},
+            timeout_seconds=timeout_seconds,
+        )
+        items = _fork_response_items(response, (str(target["id"]),), batch=False)
+        record, metadata = items[0]
+        return SandboxHandle(
+            self,
+            str(target["id"]),
+            record=record,
+            create_response=response,
+            fork_metadata=metadata,
+        )
+
+    def fork_sandboxes(
+        self,
+        source_sandbox_id: str,
+        sandboxes: Sequence[SandboxForkSpec],
+        *,
+        timeout_seconds: float = DEFAULT_FORK_TIMEOUT_SECONDS,
+    ) -> tuple[SandboxHandle, ...]:
+        targets = _fork_batch_payload(sandboxes)
+        expected_ids = tuple(str(item["id"]) for item in targets)
+        response = self._request_json(
+            "POST",
+            f"/v1/sandboxes/{_quote_segment(source_sandbox_id)}/forks",
+            payload={"sandboxes": targets},
+            timeout_seconds=timeout_seconds,
+        )
+        items = _fork_response_items(response, expected_ids, batch=True)
+        return tuple(
+            SandboxHandle(
+                self,
+                sandbox_id,
+                record=record,
+                create_response=response,
+                fork_metadata=metadata,
+            )
+            for sandbox_id, (record, metadata) in zip(expected_ids, items)
+        )
 
     def create_ssh_sandbox(
         self,
@@ -979,6 +1172,7 @@ class AsyncSandboxHandle:
     id: str
     record: JsonObject = field(default_factory=dict)
     create_response: JsonObject = field(default_factory=dict)
+    fork_metadata: JsonObject = field(default_factory=dict)
 
     async def refresh(self) -> "AsyncSandboxHandle":
         record = await self.client.get_sandbox(self.id)
@@ -1067,6 +1261,42 @@ class AsyncSandboxHandle:
         local_path: str | Path,
     ) -> Path:
         return await self.client.download_file_to_path(self.id, container_path, local_path)
+
+    async def fork(
+        self,
+        spec: SandboxForkSpec | None = None,
+        *,
+        id: str | None = None,
+        env: Mapping[str, str] | None = None,
+        labels: Mapping[str, str] | None = None,
+        ttl_seconds: int | None = None,
+        memory_mb: int | None = None,
+        cpus: float | None = None,
+        timeout_seconds: float = DEFAULT_FORK_TIMEOUT_SECONDS,
+    ) -> "AsyncSandboxHandle":
+        return await self.client.fork_sandbox(
+            self.id,
+            spec,
+            id=id,
+            env=env,
+            labels=labels,
+            ttl_seconds=ttl_seconds,
+            memory_mb=memory_mb,
+            cpus=cpus,
+            timeout_seconds=timeout_seconds,
+        )
+
+    async def fork_many(
+        self,
+        sandboxes: Sequence[SandboxForkSpec],
+        *,
+        timeout_seconds: float = DEFAULT_FORK_TIMEOUT_SECONDS,
+    ) -> tuple["AsyncSandboxHandle", ...]:
+        return await self.client.fork_sandboxes(
+            self.id,
+            sandboxes,
+            timeout_seconds=timeout_seconds,
+        )
 
     async def snapshot(self, image: Image, *, image_id: str | None = None) -> JsonObject:
         return await self.client.snapshot_sandbox(self.id, image, image_id=image_id)
@@ -1292,6 +1522,71 @@ class AsyncSandboxClient:
         if not isinstance(sandbox_id, str) or not sandbox_id:
             raise SandboxApiError("node-agent sandbox payload is missing spec.id", body=response)
         return AsyncSandboxHandle(self, sandbox_id, record=record, create_response=response)
+
+    async def fork_sandbox(
+        self,
+        source_sandbox_id: str,
+        spec: SandboxForkSpec | None = None,
+        *,
+        id: str | None = None,
+        env: Mapping[str, str] | None = None,
+        labels: Mapping[str, str] | None = None,
+        ttl_seconds: int | None = None,
+        memory_mb: int | None = None,
+        cpus: float | None = None,
+        timeout_seconds: float = DEFAULT_FORK_TIMEOUT_SECONDS,
+    ) -> AsyncSandboxHandle:
+        target = _fork_sandbox_payload(
+            spec,
+            id=id,
+            env=env,
+            labels=labels,
+            ttl_seconds=ttl_seconds,
+            memory_mb=memory_mb,
+            cpus=cpus,
+        )
+        response = await self._request_json(
+            "POST",
+            f"/v1/sandboxes/{_quote_segment(source_sandbox_id)}/forks",
+            payload={"sandbox": target},
+            timeout_seconds=timeout_seconds,
+        )
+        items = _fork_response_items(response, (str(target["id"]),), batch=False)
+        record, metadata = items[0]
+        return AsyncSandboxHandle(
+            self,
+            str(target["id"]),
+            record=record,
+            create_response=response,
+            fork_metadata=metadata,
+        )
+
+    async def fork_sandboxes(
+        self,
+        source_sandbox_id: str,
+        sandboxes: Sequence[SandboxForkSpec],
+        *,
+        timeout_seconds: float = DEFAULT_FORK_TIMEOUT_SECONDS,
+    ) -> tuple[AsyncSandboxHandle, ...]:
+        targets = _fork_batch_payload(sandboxes)
+        expected_ids = tuple(str(item["id"]) for item in targets)
+        response = await self._request_json(
+            "POST",
+            f"/v1/sandboxes/{_quote_segment(source_sandbox_id)}/forks",
+            payload={"sandboxes": targets},
+            timeout_seconds=timeout_seconds,
+        )
+        items = _fork_response_items(response, expected_ids, batch=True)
+        return tuple(
+            AsyncSandboxHandle(
+                self,
+                sandbox_id,
+                record=record,
+                create_response=response,
+                fork_metadata=metadata,
+            )
+            for sandbox_id, (record, metadata) in zip(expected_ids, items)
+        )
 
     async def create_ssh_sandbox(
         self,
@@ -1742,7 +2037,149 @@ def _sandbox_payload(
             payload["image"] = _image_reference(payload["image"])
     else:
         raise TypeError("sandbox image is required and must be an Image")
+    if payload.get("fork_protocol") is not None:
+        payload["fork_protocol"] = _nested_payload(payload["fork_protocol"])
+    if bool(payload.get("forkable")) and not payload.get("fork_protocol"):
+        raise ValueError("forkable sandboxes require fork_protocol")
+    if payload.get("fork_protocol") and not bool(payload.get("forkable")):
+        raise ValueError("fork_protocol requires forkable=True")
     return payload
+
+
+def _fork_sandbox_payload(
+    spec: SandboxForkSpec | None,
+    *,
+    id: str | None,
+    env: Mapping[str, str] | None,
+    labels: Mapping[str, str] | None,
+    ttl_seconds: int | None,
+    memory_mb: int | None,
+    cpus: float | None,
+) -> JsonObject:
+    if spec is not None and not isinstance(spec, SandboxForkSpec):
+        raise TypeError("fork spec must be a SandboxForkSpec")
+    payload = spec.to_dict() if spec is not None else {}
+    if id is not None:
+        payload["id"] = id
+    if env is not None:
+        payload["env"] = {str(key): str(value) for key, value in env.items()}
+    if labels is not None:
+        payload["labels"] = {
+            str(key): str(value) for key, value in labels.items()
+        }
+    if ttl_seconds is not None:
+        payload["ttl_seconds"] = ttl_seconds
+    if memory_mb is not None:
+        payload["memory_mb"] = memory_mb
+    if cpus is not None:
+        payload["cpus"] = cpus
+    sandbox_id = str(payload.get("id") or "").strip()
+    if not sandbox_id:
+        raise ValueError("fork sandbox id is required")
+    payload["id"] = sandbox_id
+    if payload.get("ttl_seconds") is not None and int(payload["ttl_seconds"]) <= 0:
+        raise ValueError("fork ttl_seconds must be positive")
+    if payload.get("memory_mb") is not None and int(payload["memory_mb"]) <= 0:
+        raise ValueError("fork memory_mb must be positive")
+    if payload.get("cpus") is not None and float(payload["cpus"]) <= 0:
+        raise ValueError("fork cpus must be positive")
+    return payload
+
+
+def _fork_batch_payload(
+    sandboxes: Sequence[SandboxForkSpec],
+) -> list[JsonObject]:
+    if not 1 <= len(sandboxes) <= MAX_FORK_BATCH_SIZE:
+        raise ValueError(
+            f"fork batch size must be in [1, {MAX_FORK_BATCH_SIZE}]"
+        )
+    payloads = [
+        _fork_sandbox_payload(
+            spec,
+            id=None,
+            env=None,
+            labels=None,
+            ttl_seconds=None,
+            memory_mb=None,
+            cpus=None,
+        )
+        for spec in sandboxes
+    ]
+    ids = [str(payload["id"]) for payload in payloads]
+    if len(set(ids)) != len(ids):
+        raise ValueError("fork batch sandbox ids must be unique")
+    return payloads
+
+
+def _fork_response_items(
+    response: JsonObject,
+    expected_ids: Sequence[str],
+    *,
+    batch: bool,
+) -> tuple[tuple[JsonObject, JsonObject], ...]:
+    if response.get("intent_persisted") is not True:
+        raise SandboxApiError(
+            "gateway fork response did not confirm durable intents",
+            body=response,
+        )
+    raw_records = response.get("sandboxes") if batch else [response.get("sandbox")]
+    raw_forks = response.get("forks") if batch else [response.get("fork")]
+    if not isinstance(raw_records, list) or not isinstance(raw_forks, list):
+        raise SandboxApiError("gateway returned an invalid fork payload", body=response)
+    if len(raw_records) != len(expected_ids) or len(raw_forks) != len(expected_ids):
+        raise SandboxApiError(
+            "gateway fork response length does not match the request",
+            body=response,
+        )
+    items: list[tuple[JsonObject, JsonObject]] = []
+    checkpoint_id: str | None = None
+    for expected_id, raw_record, raw_fork in zip(
+        expected_ids,
+        raw_records,
+        raw_forks,
+    ):
+        if not isinstance(raw_record, dict) or not isinstance(raw_fork, dict):
+            raise SandboxApiError(
+                "gateway returned an invalid fork record",
+                body=response,
+            )
+        record = dict(raw_record)
+        metadata = dict(raw_fork)
+        record_id = _sandbox_record_id(record)
+        if record_id != expected_id or metadata.get("sandbox_id") != expected_id:
+            raise SandboxApiError(
+                "gateway fork response sandbox identity does not match the request",
+                body=response,
+            )
+        item_checkpoint = metadata.get("checkpoint_id")
+        if not isinstance(item_checkpoint, str) or not item_checkpoint:
+            raise SandboxApiError(
+                "gateway fork response is missing checkpoint identity",
+                body=response,
+            )
+        if checkpoint_id is None:
+            checkpoint_id = item_checkpoint
+        elif checkpoint_id != item_checkpoint:
+            raise SandboxApiError(
+                "gateway batch fork response used multiple checkpoints",
+                body=response,
+            )
+        if metadata.get("restored") is not True:
+            raise SandboxApiError(
+                "gateway fork response did not confirm restore",
+                body=response,
+            )
+        items.append((record, metadata))
+    return tuple(items)
+
+
+def _sandbox_record_id(record: JsonObject) -> str:
+    direct = record.get("id") or record.get("sandbox_id")
+    if isinstance(direct, str) and direct:
+        return direct
+    spec = record.get("spec")
+    nested = spec.get("id") if isinstance(spec, dict) else None
+    return nested if isinstance(nested, str) else ""
 
 
 def _image_build_payload(

@@ -9,6 +9,8 @@ from .client import (
     SandboxClient,
     SandboxExecResult,
     SandboxFilesystemSpec,
+    SandboxForkProtocolSpec,
+    SandboxForkSpec,
     SandboxHandle,
     SandboxSecuritySpec,
     SandboxSpec,
@@ -26,7 +28,7 @@ from .relay import (
     model_relay_env,
 )
 
-__version__ = "0.2.7"
+__version__ = "0.3.0"
 
 __all__ = [
     "AsyncExecHandle",
@@ -38,6 +40,8 @@ __all__ = [
     "SandboxClient",
     "SandboxExecResult",
     "SandboxFilesystemSpec",
+    "SandboxForkProtocolSpec",
+    "SandboxForkSpec",
     "SandboxHandle",
     "SandboxSecuritySpec",
     "SandboxSpec",

@@ -17,9 +17,12 @@ from urllib.parse import parse_qs, unquote, urlparse
 import ucloud_sandboxes_sdk.client as client_module
 from ucloud_sandboxes_sdk import (
     AsyncSandboxClient,
+    AsyncSandboxHandle,
     Image,
     SandboxApiError,
     SandboxClient,
+    SandboxForkProtocolSpec,
+    SandboxForkSpec,
     SandboxSpec,
     sandbox_auth_headers,
 )
@@ -138,6 +141,108 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(sandbox.id, "spec-one")
         self.assertEqual(deleted["deleted"]["spec"]["image"], "busybox")
 
+    def test_sandbox_spec_only_sends_fork_fields_when_enabled(self) -> None:
+        ordinary = SandboxSpec(
+            id="ordinary",
+            image=Image.from_registry("busybox"),
+        ).to_dict()
+        protocol = SandboxForkProtocolSpec(
+            prepare_command=("fork-agent", "prepare"),
+            ready_command=("fork-agent", "ready"),
+            timeout_seconds=20,
+        )
+        forkable = SandboxSpec(
+            id="forkable",
+            image=Image.from_registry("busybox"),
+            memory_mb=128,
+            disk_mb=64,
+            forkable=True,
+            fork_protocol=protocol,
+        ).to_dict()
+
+        self.assertNotIn("forkable", ordinary)
+        self.assertNotIn("fork_protocol", ordinary)
+        self.assertTrue(forkable["forkable"])
+        self.assertEqual(
+            forkable["fork_protocol"],
+            {
+                "version": "agent-v1",
+                "prepare_command": ["fork-agent", "prepare"],
+                "ready_command": ["fork-agent", "ready"],
+                "timeout_seconds": 20,
+            },
+        )
+
+    def test_sync_client_forks_single_and_batch_from_handle(self) -> None:
+        protocol = SandboxForkProtocolSpec(
+            prepare_command=("fork-agent", "prepare"),
+            ready_command=("fork-agent", "ready"),
+        )
+        with running_gateway() as gateway:
+            client = SandboxClient(gateway.base_url)
+            source = client.create_sandbox(
+                SandboxSpec(
+                    id="fork-source",
+                    image=Image.from_registry("busybox"),
+                    env={"SOURCE": "yes"},
+                    labels={"tree": "root"},
+                    memory_mb=128,
+                    cpus=0.5,
+                    disk_mb=64,
+                    forkable=True,
+                    fork_protocol=protocol,
+                )
+            )
+
+            child = source.fork(
+                id="fork-child",
+                env={"BRANCH": "single"},
+                labels={"leaf": "one"},
+                ttl_seconds=300,
+            )
+            batch = source.fork_many(
+                (
+                    SandboxForkSpec(id="fork-child-a", env={"BRANCH": "a"}),
+                    SandboxForkSpec(id="fork-child-b", cpus=0.25),
+                )
+            )
+
+        self.assertEqual(child.id, "fork-child")
+        self.assertEqual(child.record["creation_kind"], "restore")
+        self.assertEqual(child.record["spec"]["env"]["SOURCE"], "yes")
+        self.assertEqual(child.record["spec"]["env"]["BRANCH"], "single")
+        self.assertEqual(child.record["spec"]["labels"]["leaf"], "one")
+        self.assertEqual(child.fork_metadata["checkpoint_id"], "fork-set-sdk-test")
+        self.assertTrue(child.create_response["intent_persisted"])
+        self.assertEqual([item.id for item in batch], ["fork-child-a", "fork-child-b"])
+        self.assertEqual(
+            {item.fork_metadata["checkpoint_id"] for item in batch},
+            {"fork-set-sdk-test"},
+        )
+        self.assertEqual(batch[1].record["spec"]["cpus"], 0.25)
+
+    def test_sync_fork_error_exposes_durable_intent_state(self) -> None:
+        with running_gateway() as gateway:
+            client = SandboxClient(gateway.base_url)
+            source = client.create_sandbox(
+                id="fork-error-source",
+                image=Image.from_registry("busybox"),
+                memory_mb=128,
+                disk_mb=64,
+                forkable=True,
+                fork_protocol=SandboxForkProtocolSpec(
+                    prepare_command=("fork-agent", "prepare"),
+                    ready_command=("fork-agent", "ready"),
+                ),
+            )
+            with self.assertRaises(SandboxApiError) as raised:
+                source.fork(id="fork-error")
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertTrue(raised.exception.retryable)
+        self.assertTrue(raised.exception.intent_persisted)
+        self.assertEqual(raised.exception.intents[0]["sandbox_id"], "fork-error")
+
     def test_sync_create_sandbox_accepts_per_call_request_timeout(self) -> None:
         class FakeResponse:
             status = 200
@@ -173,6 +278,53 @@ class SandboxSdkTests(unittest.TestCase):
 
         self.assertEqual(sandbox.id, "timeout-one")
         self.assertEqual(captured_timeouts, [7])
+
+    def test_sync_fork_uses_long_default_request_timeout(self) -> None:
+        class FakeResponse:
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return json.dumps(
+                    {
+                        "intent_persisted": True,
+                        "sandbox": {
+                            "id": "timeout-child",
+                            "spec": {"id": "timeout-child"},
+                        },
+                        "fork": {
+                            "sandbox_id": "timeout-child",
+                            "checkpoint_id": "fork-timeout",
+                            "restored": True,
+                        },
+                    }
+                ).encode()
+
+        captured_timeouts: list[object] = []
+
+        def fake_urlopen(req: object, timeout: object = None) -> FakeResponse:
+            captured_timeouts.append(timeout)
+            return FakeResponse()
+
+        client = SandboxClient("http://gateway.invalid", timeout_seconds=11)
+        with patch.object(client_module.request, "urlopen", fake_urlopen):
+            child = client.fork_sandbox("source", id="timeout-child")
+
+        self.assertEqual(child.id, "timeout-child")
+        self.assertEqual(captured_timeouts, [3600.0])
+
+    def test_fork_batch_requires_unique_bounded_targets(self) -> None:
+        client = SandboxClient("http://gateway.invalid")
+        with self.assertRaisesRegex(ValueError, "batch size"):
+            client.fork_sandboxes("source", ())
+        with self.assertRaisesRegex(ValueError, "must be unique"):
+            client.fork_sandboxes(
+                "source",
+                (SandboxForkSpec(id="same"), SandboxForkSpec(id="same")),
+            )
 
     def test_sync_client_uploads_local_build_context(self) -> None:
         with TemporaryDirectory() as raw_dir:
@@ -422,6 +574,47 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(size, 12)
         self.assertEqual(downloaded, b"async bytes\n")
 
+    def test_async_client_forks_single_and_batch_from_handle(self) -> None:
+        async def scenario(
+            base_url: str,
+        ) -> tuple[AsyncSandboxHandle, tuple[AsyncSandboxHandle, ...]]:
+            async with AsyncSandboxClient(base_url) as client:
+                source = await client.create_sandbox(
+                    id="async-fork-source",
+                    image=Image.from_registry("busybox"),
+                    memory_mb=128,
+                    disk_mb=64,
+                    forkable=True,
+                    fork_protocol=SandboxForkProtocolSpec(
+                        prepare_command=("fork-agent", "prepare"),
+                        ready_command=("fork-agent", "ready"),
+                    ),
+                )
+                child = await source.fork(
+                    SandboxForkSpec(
+                        id="async-fork-child",
+                        env={"BRANCH": "single"},
+                    )
+                )
+                batch = await source.fork_many(
+                    (
+                        SandboxForkSpec(id="async-fork-child-a"),
+                        SandboxForkSpec(id="async-fork-child-b"),
+                    )
+                )
+                return child, batch
+
+        with running_gateway() as gateway:
+            child, batch = asyncio.run(scenario(gateway.base_url))
+
+        self.assertEqual(child.id, "async-fork-child")
+        self.assertEqual(child.record["spec"]["env"]["BRANCH"], "single")
+        self.assertTrue(child.fork_metadata["restored"])
+        self.assertEqual(
+            [item.id for item in batch],
+            ["async-fork-child-a", "async-fork-child-b"],
+        )
+
     def test_async_create_sandbox_accepts_per_call_request_timeout(self) -> None:
         class FakeResponse:
             status = 200
@@ -462,6 +655,61 @@ class SandboxSdkTests(unittest.TestCase):
 
         self.assertEqual(sandbox_id, "timeout-one")
         self.assertEqual([_timeout_total(timeout) for timeout in timeouts], [7])
+
+    def test_async_fork_uses_long_default_request_timeout(self) -> None:
+        class FakeResponse:
+            status = 201
+
+            async def __aenter__(self) -> "FakeResponse":
+                return self
+
+            async def __aexit__(self, *args: object) -> None:
+                return None
+
+            async def text(self) -> str:
+                return json.dumps(
+                    {
+                        "intent_persisted": True,
+                        "sandbox": {
+                            "id": "async-timeout-child",
+                            "spec": {"id": "async-timeout-child"},
+                        },
+                        "fork": {
+                            "sandbox_id": "async-timeout-child",
+                            "checkpoint_id": "fork-timeout",
+                            "restored": True,
+                        },
+                    }
+                )
+
+        class FakeSession:
+            def __init__(self) -> None:
+                self.timeouts: list[object] = []
+
+            def request(self, _method: object, _url: object, **kwargs: object) -> FakeResponse:
+                self.timeouts.append(kwargs.get("timeout"))
+                return FakeResponse()
+
+        async def scenario() -> tuple[str, list[object]]:
+            session = FakeSession()
+            client = AsyncSandboxClient(
+                "http://gateway.invalid",
+                session=session,
+                timeout_seconds=11,
+            )
+            child = await client.fork_sandbox(
+                "source",
+                id="async-timeout-child",
+            )
+            return child.id, session.timeouts
+
+        sandbox_id, timeouts = asyncio.run(scenario())
+
+        self.assertEqual(sandbox_id, "async-timeout-child")
+        self.assertEqual(
+            [_timeout_total(timeout) for timeout in timeouts],
+            [3600.0],
+        )
 
     def test_async_build_image_accepts_per_call_timeout(self) -> None:
         class FakeResponse:
@@ -730,6 +978,98 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
                 self.state.sandboxes[sandbox_id] = record
             self._write_json({"sandbox": record}, status=HTTPStatus.CREATED)
             return
+        fork_source_id = _fork_source_id_from_path(path)
+        if fork_source_id is not None:
+            batch = isinstance(payload.get("sandboxes"), list)
+            raw_targets = (
+                payload.get("sandboxes")
+                if batch
+                else [payload.get("sandbox")]
+            )
+            targets = (
+                [item for item in raw_targets if isinstance(item, dict)]
+                if isinstance(raw_targets, list)
+                else []
+            )
+            if len(targets) != len(raw_targets or []):
+                self._write_json(
+                    {"error": "invalid fork targets"},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
+            if any(item.get("id") == "fork-error" for item in targets):
+                self._write_json(
+                    {
+                        "error": "fork restore outcome is ambiguous",
+                        "intent_persisted": True,
+                        "retryable": True,
+                        "intents": [
+                            {
+                                "sandbox_id": str(item.get("id") or ""),
+                                "intent_persisted": True,
+                            }
+                            for item in targets
+                        ],
+                    },
+                    status=HTTPStatus.CONFLICT,
+                )
+                return
+            with self.state.lock:
+                source = self.state.sandboxes.get(fork_source_id)
+            if not isinstance(source, dict):
+                self._write_json(
+                    {"error": "sandbox route not found"},
+                    status=HTTPStatus.NOT_FOUND,
+                )
+                return
+            source_spec = source.get("spec")
+            if not isinstance(source_spec, dict):
+                self._write_json(
+                    {"error": "source spec missing"},
+                    status=HTTPStatus.CONFLICT,
+                )
+                return
+            checkpoint_id = "fork-set-sdk-test"
+            records: list[dict] = []
+            forks: list[dict] = []
+            for target in targets:
+                sandbox_id = str(target.get("id") or "")
+                spec = dict(source_spec)
+                spec["id"] = sandbox_id
+                for key in ("ttl_seconds", "memory_mb", "cpus"):
+                    if target.get(key) is not None:
+                        spec[key] = target[key]
+                for key in ("env", "labels"):
+                    merged = dict(source_spec.get(key) or {})
+                    if isinstance(target.get(key), dict):
+                        merged.update(target[key])
+                    spec[key] = merged
+                record = {
+                    "id": sandbox_id,
+                    "sandbox_id": sandbox_id,
+                    "spec": spec,
+                    "state": "running",
+                    "creation_kind": "restore",
+                    "source_sandbox_id": fork_source_id,
+                    "checkpoint_id": checkpoint_id,
+                }
+                fork = {
+                    "sandbox_id": sandbox_id,
+                    "checkpoint_id": checkpoint_id,
+                    "restored": True,
+                    "commands": [],
+                }
+                records.append(record)
+                forks.append(fork)
+                with self.state.lock:
+                    self.state.sandboxes[sandbox_id] = record
+            response = {"intent_persisted": True}
+            if batch:
+                response.update({"sandboxes": records, "forks": forks})
+            else:
+                response.update({"sandbox": records[0], "fork": forks[0]})
+            self._write_json(response, status=HTTPStatus.CREATED)
+            return
         if path == "/v1/images/build":
             if payload.get("id") == "denied":
                 self._write_json(
@@ -981,6 +1321,17 @@ def _sandbox_id_from_path(path: str) -> str | None:
     if not rest:
         return None
     return unquote(rest.split("/", 1)[0])
+
+
+def _fork_source_id_from_path(path: str) -> str | None:
+    prefix = "/v1/sandboxes/"
+    suffix = "/forks"
+    if not path.startswith(prefix) or not path.endswith(suffix):
+        return None
+    encoded = path[len(prefix) : -len(suffix)]
+    if not encoded or "/" in encoded:
+        return None
+    return unquote(encoded)
 
 
 def _exec_id_from_path(path: str) -> str | None:

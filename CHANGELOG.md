@@ -2,6 +2,18 @@
 
 This project uses semantic versioning.
 
+## 0.3.0 - 2026-07-11
+
+- Added typed `SandboxForkProtocolSpec` and `SandboxForkSpec` request models.
+- Added synchronous and asynchronous single and batch fork methods on clients
+  and sandbox handles.
+- Validated durable fork acknowledgments, restored child identities, response
+  ordering, shared batch checkpoint identity, and the 64-child batch limit.
+- Preserved fork metadata and the complete gateway response on returned child
+  handles, and exposed retryable/durable intent state on `SandboxApiError`.
+- Used a one-hour default fork request timeout to cover the gateway's bounded
+  64-child restore window.
+
 ## 0.2.8 - 2026-07-06
 
 - Retried transient UCloud public-link `503` responses that return the

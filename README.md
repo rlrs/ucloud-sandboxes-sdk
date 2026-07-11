@@ -70,6 +70,80 @@ finally:
 long-lived or interactive commands, call `start_exec()`, then use the returned
 exec handle to write stdin, read events, close stdin, or wait for completion.
 
+## Live Forking
+
+Forkable workloads must implement the gateway's `agent-v1` quiesce/readiness
+protocol in their initial process tree. The SDK describes the hook commands;
+the commands themselves must be present in the image and coordinate with the
+long-running agent process:
+
+```python
+from ucloud_sandboxes_sdk import (
+    Image,
+    SandboxClient,
+    SandboxForkProtocolSpec,
+    SandboxForkSpec,
+    SandboxSpec,
+)
+
+client = SandboxClient(
+    "https://app-sandboxes.cloud.sdu.dk",
+    api_token="<token>",
+)
+source = client.create_sandbox(
+    SandboxSpec(
+        id="agent-source",
+        image=Image.from_registry("registry.example.org/agent:latest"),
+        command=["/usr/local/bin/agent"],
+        memory_mb=2048,
+        cpus=1,
+        disk_mb=10240,
+        network="bridge",
+        forkable=True,
+        fork_protocol=SandboxForkProtocolSpec(
+            prepare_command=("/usr/local/bin/fork-agent", "prepare"),
+            ready_command=("/usr/local/bin/fork-agent", "ready"),
+            timeout_seconds=30,
+        ),
+    )
+)
+
+child = source.fork(
+    id="agent-child",
+    env={"AGENT_BRANCH": "child"},
+    ttl_seconds=900,
+)
+assert child.fork_metadata["restored"] is True
+
+children = source.fork_many(
+    (
+        SandboxForkSpec(id="agent-child-a", env={"AGENT_BRANCH": "a"}),
+        SandboxForkSpec(id="agent-child-b", env={"AGENT_BRANCH": "b"}),
+    )
+)
+```
+
+The gateway appends `<checkpoint-id> <nonce> <role>` to each hook command. The
+prepare hook must print `UCLOUD_FORK_PREPARED=<nonce>` after the initial process
+has quiesced and opened `/proc/gvisor/checkpoint`. Ready hooks must print
+`UCLOUD_FORK_READY=<nonce>:<role>` only after the source resumed or the child
+read its new identity from `/proc/gvisor/spec_environ` and rekeyed inherited
+state. Forkable sources require explicit memory and disk limits and cannot use
+the direct SSH option.
+
+The corresponding client methods are `fork_sandbox()` and
+`fork_sandboxes()`; async clients and handles expose the same operations. A
+returned child handle keeps the normal sandbox record in `record`, its
+per-child checkpoint result in `fork_metadata`, and the complete gateway
+response in `create_response`.
+
+Fork calls use a one-hour request timeout by default so the maximum 64-child
+fan-out can complete within the gateway's bounded restore window. Override it
+with `timeout_seconds`. If a fork raises `SandboxApiError`, inspect
+`intent_persisted`, `intents`, and `retryable`. Replay the exact same request
+when intent state is `True` or unknown; do not submit a different child id while
+the original outcome is ambiguous.
+
 ## Files
 
 Upload and download files as raw bytes through the gateway:
