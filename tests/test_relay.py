@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from collections.abc import Iterator
 from contextlib import contextmanager
 from http import HTTPStatus
@@ -12,11 +13,17 @@ from urllib.parse import parse_qs, urlparse
 
 from ucloud_sandboxes_sdk import (
     AsyncRelayWorkerClient,
+    HttpTunnelConfig,
     ModelRelayConfig,
     RelayApiError,
+    RelayRequest,
     RelayWorkerClient,
+    http_tunnel_url,
     model_relay_env,
 )
+
+
+REGISTRATION_TOKEN = "0123456789abcdef0123456789abcdef"
 
 
 class ModelRelayConfigTests(unittest.TestCase):
@@ -42,6 +49,23 @@ class ModelRelayConfigTests(unittest.TestCase):
         )
 
         self.assertEqual(config.openai_base_url, "https://relay.example.org/v1")
+
+    def test_builds_general_http_tunnel_url_and_auth_headers(self) -> None:
+        config = HttpTunnelConfig(
+            "https://relay.example.org/",
+            "run:001",
+            relay_token="sandbox-token",
+        )
+
+        self.assertEqual(
+            config.base_url,
+            "https://relay.example.org/tunnels/run%3A001/",
+        )
+        self.assertEqual(
+            http_tunnel_url(config.relay_url, config.tunnel_id, "/api/items"),
+            "https://relay.example.org/tunnels/run%3A001/api/items",
+        )
+        self.assertEqual(config.headers(), {"X-UCloud-Relay-Token": "sandbox-token"})
 
 
 class RelayWorkerClientTests(unittest.TestCase):
@@ -99,9 +123,48 @@ class RelayWorkerClientTests(unittest.TestCase):
         self.assertTrue(unregistered["existed"])
         self.assertEqual(relay.state.last_poll_query["limit"], ["8"])
         self.assertEqual(relay.state.last_poll_query["lease_seconds"], ["600"])
+        self.assertEqual(
+            relay.state.last_poll_query["registration_token"],
+            [REGISTRATION_TOKEN],
+        )
+        self.assertEqual(
+            relay.state.last_renew_payload["registration_token"],
+            REGISTRATION_TOKEN,
+        )
         self.assertEqual(relay.state.last_renew_payload["lease_seconds"], 900)
-        self.assertEqual(relay.state.last_respond_payload["headers"], {"X-Model": "local"})
+        self.assertEqual(
+            relay.state.last_respond_payload["headers"], {"X-Model": "local"}
+        )
+        self.assertEqual(
+            relay.state.last_respond_payload["registration_token"],
+            REGISTRATION_TOKEN,
+        )
         self.assertEqual(relay.state.last_error_payload["status"], 503)
+
+    def test_sync_worker_client_forwards_binary_http_request_and_response(self) -> None:
+        with running_relay() as relay:
+            client = RelayWorkerClient(relay.base_url, worker_token="worker-token")
+            relay_request = RelayRequest.from_payload(
+                _relay_request(
+                    rollout_id="binary-tunnel",
+                    leased_by="worker-1",
+                    endpoint="/upstream/echo?x=1",
+                    body=b"\x00\xffrequest",
+                    content_type="application/octet-stream",
+                )
+            )
+
+            result = client.forward_to(relay_request, relay.base_url)
+
+        self.assertEqual(result["request_id"], "req-1")
+        self.assertEqual(relay.state.upstream_method, "POST")
+        self.assertEqual(relay.state.upstream_path, "/upstream/echo?x=1")
+        self.assertEqual(relay.state.upstream_body, b"\x00\xffrequest")
+        self.assertEqual(relay.state.last_respond_payload["status"], 207)
+        self.assertEqual(
+            base64.b64decode(relay.state.last_respond_payload["body_base64"]),
+            b"\xffresponse",
+        )
 
     def test_sync_worker_client_surfaces_auth_errors(self) -> None:
         with running_relay() as relay:
@@ -133,7 +196,11 @@ class RelayWorkerClientTests(unittest.TestCase):
                     lease_seconds=1200,
                 )
                 response = await client.respond_to(renewed, {"choices": []})
-                return renewed.request_id, renewed.lease_expires_at, response["request_id"]
+                return (
+                    renewed.request_id,
+                    renewed.lease_expires_at,
+                    response["request_id"],
+                )
 
         with running_relay() as relay:
             renewed_id, lease_expires_at, responded_id = asyncio.run(
@@ -179,6 +246,9 @@ class FakeRelayState:
         self.last_renew_payload: dict = {}
         self.last_respond_payload: dict = {}
         self.last_error_payload: dict = {}
+        self.upstream_method = ""
+        self.upstream_path = ""
+        self.upstream_body = b""
 
 
 class FakeRelayHandler(BaseHTTPRequestHandler):
@@ -216,22 +286,40 @@ class FakeRelayHandler(BaseHTTPRequestHandler):
         self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path == "/upstream/echo":
+            body = self.rfile.read(int(self.headers.get("Content-Length") or "0"))
+            with self.state.lock:
+                self.state.upstream_method = "POST"
+                self.state.upstream_path = self.path
+                self.state.upstream_body = body
+            self._write_bytes(
+                b"\xffresponse",
+                status=207,
+                content_type="application/octet-stream",
+            )
+            return
         if not self._check_authorized():
             return
-        parsed = urlparse(self.path)
         payload = self._read_json()
-        if parsed.path == "/register_rollout":
-            rollout_id = str(payload.get("rollout_id") or "")
+        if parsed.path in {"/register_rollout", "/v1/tunnels/register"}:
+            rollout_id = str(
+                payload.get("rollout_id") or payload.get("tunnel_id") or ""
+            )
             record = {
                 "rollout_id": rollout_id,
+                "tunnel_id": rollout_id,
+                "registration_token": REGISTRATION_TOKEN,
                 "metadata": dict(payload.get("metadata") or {}),
             }
             with self.state.lock:
                 self.state.rollouts[rollout_id] = record
             self._write_json({"ok": True, "rollout": record}, status=HTTPStatus.CREATED)
             return
-        if parsed.path == "/unregister_rollout":
-            rollout_id = str(payload.get("rollout_id") or "")
+        if parsed.path in {"/unregister_rollout", "/v1/tunnels/unregister"}:
+            rollout_id = str(
+                payload.get("rollout_id") or payload.get("tunnel_id") or ""
+            )
             with self.state.lock:
                 existed = self.state.rollouts.pop(rollout_id, None) is not None
             self._write_json({"ok": True, "rollout_id": rollout_id, "existed": existed})
@@ -310,20 +398,42 @@ class FakeRelayHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _write_bytes(
+        self,
+        body: bytes,
+        *,
+        status: int = 200,
+        content_type: str = "application/octet-stream",
+    ) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
 
 def _relay_request(
     *,
     rollout_id: str,
     leased_by: str,
     lease_expires_at: float = 123.0,
+    endpoint: str = "/v1/chat/completions",
+    body: bytes | None = None,
+    content_type: str = "application/json",
 ) -> dict:
+    json_body = {"model": "test-model", "messages": []}
+    raw_body = body if body is not None else json.dumps(json_body).encode("utf-8")
     return {
         "request_id": "req-1",
         "rollout_id": rollout_id,
-        "endpoint": "/v1/chat/completions",
+        "tunnel_id": rollout_id,
+        "registration_token": REGISTRATION_TOKEN,
+        "endpoint": endpoint,
         "method": "POST",
-        "headers": {"X-Relay": "yes"},
-        "body": {"model": "test-model", "messages": []},
+        "headers": {"X-Relay": "yes", "Content-Type": content_type},
+        "body": json_body if body is None else None,
+        "body_base64": base64.b64encode(raw_body).decode("ascii"),
+        "body_size": len(raw_body),
         "created_at": 1.0,
         "delivered_at": 2.0,
         "first_delivered_at": 2.0,

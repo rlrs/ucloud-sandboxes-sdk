@@ -20,15 +20,17 @@ from .client import (
 )
 from .relay import (
     AsyncRelayWorkerClient,
+    HttpTunnelConfig,
     ModelRelayConfig,
     RelayApiError,
     RelayPollResult,
     RelayRequest,
     RelayWorkerClient,
+    http_tunnel_url,
     model_relay_env,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "AsyncExecHandle",
@@ -36,6 +38,7 @@ __all__ = [
     "AsyncSandboxClient",
     "AsyncSandboxHandle",
     "Image",
+    "HttpTunnelConfig",
     "SandboxApiError",
     "SandboxClient",
     "SandboxExecResult",
@@ -54,5 +57,6 @@ __all__ = [
     "RelayRequest",
     "RelayWorkerClient",
     "__version__",
+    "http_tunnel_url",
     "model_relay_env",
 ]

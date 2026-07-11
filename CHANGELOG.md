@@ -2,6 +2,18 @@
 
 This project uses semantic versioning.
 
+## 0.4.0 - 2026-07-11
+
+- Added general buffered HTTP tunnel configuration and worker APIs, including
+  byte-safe request envelopes, binary responses, and forwarding to a
+  worker-local HTTP service.
+- Added tunnel registration/list/unregistration aliases while preserving the
+  OpenAI-compatible model relay helpers.
+- Persisted relay registration tokens in sync and async worker clients and sent
+  them on poll, heartbeat, lease renewal, response, error, and unregister calls.
+- Documented the 32 MiB buffered-body limit and the current exclusion of
+  WebSockets, streaming responses, and raw TCP.
+
 ## 0.3.0 - 2026-07-11
 
 - Added typed `SandboxForkProtocolSpec` and `SandboxForkSpec` request models.

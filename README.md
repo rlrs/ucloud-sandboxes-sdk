@@ -236,6 +236,44 @@ for request in poll.requests:
 Use `AsyncRelayWorkerClient` for async workers; it exposes the same methods with
 `await`.
 
+### General HTTP tunnel
+
+The same relay can expose any buffered HTTP service, not only OpenAI endpoints.
+Register a tunnel and forward each leased request to the worker-local service:
+
+```python
+from ucloud_sandboxes_sdk import HttpTunnelConfig, RelayWorkerClient
+
+relay = RelayWorkerClient(
+    "https://relay.example.org",
+    worker_token="<worker-relay-token>",
+)
+relay.register_tunnel("dev-api")
+
+while True:
+    for request in relay.poll("dev-api", timeout_seconds=30).requests:
+        relay.forward_to(request, "http://127.0.0.1:8080")
+```
+
+Callers use the tunnel URL and a dedicated relay-auth header. Keeping relay
+authentication separate means an upstream `Authorization` header can pass
+through unchanged:
+
+```python
+tunnel = HttpTunnelConfig(
+    "https://relay.example.org",
+    "dev-api",
+    relay_token="<sandbox-relay-token>",
+)
+
+# requests.get(tunnel.base_url + "v1/data", headers=tunnel.headers())
+```
+
+The tunnel preserves methods, percent-encoded paths, query strings, headers,
+status codes, and binary request/response bodies. This first implementation is
+buffered HTTP with a 32 MiB body limit; WebSockets, streaming responses, and raw
+TCP tunnels are not included.
+
 ## Prepared Capacity
 
 If a runner knows it will soon need a burst of sandboxes, it can send a
