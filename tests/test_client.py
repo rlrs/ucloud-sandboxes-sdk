@@ -783,6 +783,72 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 503)
         self.assertEqual(len(calls), 1)
 
+    def test_sync_client_retries_structured_capacity_error_for_safe_read(self) -> None:
+        class FakeResponse:
+            status = 200
+
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"sandboxes": []}'
+
+        calls = 0
+
+        def fake_urlopen(req: object, timeout: object = None) -> object:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise client_module.error.HTTPError(
+                    str(getattr(req, "full_url", "")),
+                    503,
+                    "Service Unavailable",
+                    {"Retry-After": "0"},
+                    io.BytesIO(
+                        b'{"error":"HTTP request capacity is exhausted; retry shortly",'
+                        b'"retryable":true}'
+                    ),
+                )
+            return FakeResponse()
+
+        client = SandboxClient("http://gateway.invalid")
+        with patch.object(client_module, "open_no_redirect", fake_urlopen), patch.object(
+            client_module.time,
+            "sleep",
+            lambda _delay: None,
+        ):
+            sandboxes = client.list_sandboxes()
+
+        self.assertEqual(sandboxes, [])
+        self.assertEqual(calls, 2)
+
+    def test_sync_client_does_not_retry_structured_capacity_for_exec(self) -> None:
+        calls = 0
+
+        def fake_urlopen(req: object, timeout: object = None) -> object:
+            nonlocal calls
+            calls += 1
+            raise client_module.error.HTTPError(
+                str(getattr(req, "full_url", "")),
+                503,
+                "Service Unavailable",
+                {"Retry-After": "0"},
+                io.BytesIO(
+                    b'{"error":"HTTP request capacity is exhausted; retry shortly",'
+                    b'"retryable":true}'
+                ),
+            )
+
+        client = SandboxClient("http://gateway.invalid")
+        with patch.object(client_module, "open_no_redirect", fake_urlopen):
+            with self.assertRaises(SandboxApiError):
+                client.start_exec("sandbox-one", ["true"])
+
+        self.assertEqual(calls, 1)
+
     def test_sync_client_rejects_legacy_image_patterns(self) -> None:
         client = SandboxClient("http://gateway.invalid")
 
@@ -1223,6 +1289,50 @@ class SandboxSdkTests(unittest.TestCase):
         health, calls = asyncio.run(scenario())
 
         self.assertEqual(health, {"ok": True})
+        self.assertEqual(calls, 2)
+
+    def test_async_client_retries_structured_capacity_error_for_safe_read(self) -> None:
+        class FakeResponse:
+            def __init__(self, status: int, body: str) -> None:
+                self.status = status
+                self.body = body
+
+            async def __aenter__(self) -> "FakeResponse":
+                return self
+
+            async def __aexit__(self, *args: object) -> None:
+                return None
+
+            async def text(self) -> str:
+                return self.body
+
+        class FakeSession:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def request(self, _method: object, _url: object, **_kwargs: object) -> FakeResponse:
+                self.calls += 1
+                if self.calls == 1:
+                    return FakeResponse(
+                        503,
+                        '{"error":"HTTP request capacity is exhausted; retry shortly",'
+                        '"retryable":true}',
+                    )
+                return FakeResponse(200, '{"sandboxes": []}')
+
+        async def no_sleep(_delay: float) -> None:
+            return None
+
+        async def scenario() -> tuple[list[dict], int]:
+            session = FakeSession()
+            client = AsyncSandboxClient("http://gateway.invalid", session=session)
+            with patch.object(client_module.asyncio, "sleep", no_sleep):
+                sandboxes = await client.list_sandboxes()
+            return sandboxes, session.calls
+
+        sandboxes, calls = asyncio.run(scenario())
+
+        self.assertEqual(sandboxes, [])
         self.assertEqual(calls, 2)
 
 

@@ -1136,9 +1136,17 @@ class SandboxClient:
                     headers=response_headers(exc),
                 )
                 exc.close()
-                if _should_retry_ucloud_unavailable(exc.code, decoded, attempt):
+                if _should_retry_ucloud_unavailable(
+                    exc.code,
+                    decoded,
+                    attempt,
+                    method=method,
+                ):
                     if _sleep_for_retry(
-                        _ucloud_unavailable_retry_delay(attempt),
+                        _scale_up_retry_delay(
+                            api_error,
+                            _ucloud_unavailable_retry_delay(attempt),
+                        ),
                         deadline,
                     ):
                         continue
@@ -1195,9 +1203,17 @@ class SandboxClient:
                     headers=response_headers(exc),
                 )
                 exc.close()
-                if _should_retry_ucloud_unavailable(exc.code, decoded, attempt):
+                if _should_retry_ucloud_unavailable(
+                    exc.code,
+                    decoded,
+                    attempt,
+                    method=method,
+                ):
                     if _sleep_for_retry(
-                        _ucloud_unavailable_retry_delay(attempt),
+                        _scale_up_retry_delay(
+                            api_error,
+                            _ucloud_unavailable_retry_delay(attempt),
+                        ),
                         deadline,
                     ):
                         continue
@@ -2065,8 +2081,12 @@ class AsyncSandboxClient:
                         response.status,
                         decoded,
                         attempt,
+                        method=method,
                     ):
-                        delay = _ucloud_unavailable_retry_delay(attempt)
+                        delay = _scale_up_retry_delay(
+                            api_error,
+                            _ucloud_unavailable_retry_delay(attempt),
+                        )
                         remaining = _remaining_seconds(deadline)
                         if remaining is None or remaining > delay:
                             await asyncio.sleep(delay)
@@ -2120,8 +2140,12 @@ class AsyncSandboxClient:
                         response.status,
                         decoded,
                         attempt,
+                        method=method,
                     ):
-                        delay = _ucloud_unavailable_retry_delay(attempt)
+                        delay = _scale_up_retry_delay(
+                            api_error,
+                            _ucloud_unavailable_retry_delay(attempt),
+                        )
                         remaining = _remaining_seconds(deadline)
                         if remaining is None or remaining > delay:
                             await asyncio.sleep(delay)
@@ -2534,9 +2558,18 @@ def _should_retry_ucloud_unavailable(
     status_code: int,
     body: object,
     attempt: int,
+    *,
+    method: str = "GET",
 ) -> bool:
     if attempt >= UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS - 1:
         return False
+    if (
+        method.upper() in {"GET", "HEAD", "OPTIONS"}
+        and status_code in {408, 425, 429, 500, 502, 503, 504}
+        and isinstance(body, dict)
+        and body.get("retryable") is True
+    ):
+        return True
     if status_code != UCLOUD_UNAVAILABLE_STATUS:
         return False
     text = _ucloud_unavailable_error_text(body).lower()

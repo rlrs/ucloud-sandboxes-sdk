@@ -4,6 +4,14 @@ This project uses semantic versioning.
 
 ## Unreleased
 
+## 0.3.1 - 2026-07-11
+
+- Retried structured retryable capacity responses for safe reads, including
+  `list_sandboxes()`, while leaving side-effecting exec requests single-shot.
+- Honored the gateway's `Retry-After` header for transient read retries.
+
+## 0.3.0 - 2026-07-11
+
 - Prepared the breaking `0.3.0` SDK surface: removed the internal-node
   `heartbeat()` method, replaced ambiguous image-name aliases with
   `Image.from_gateway_id()`, made Dockerfile image ids explicit, and required
