@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, field
 import io
 import json
 from pathlib import Path
+import random
 import shlex
 import tarfile
 import time
@@ -18,8 +19,11 @@ TERMINAL_EXEC_STATUSES = {"exited", "failed"}
 SANDBOX_TOKEN_HEADER = "X-UCloud-Sandbox-Token"
 UCLOUD_UNAVAILABLE_STATUS = 503
 UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS = 6
+UCLOUD_CREATE_RETRY_ATTEMPTS = 151
 UCLOUD_UNAVAILABLE_RETRY_BASE_DELAY_SECONDS = 0.25
 UCLOUD_UNAVAILABLE_RETRY_MAX_DELAY_SECONDS = 4.0
+UCLOUD_RETRY_AFTER_JITTER_RATIO = 0.25
+DEFAULT_CREATE_TIMEOUT_SECONDS = 10 * 60.0
 DEFAULT_FORK_TIMEOUT_SECONDS = 3600.0
 MAX_FORK_BATCH_SIZE = 64
 
@@ -678,7 +682,11 @@ class SandboxClient:
             "POST",
             "/v1/sandboxes",
             payload=payload,
-            timeout_seconds=request_timeout_seconds,
+            timeout_seconds=(
+                DEFAULT_CREATE_TIMEOUT_SECONDS
+                if request_timeout_seconds is None
+                else request_timeout_seconds
+            ),
         )
         record = response.get("sandbox")
         if not isinstance(record, dict):
@@ -1109,7 +1117,8 @@ class SandboxClient:
         elif content_type is not None:
             headers["Content-Type"] = content_type
         timeout = self.timeout_seconds if timeout_seconds is None else timeout_seconds
-        for attempt in range(UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS):
+        retry_attempts = _ucloud_unavailable_retry_attempts(method, path)
+        for attempt in range(retry_attempts):
             req = request.Request(
                 self.base_url + path,
                 data=raw_body,
@@ -1131,6 +1140,7 @@ class SandboxClient:
                     attempt,
                     method=method,
                     path=path,
+                    max_attempts=retry_attempts,
                 ):
                     time.sleep(
                         _ucloud_unavailable_retry_delay(
@@ -1152,7 +1162,8 @@ class SandboxClient:
         raise AssertionError("unreachable UCloud unavailable retry state")
 
     def _request_bytes(self, method: str, path: str) -> bytes:
-        for attempt in range(UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS):
+        retry_attempts = _ucloud_unavailable_retry_attempts(method, path)
+        for attempt in range(retry_attempts):
             req = request.Request(
                 self.base_url + path,
                 method=method,
@@ -1172,6 +1183,7 @@ class SandboxClient:
                     attempt,
                     method=method,
                     path=path,
+                    max_attempts=retry_attempts,
                 ):
                     time.sleep(
                         _ucloud_unavailable_retry_delay(
@@ -1536,7 +1548,11 @@ class AsyncSandboxClient:
             "POST",
             "/v1/sandboxes",
             payload=payload,
-            timeout_seconds=request_timeout_seconds,
+            timeout_seconds=(
+                DEFAULT_CREATE_TIMEOUT_SECONDS
+                if request_timeout_seconds is None
+                else request_timeout_seconds
+            ),
         )
         record = response.get("sandbox")
         if not isinstance(record, dict):
@@ -1984,7 +2000,8 @@ class AsyncSandboxClient:
         timeout = _aiohttp_timeout(
             self.timeout_seconds if timeout_seconds is None else timeout_seconds
         )
-        for attempt in range(UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS):
+        retry_attempts = _ucloud_unavailable_retry_attempts(method, path)
+        for attempt in range(retry_attempts):
             async with client.request(
                 method,
                 self.base_url + path,
@@ -2005,6 +2022,7 @@ class AsyncSandboxClient:
                         attempt,
                         method=method,
                         path=path,
+                        max_attempts=retry_attempts,
                     ):
                         await asyncio.sleep(
                             _ucloud_unavailable_retry_delay(
@@ -2025,7 +2043,8 @@ class AsyncSandboxClient:
 
     async def _request_bytes(self, method: str, path: str) -> bytes:
         client = await self._client()
-        for attempt in range(UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS):
+        retry_attempts = _ucloud_unavailable_retry_attempts(method, path)
+        for attempt in range(retry_attempts):
             async with client.request(
                 method,
                 self.base_url + path,
@@ -2042,6 +2061,7 @@ class AsyncSandboxClient:
                         attempt,
                         method=method,
                         path=path,
+                        max_attempts=retry_attempts,
                     ):
                         await asyncio.sleep(
                             _ucloud_unavailable_retry_delay(
@@ -2494,8 +2514,9 @@ def _should_retry_ucloud_unavailable(
     *,
     method: str = "GET",
     path: str = "",
+    max_attempts: int = UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS,
 ) -> bool:
-    if attempt >= UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS - 1:
+    if attempt >= max_attempts - 1:
         return False
     normalized_method = method.upper()
     if (
@@ -2512,6 +2533,12 @@ def _should_retry_ucloud_unavailable(
         return False
     text = _ucloud_unavailable_error_text(body).lower()
     return "job is unavailable" in text and "ucloud" in text
+
+
+def _ucloud_unavailable_retry_attempts(method: str, path: str) -> int:
+    if method.upper() == "POST" and path == "/v1/sandboxes":
+        return UCLOUD_CREATE_RETRY_ATTEMPTS
+    return UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS
 
 
 def _ucloud_unavailable_error_text(body: object) -> str:
@@ -2543,7 +2570,12 @@ def _ucloud_unavailable_retry_delay(
         )
         if raw_retry_after is not None:
             try:
-                return max(0.0, min(60.0, float(raw_retry_after)))
+                retry_after = max(0.0, min(60.0, float(raw_retry_after)))
+                return min(
+                    60.0,
+                    retry_after
+                    * (1.0 + random.random() * UCLOUD_RETRY_AFTER_JITTER_RATIO),
+                )
             except (TypeError, ValueError):
                 pass
     delay = UCLOUD_UNAVAILABLE_RETRY_BASE_DELAY_SECONDS * (2**attempt)

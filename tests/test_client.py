@@ -536,9 +536,11 @@ class SandboxSdkTests(unittest.TestCase):
                 return b'{"sandbox":{"spec":{"id":"tmax-task-one"}}}'
 
         payloads: list[dict] = []
+        timeouts: list[object] = []
 
         def fake_urlopen(req: object, timeout: object = None) -> object:
             payloads.append(json.loads(getattr(req, "data", b"{}")))
+            timeouts.append(timeout)
             if len(payloads) == 1:
                 raise client_module.error.HTTPError(
                     str(getattr(req, "full_url", "")),
@@ -566,6 +568,50 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(sandbox.id, "tmax-task-one")
         self.assertEqual(len(payloads), 2)
         self.assertEqual(payloads[0], payloads[1])
+        self.assertEqual(
+            timeouts,
+            [client_module.DEFAULT_CREATE_TIMEOUT_SECONDS] * 2,
+        )
+
+    def test_sync_stable_create_retries_beyond_safe_read_budget(self) -> None:
+        class FakeResponse:
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"sandbox":{"spec":{"id":"long-cold-start"}}}'
+
+        calls = 0
+
+        def fake_urlopen(req: object, timeout: object = None) -> object:
+            nonlocal calls
+            calls += 1
+            if calls <= client_module.UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS:
+                raise client_module.error.HTTPError(
+                    str(getattr(req, "full_url", "")),
+                    503,
+                    "Service Unavailable",
+                    {"Retry-After": "0"},
+                    io.BytesIO(b'{"error":"gateway busy","retryable":true}'),
+                )
+            return FakeResponse()
+
+        client = SandboxClient("http://gateway.invalid")
+        with patch.object(client_module.request, "urlopen", fake_urlopen), patch.object(
+            client_module.time,
+            "sleep",
+            lambda _delay: None,
+        ):
+            sandbox = client.create_sandbox(
+                id="long-cold-start",
+                image=Image.from_registry("busybox:latest"),
+            )
+
+        self.assertEqual(sandbox.id, "long-cold-start")
+        self.assertEqual(calls, client_module.UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS + 1)
 
     def test_sync_client_does_not_retry_structured_capacity_for_exec(self) -> None:
         calls = 0
@@ -1007,6 +1053,56 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(sandbox_id, "tmax-task-async")
         self.assertEqual(len(payloads), 2)
         self.assertEqual(payloads[0], payloads[1])
+
+    def test_async_stable_create_retries_beyond_safe_read_budget(self) -> None:
+        class FakeResponse:
+            def __init__(self, status: int, body: str) -> None:
+                self.status = status
+                self.body = body
+                self.headers = {"Retry-After": "0"}
+
+            async def __aenter__(self) -> "FakeResponse":
+                return self
+
+            async def __aexit__(self, *args: object) -> None:
+                return None
+
+            async def text(self) -> str:
+                return self.body
+
+        class FakeSession:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def request(self, _method: object, _url: object, **_kwargs: object) -> FakeResponse:
+                self.calls += 1
+                if self.calls <= client_module.UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS:
+                    return FakeResponse(
+                        503,
+                        '{"error":"gateway busy","retryable":true}',
+                    )
+                return FakeResponse(
+                    201,
+                    '{"sandbox":{"spec":{"id":"long-cold-start-async"}}}',
+                )
+
+        async def no_sleep(_delay: float) -> None:
+            return None
+
+        async def scenario() -> tuple[str, int]:
+            session = FakeSession()
+            client = AsyncSandboxClient("http://gateway.invalid", session=session)
+            with patch.object(client_module.asyncio, "sleep", no_sleep):
+                sandbox = await client.create_sandbox(
+                    id="long-cold-start-async",
+                    image=Image.from_registry("busybox:latest"),
+                )
+            return sandbox.id, session.calls
+
+        sandbox_id, calls = asyncio.run(scenario())
+
+        self.assertEqual(sandbox_id, "long-cold-start-async")
+        self.assertEqual(calls, client_module.UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS + 1)
 
     def test_async_client_does_not_retry_structured_capacity_for_exec(self) -> None:
         class FakeResponse:

@@ -7,7 +7,12 @@ This project uses semantic versioning.
 - Retried structured retryable capacity responses for safe reads and stable-id
   sandbox creation, while leaving exec, fork, and relay side effects
   single-shot.
-- Honored the gateway's `Retry-After` response header for transient retries.
+- Honored the gateway's `Retry-After` response header for transient retries,
+  with jitter to avoid synchronized retry waves.
+- Extended stable-id sandbox-create retries to cover a five-minute cold-image
+  preparation window without extending the retry budget for ordinary reads.
+- Raised the default sandbox-create request timeout to ten minutes so admitted
+  cold-image creates do not fail at the generic 30-second client timeout.
 
 ## 0.4.0 - 2026-07-11
 
