@@ -2,7 +2,7 @@
 
 This project uses semantic versioning.
 
-## Unreleased
+## 0.4.2 - 2026-07-25
 
 - Treated `Retry-After` as the server's minimum delay for stable-id sandbox
   creates, combining it with exponential backoff and jitter to prevent retry
