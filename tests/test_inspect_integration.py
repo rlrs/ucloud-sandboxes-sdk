@@ -252,6 +252,49 @@ class InspectIntegrationTests(unittest.TestCase):
         self.assertTrue(all(timeout is not None for timeout in client.timeouts))
         self.assertTrue(all(0 < timeout <= 5 for timeout in client.timeouts if timeout is not None))
 
+    def test_create_sandbox_outer_retry_honors_retry_after(self) -> None:
+        from ucloud_sandboxes_sdk.integrations import inspect as inspect_integration
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.attempts = 0
+
+            async def create_sandbox(self, payload, *, request_timeout_seconds=None):
+                del request_timeout_seconds
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise SandboxApiError(
+                        "busy",
+                        status_code=503,
+                        body={
+                            "error": "no ready node has resources",
+                            "pending_resources": {"vcpu": 1.0},
+                            "retryable": True,
+                        },
+                        headers={"Retry-After": "3"},
+                    )
+                return {"created": payload.id}
+
+        sleeps: list[float] = []
+
+        async def capture_sleep(delay: float) -> None:
+            sleeps.append(delay)
+
+        client = FakeClient()
+        settings = _settings(inspect_integration)
+        with patch.object(inspect_integration.asyncio, "sleep", capture_sleep):
+            result = asyncio.run(
+                inspect_integration._create_sandbox_with_wait(
+                    client,
+                    _sandbox_spec(),
+                    settings=settings,
+                )
+            )
+
+        self.assertEqual(result, {"created": "sandbox-one"})
+        self.assertEqual(client.attempts, 2)
+        self.assertEqual(sleeps, [3])
+
     def test_create_sandbox_does_not_retry_non_scale_up_errors(self) -> None:
         from ucloud_sandboxes_sdk.integrations import inspect as inspect_integration
 

@@ -2,6 +2,15 @@
 
 This project uses semantic versioning.
 
+## Unreleased
+
+- Treated `Retry-After` as the server's minimum delay for stable-id sandbox
+  creates, combining it with exponential backoff and jitter to prevent retry
+  storms while retaining an approximately five-minute cold-start window.
+- Parsed both delta-seconds and HTTP-date `Retry-After` values, exposed the
+  delay on `SandboxApiError`, and honored it in the Inspect integration's outer
+  scale-up retry loop.
+
 ## 0.4.1 - 2026-07-11
 
 - Retried structured retryable capacity responses for safe reads and stable-id

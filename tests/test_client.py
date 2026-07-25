@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 import io
 import json
 from http import HTTPStatus
@@ -523,6 +525,46 @@ class SandboxSdkTests(unittest.TestCase):
 
         self.assertEqual(sandboxes, [])
         self.assertEqual(calls, 2)
+
+    def test_retry_after_delta_seconds_is_a_minimum_with_jitter(self) -> None:
+        with patch.object(client_module.random, "random", return_value=0.5):
+            delay = client_module._ucloud_unavailable_retry_delay(
+                0,
+                {"Retry-After": "2"},
+            )
+
+        self.assertEqual(delay, 2.25)
+
+    def test_stable_create_adds_exponential_backoff_above_retry_after(self) -> None:
+        with patch.object(client_module.random, "random", return_value=0):
+            delay = client_module._ucloud_unavailable_retry_delay(
+                6,
+                {"Retry-After": "2"},
+                method="POST",
+                path="/v1/sandboxes",
+            )
+
+        self.assertEqual(delay, 16)
+
+    def test_retry_after_http_date_is_supported(self) -> None:
+        retry_at = datetime.now(timezone.utc) + timedelta(seconds=30)
+        header = format_datetime(retry_at, usegmt=True)
+
+        delay = client_module._retry_after_seconds({"Retry-After": header})
+
+        self.assertIsNotNone(delay)
+        self.assertGreater(delay or 0, 28)
+        self.assertLessEqual(delay or 0, 30)
+
+    def test_api_error_exposes_retry_after_seconds(self) -> None:
+        exc = SandboxApiError(
+            "busy",
+            status_code=503,
+            body={"retryable": True},
+            headers={"Retry-After": "7"},
+        )
+
+        self.assertEqual(exc.retry_after_seconds, 7)
 
     def test_sync_client_retries_structured_capacity_for_stable_create(self) -> None:
         class FakeResponse:

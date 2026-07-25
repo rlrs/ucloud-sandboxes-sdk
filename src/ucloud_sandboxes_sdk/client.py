@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import base64
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import io
 import json
 from pathlib import Path
@@ -19,9 +21,10 @@ TERMINAL_EXEC_STATUSES = {"exited", "failed"}
 SANDBOX_TOKEN_HEADER = "X-UCloud-Sandbox-Token"
 UCLOUD_UNAVAILABLE_STATUS = 503
 UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS = 6
-UCLOUD_CREATE_RETRY_ATTEMPTS = 151
+UCLOUD_CREATE_RETRY_ATTEMPTS = 16
 UCLOUD_UNAVAILABLE_RETRY_BASE_DELAY_SECONDS = 0.25
 UCLOUD_UNAVAILABLE_RETRY_MAX_DELAY_SECONDS = 4.0
+UCLOUD_CREATE_RETRY_MAX_DELAY_SECONDS = 30.0
 UCLOUD_RETRY_AFTER_JITTER_RATIO = 0.25
 DEFAULT_CREATE_TIMEOUT_SECONDS = 10 * 60.0
 DEFAULT_FORK_TIMEOUT_SECONDS = 3600.0
@@ -35,10 +38,12 @@ class SandboxApiError(RuntimeError):
         *,
         status_code: int | None = None,
         body: object | None = None,
+        headers: Mapping[str, str] | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.body = body
+        self.headers = dict(headers or {})
 
     @property
     def retryable(self) -> bool | None:
@@ -47,6 +52,10 @@ class SandboxApiError(RuntimeError):
         ):
             return None
         return self.body["retryable"]
+
+    @property
+    def retry_after_seconds(self) -> float | None:
+        return _retry_after_seconds(self.headers)
 
     @property
     def intent_persisted(self) -> bool | None:
@@ -1146,6 +1155,8 @@ class SandboxClient:
                         _ucloud_unavailable_retry_delay(
                             attempt,
                             response_headers,
+                            method=method,
+                            path=path,
                         )
                     )
                     continue
@@ -1153,6 +1164,7 @@ class SandboxClient:
                     f"node-agent request failed ({exc.code}): {decoded}",
                     status_code=exc.code,
                     body=decoded,
+                    headers=dict(response_headers),
                 ) from exc
             except (OSError, json.JSONDecodeError) as exc:
                 raise SandboxApiError(f"node-agent request failed: {exc}") from exc
@@ -1189,6 +1201,8 @@ class SandboxClient:
                         _ucloud_unavailable_retry_delay(
                             attempt,
                             response_headers,
+                            method=method,
+                            path=path,
                         )
                     )
                     continue
@@ -1196,6 +1210,7 @@ class SandboxClient:
                     f"node-agent request failed ({exc.code}): {decoded}",
                     status_code=exc.code,
                     body=decoded,
+                    headers=dict(response_headers),
                 ) from exc
             except OSError as exc:
                 raise SandboxApiError(f"node-agent request failed: {exc}") from exc
@@ -2028,6 +2043,8 @@ class AsyncSandboxClient:
                             _ucloud_unavailable_retry_delay(
                                 attempt,
                                 getattr(response, "headers", {}),
+                                method=method,
+                                path=path,
                             )
                         )
                         continue
@@ -2035,6 +2052,7 @@ class AsyncSandboxClient:
                         f"node-agent request failed ({response.status}): {decoded}",
                         status_code=response.status,
                         body=decoded,
+                        headers=dict(getattr(response, "headers", {})),
                     )
             if not isinstance(decoded, dict):
                 raise SandboxApiError("node-agent returned a non-object JSON payload", body=decoded)
@@ -2067,6 +2085,8 @@ class AsyncSandboxClient:
                             _ucloud_unavailable_retry_delay(
                                 attempt,
                                 getattr(response, "headers", {}),
+                                method=method,
+                                path=path,
                             )
                         )
                         continue
@@ -2074,6 +2094,7 @@ class AsyncSandboxClient:
                         f"node-agent request failed ({response.status}): {decoded}",
                         status_code=response.status,
                         body=decoded,
+                        headers=dict(getattr(response, "headers", {})),
                     )
                 return raw
         raise AssertionError("unreachable UCloud unavailable retry state")
@@ -2557,29 +2578,55 @@ def _ucloud_unavailable_error_text(body: object) -> str:
 def _ucloud_unavailable_retry_delay(
     attempt: int,
     headers: object | None = None,
+    *,
+    method: str = "GET",
+    path: str = "",
 ) -> float:
-    items = getattr(headers, "items", None)
-    if callable(items):
-        raw_retry_after = next(
-            (
-                value
-                for key, value in items()
-                if str(key).lower() == "retry-after"
-            ),
-            None,
+    max_delay = (
+        UCLOUD_CREATE_RETRY_MAX_DELAY_SECONDS
+        if method.upper() == "POST" and path == "/v1/sandboxes"
+        else UCLOUD_UNAVAILABLE_RETRY_MAX_DELAY_SECONDS
+    )
+    client_backoff = min(
+        max_delay,
+        UCLOUD_UNAVAILABLE_RETRY_BASE_DELAY_SECONDS * (2**attempt),
+    )
+    retry_after = _retry_after_seconds(headers)
+    if retry_after is not None:
+        return min(
+            60.0,
+            max(retry_after, client_backoff)
+            * (1.0 + random.random() * UCLOUD_RETRY_AFTER_JITTER_RATIO),
         )
-        if raw_retry_after is not None:
-            try:
-                retry_after = max(0.0, min(60.0, float(raw_retry_after)))
-                return min(
-                    60.0,
-                    retry_after
-                    * (1.0 + random.random() * UCLOUD_RETRY_AFTER_JITTER_RATIO),
-                )
-            except (TypeError, ValueError):
-                pass
-    delay = UCLOUD_UNAVAILABLE_RETRY_BASE_DELAY_SECONDS * (2**attempt)
-    return min(UCLOUD_UNAVAILABLE_RETRY_MAX_DELAY_SECONDS, delay)
+    return client_backoff
+
+
+def _retry_after_seconds(headers: object | None) -> float | None:
+    items = getattr(headers, "items", None)
+    if not callable(items):
+        return None
+    raw = next(
+        (
+            value
+            for key, value in items()
+            if str(key).lower() == "retry-after"
+        ),
+        None,
+    )
+    if raw is None:
+        return None
+    try:
+        return max(0.0, min(60.0, float(raw)))
+    except (TypeError, ValueError):
+        pass
+    try:
+        retry_at = parsedate_to_datetime(str(raw))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    return max(0.0, min(60.0, (retry_at - now).total_seconds()))
 
 
 def _exec_result(

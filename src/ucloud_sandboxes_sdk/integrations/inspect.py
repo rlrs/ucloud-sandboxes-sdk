@@ -1156,7 +1156,12 @@ async def _retry_scale_up(
                     f"Timed out waiting for UCloud {label} readiness "
                     f"after {timeout_seconds}s and {attempts} attempt(s): {exc}"
                 ) from exc
-            await asyncio.sleep(min(retry_interval_seconds, remaining))
+            retry_after = exc.retry_after_seconds
+            delay = max(
+                retry_interval_seconds,
+                retry_after if retry_after is not None else 0.0,
+            )
+            await asyncio.sleep(min(delay, remaining))
         except ClientError as exc:
             if not retry_client_errors:
                 raise
