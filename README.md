@@ -54,6 +54,7 @@ sandbox = client.create_sandbox(
     memory_mb=2048,
     disk_mb=10240,
     ttl_seconds=600,
+    parkable=True,
 )
 try:
     result = sandbox.exec(
@@ -69,6 +70,11 @@ finally:
 `exec()` returns stdout, stderr, exit status, and the ordered event stream. For
 long-lived or interactive commands, call `start_exec()`, then use the returned
 exec handle to write stdin, read events, close stdin, or wait for completion.
+When `parkable=True`, a direct-runtime node may checkpoint an idle sandbox and
+release its live runsc backend. Exec and file operations transparently wake it;
+its filesystem and process state remain intact. Parking is opt-in because its
+disk admission includes the complete memory backing required by the sandbox's
+hard limit.
 
 ## Live Forking
 

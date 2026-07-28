@@ -2,6 +2,13 @@
 
 This project uses semantic versioning.
 
+## 0.4.3 - 2026-07-28
+
+- Added `SandboxSpec.parkable` and the `parkable=True` create option so clients
+  can opt into direct-runtime idle parking and transparent wake-on-tool-call.
+- Kept the field absent from ordinary create payloads for compatibility with
+  gateways that predate direct-runtime parking.
+
 ## 0.4.2 - 2026-07-25
 
 - Treated `Retry-After` as the server's minimum delay for stable-id sandbox

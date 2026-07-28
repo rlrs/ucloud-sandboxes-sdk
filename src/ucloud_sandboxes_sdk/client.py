@@ -229,6 +229,7 @@ class SandboxSpec:
     filesystem: SandboxFilesystemSpec | Mapping[str, Any] | None = SandboxFilesystemSpec()
     labels: Mapping[str, str] = field(default_factory=dict)
     forkable: bool = False
+    parkable: bool = False
     fork_protocol: SandboxForkProtocolSpec | Mapping[str, Any] | None = None
 
     def to_dict(self) -> JsonObject:
@@ -250,6 +251,8 @@ class SandboxSpec:
         }
         if self.forkable:
             payload["forkable"] = True
+        if self.parkable:
+            payload["parkable"] = True
         if self.fork_protocol is not None:
             payload["fork_protocol"] = _nested_payload(self.fork_protocol)
         return payload

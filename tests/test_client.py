@@ -175,6 +175,22 @@ class SandboxSdkTests(unittest.TestCase):
             },
         )
 
+    def test_sandbox_spec_sends_parkable_only_when_enabled(self) -> None:
+        ordinary = SandboxSpec(
+            id="ordinary",
+            image=Image.from_registry("busybox"),
+        ).to_dict()
+        parkable = SandboxSpec(
+            id="parkable",
+            image=Image.from_registry("busybox"),
+            memory_mb=128,
+            disk_mb=64,
+            parkable=True,
+        ).to_dict()
+
+        self.assertNotIn("parkable", ordinary)
+        self.assertTrue(parkable["parkable"])
+
     def test_sync_client_forks_single_and_batch_from_handle(self) -> None:
         protocol = SandboxForkProtocolSpec(
             prepare_command=("fork-agent", "prepare"),
