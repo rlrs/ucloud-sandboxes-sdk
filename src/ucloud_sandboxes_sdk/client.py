@@ -625,6 +625,7 @@ class SandboxClient:
         disk_mb: int | None = None,
         resources: Mapping[str, Any] | None = None,
         image: Image | None = None,
+        parkable: bool = False,
         ttl_seconds: int = 900,
         prepare_id: str | None = None,
     ) -> JsonObject:
@@ -638,6 +639,7 @@ class SandboxClient:
                 disk_mb=disk_mb,
                 resources=resources,
                 image=image,
+                parkable=parkable,
                 ttl_seconds=ttl_seconds,
                 prepare_id=prepare_id,
             ),
@@ -1497,6 +1499,7 @@ class AsyncSandboxClient:
         disk_mb: int | None = None,
         resources: Mapping[str, Any] | None = None,
         image: Image | None = None,
+        parkable: bool = False,
         ttl_seconds: int = 900,
         prepare_id: str | None = None,
     ) -> JsonObject:
@@ -1510,6 +1513,7 @@ class AsyncSandboxClient:
                 disk_mb=disk_mb,
                 resources=resources,
                 image=image,
+                parkable=parkable,
                 ttl_seconds=ttl_seconds,
                 prepare_id=prepare_id,
             ),
@@ -2121,6 +2125,9 @@ def _sandbox_payload(
         raise TypeError("sandbox image is required and must be an Image")
     if payload.get("fork_protocol") is not None:
         payload["fork_protocol"] = _nested_payload(payload["fork_protocol"])
+    for nested_field in ("security", "filesystem", "ssh"):
+        if payload.get(nested_field) is not None:
+            payload[nested_field] = _nested_payload(payload[nested_field])
     if bool(payload.get("forkable")) and not payload.get("fork_protocol"):
         raise ValueError("forkable sandboxes require fork_protocol")
     if payload.get("fork_protocol") and not bool(payload.get("forkable")):
@@ -2429,6 +2436,7 @@ def _prepare_capacity_payload(
     disk_mb: int | None,
     resources: Mapping[str, Any] | None,
     image: Image | None,
+    parkable: bool,
     ttl_seconds: int,
     prepare_id: str | None,
 ) -> JsonObject:
@@ -2448,6 +2456,8 @@ def _prepare_capacity_payload(
         payload["disk_mb"] = disk_mb
     if image is not None:
         payload["image"] = _image_pull_reference(image)
+    if parkable:
+        payload["parkable"] = True
     return payload
 
 

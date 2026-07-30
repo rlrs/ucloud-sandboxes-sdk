@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 from dataclasses import dataclass
 import json
+import time
 from typing import Any, Mapping
 from urllib import error, parse, request
 from urllib.parse import quote
@@ -67,10 +69,15 @@ class HttpTunnelConfig:
     relay_url: str
     tunnel_id: str
     relay_token: str | None = None
+    registration_token: str | None = None
 
     @property
     def base_url(self) -> str:
-        return http_tunnel_url(self.relay_url, self.tunnel_id)
+        return http_tunnel_url(
+            self.relay_url,
+            self.tunnel_id,
+            registration_token=self.registration_token,
+        )
 
     def headers(self) -> dict[str, str]:
         if self.relay_token is None:
@@ -78,9 +85,20 @@ class HttpTunnelConfig:
         return {"X-UCloud-Relay-Token": self.relay_token}
 
 
-def http_tunnel_url(relay_url: str, tunnel_id: str, path: str = "/") -> str:
+def http_tunnel_url(
+    relay_url: str,
+    tunnel_id: str,
+    path: str = "/",
+    *,
+    registration_token: str | None = None,
+) -> str:
     suffix = "/" + path.lstrip("/")
-    return f"{relay_url.rstrip('/')}/tunnels/{quote(tunnel_id, safe='')}{suffix}"
+    base = f"{relay_url.rstrip('/')}/tunnels/{quote(tunnel_id, safe='')}"
+    if registration_token is not None:
+        if not registration_token:
+            raise ValueError("registration_token cannot be empty")
+        base += f"/_relay/{quote(registration_token, safe='')}"
+    return base + suffix
 
 
 @dataclass(frozen=True)
@@ -100,6 +118,8 @@ class RelayRequest:
     lease_expires_at: float | None = None
     leased_by: str | None = None
     delivery_count: int = 0
+    sandbox_id: str | None = None
+    sandbox_generation: int | None = None
 
     @property
     def tunnel_id(self) -> str:
@@ -130,6 +150,16 @@ class RelayRequest:
                 else None
             ),
             delivery_count=_int(payload.get("delivery_count"), default=0),
+            sandbox_id=(
+                str(payload["sandbox_id"])
+                if payload.get("sandbox_id") is not None
+                else None
+            ),
+            sandbox_generation=(
+                _int(payload.get("sandbox_generation"), default=0)
+                if payload.get("sandbox_generation") is not None
+                else None
+            ),
         )
 
 
@@ -230,6 +260,25 @@ class RelayWorkerClient:
         response = self._request_json("POST", "/v1/tunnels/register", payload=payload)
         self._remember_registration(tunnel_id, response)
         return response
+
+    def register_sandbox_tunnel(
+        self,
+        tunnel_id: str,
+        *,
+        sandbox_id: str,
+        sandbox_generation: int,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> JsonObject:
+        if sandbox_generation < 1:
+            raise ValueError("sandbox_generation must be positive")
+        binding = dict(metadata or {})
+        binding.update(
+            {
+                "sandbox_id": sandbox_id,
+                "sandbox_generation": sandbox_generation,
+            }
+        )
+        return self.register_tunnel(tunnel_id, metadata=binding)
 
     def unregister_rollout(
         self,
@@ -428,6 +477,33 @@ class RelayWorkerClient:
             registration_token=relay_request.registration_token,
         )
 
+    def commit_response_bytes_to(
+        self,
+        relay_request: RelayRequest,
+        body: bytes,
+        *,
+        status: int = 200,
+        headers: Mapping[str, str] | None = None,
+        attempts: int = 60,
+        retry_delay_seconds: float = 1.0,
+    ) -> JsonObject:
+        """Retry the idempotent commit while a committed result awaits wake."""
+
+        attempts = max(1, attempts)
+        for attempt in range(attempts):
+            try:
+                return self.respond_bytes_to(
+                    relay_request,
+                    body,
+                    status=status,
+                    headers=headers,
+                )
+            except RelayApiError as exc:
+                if exc.status_code != 503 or attempt + 1 >= attempts:
+                    raise
+                time.sleep(max(0.0, retry_delay_seconds))
+        raise AssertionError("unreachable")
+
     def forward_to(
         self,
         relay_request: RelayRequest,
@@ -449,7 +525,7 @@ class RelayWorkerClient:
         except error.HTTPError as exc:
             upstream = exc
         except OSError as exc:
-            return self.respond_bytes_to(
+            return self.commit_response_bytes_to(
                 relay_request,
                 json.dumps({"error": f"upstream request failed: {exc}"}).encode(
                     "utf-8"
@@ -463,7 +539,7 @@ class RelayWorkerClient:
             headers = _safe_http_headers(dict(upstream.headers))
         finally:
             upstream.close()
-        return self.respond_bytes_to(
+        return self.commit_response_bytes_to(
             relay_request,
             body,
             status=status,
@@ -675,6 +751,25 @@ class AsyncRelayWorkerClient:
         self._remember_registration(tunnel_id, response)
         return response
 
+    async def register_sandbox_tunnel(
+        self,
+        tunnel_id: str,
+        *,
+        sandbox_id: str,
+        sandbox_generation: int,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> JsonObject:
+        if sandbox_generation < 1:
+            raise ValueError("sandbox_generation must be positive")
+        binding = dict(metadata or {})
+        binding.update(
+            {
+                "sandbox_id": sandbox_id,
+                "sandbox_generation": sandbox_generation,
+            }
+        )
+        return await self.register_tunnel(tunnel_id, metadata=binding)
+
     async def unregister_rollout(
         self,
         rollout_id: str,
@@ -874,6 +969,33 @@ class AsyncRelayWorkerClient:
             registration_token=relay_request.registration_token,
         )
 
+    async def commit_response_bytes_to(
+        self,
+        relay_request: RelayRequest,
+        body: bytes,
+        *,
+        status: int = 200,
+        headers: Mapping[str, str] | None = None,
+        attempts: int = 60,
+        retry_delay_seconds: float = 1.0,
+    ) -> JsonObject:
+        """Retry the idempotent commit while a committed result awaits wake."""
+
+        attempts = max(1, attempts)
+        for attempt in range(attempts):
+            try:
+                return await self.respond_bytes_to(
+                    relay_request,
+                    body,
+                    status=status,
+                    headers=headers,
+                )
+            except RelayApiError as exc:
+                if exc.status_code != 503 or attempt + 1 >= attempts:
+                    raise
+                await asyncio.sleep(max(0.0, retry_delay_seconds))
+        raise AssertionError("unreachable")
+
     async def forward_to(
         self,
         relay_request: RelayRequest,
@@ -898,7 +1020,7 @@ class AsyncRelayWorkerClient:
                 status = upstream.status
                 headers = _safe_http_headers(dict(upstream.headers))
         except Exception as exc:
-            return await self.respond_bytes_to(
+            return await self.commit_response_bytes_to(
                 relay_request,
                 json.dumps({"error": f"upstream request failed: {exc}"}).encode(
                     "utf-8"
@@ -906,7 +1028,7 @@ class AsyncRelayWorkerClient:
                 status=502,
                 headers={"Content-Type": "application/json"},
             )
-        return await self.respond_bytes_to(
+        return await self.commit_response_bytes_to(
             relay_request,
             body,
             status=status,

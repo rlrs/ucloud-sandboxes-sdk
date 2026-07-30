@@ -67,8 +67,49 @@ class ModelRelayConfigTests(unittest.TestCase):
         )
         self.assertEqual(config.headers(), {"X-UCloud-Relay-Token": "sandbox-token"})
 
+    def test_builds_registration_scoped_tunnel_capability_url(self) -> None:
+        config = HttpTunnelConfig(
+            "https://relay.example.org/",
+            "run:001",
+            registration_token=REGISTRATION_TOKEN,
+        )
+
+        expected = (
+            "https://relay.example.org/tunnels/run%3A001/_relay/"
+            f"{REGISTRATION_TOKEN}/"
+        )
+        self.assertEqual(config.base_url, expected)
+        self.assertEqual(
+            http_tunnel_url(
+                config.relay_url,
+                config.tunnel_id,
+                registration_token=REGISTRATION_TOKEN,
+            ),
+            expected,
+        )
+        self.assertEqual(config.headers(), {})
+
 
 class RelayWorkerClientTests(unittest.TestCase):
+    def test_sync_worker_registers_generation_bound_sandbox_tunnel(self) -> None:
+        with running_relay() as relay:
+            client = RelayWorkerClient(relay.base_url, worker_token="worker-token")
+            response = client.register_sandbox_tunnel(
+                "sandbox-tunnel",
+                sandbox_id="sandbox-7",
+                sandbox_generation=3,
+                metadata={"suite": "verifiers"},
+            )
+
+        self.assertEqual(
+            response["rollout"]["metadata"],
+            {
+                "suite": "verifiers",
+                "sandbox_id": "sandbox-7",
+                "sandbox_generation": 3,
+            },
+        )
+
     def test_sync_worker_client_supports_full_lease_lifecycle(self) -> None:
         with running_relay() as relay:
             client = RelayWorkerClient(relay.base_url, worker_token="worker-token")
@@ -166,6 +207,23 @@ class RelayWorkerClientTests(unittest.TestCase):
             b"\xffresponse",
         )
 
+    def test_sync_response_commit_retries_wake_pending_503(self) -> None:
+        with running_relay() as relay:
+            relay.state.respond_failures = 1
+            client = RelayWorkerClient(relay.base_url, worker_token="worker-token")
+            relay_request = RelayRequest.from_payload(
+                _relay_request(rollout_id="retry", leased_by="worker")
+            )
+            result = client.commit_response_bytes_to(
+                relay_request,
+                b"committed",
+                attempts=2,
+                retry_delay_seconds=0,
+            )
+
+        self.assertEqual(result["request_id"], "req-1")
+        self.assertEqual(relay.state.respond_attempts, 2)
+
     def test_sync_worker_client_surfaces_auth_errors(self) -> None:
         with running_relay() as relay:
             client = RelayWorkerClient(relay.base_url)
@@ -212,6 +270,48 @@ class RelayWorkerClientTests(unittest.TestCase):
         self.assertEqual(responded_id, "req-1")
         self.assertEqual(relay.state.last_renew_payload["lease_seconds"], 1200)
 
+    def test_async_worker_registers_generation_bound_sandbox_tunnel(self) -> None:
+        async def scenario(base_url: str) -> dict:
+            async with AsyncRelayWorkerClient(
+                base_url,
+                worker_token="worker-token",
+            ) as client:
+                return await client.register_sandbox_tunnel(
+                    "sandbox-tunnel-async",
+                    sandbox_id="sandbox-8",
+                    sandbox_generation=4,
+                )
+
+        with running_relay() as relay:
+            response = asyncio.run(scenario(relay.base_url))
+
+        self.assertEqual(
+            response["rollout"]["metadata"],
+            {"sandbox_id": "sandbox-8", "sandbox_generation": 4},
+        )
+
+    def test_async_response_commit_retries_wake_pending_503(self) -> None:
+        async def scenario(base_url: str) -> dict:
+            async with AsyncRelayWorkerClient(
+                base_url,
+                worker_token="worker-token",
+            ) as client:
+                return await client.commit_response_bytes_to(
+                    RelayRequest.from_payload(
+                        _relay_request(rollout_id="retry", leased_by="worker")
+                    ),
+                    b"committed",
+                    attempts=2,
+                    retry_delay_seconds=0,
+                )
+
+        with running_relay() as relay:
+            relay.state.respond_failures = 1
+            result = asyncio.run(scenario(relay.base_url))
+
+        self.assertEqual(result["request_id"], "req-1")
+        self.assertEqual(relay.state.respond_attempts, 2)
+
 
 @contextmanager
 def running_relay() -> Iterator["RelayHandle"]:
@@ -249,6 +349,8 @@ class FakeRelayState:
         self.upstream_method = ""
         self.upstream_path = ""
         self.upstream_body = b""
+        self.respond_failures = 0
+        self.respond_attempts = 0
 
 
 class FakeRelayHandler(BaseHTTPRequestHandler):
@@ -353,6 +455,14 @@ class FakeRelayHandler(BaseHTTPRequestHandler):
         if parsed.path == "/worker/respond":
             with self.state.lock:
                 self.state.last_respond_payload = dict(payload)
+                self.state.respond_attempts += 1
+                if self.state.respond_failures > 0:
+                    self.state.respond_failures -= 1
+                    self._write_json(
+                        {"error": "response committed but wake is pending"},
+                        status=HTTPStatus.SERVICE_UNAVAILABLE,
+                    )
+                    return
             self._write_json(
                 {
                     "ok": True,

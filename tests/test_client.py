@@ -23,9 +23,12 @@ from ucloud_sandboxes_sdk import (
     Image,
     SandboxApiError,
     SandboxClient,
+    SandboxFilesystemSpec,
     SandboxForkProtocolSpec,
     SandboxForkSpec,
+    SandboxSecuritySpec,
     SandboxSpec,
+    SandboxSshSpec,
     sandbox_auth_headers,
 )
 
@@ -142,6 +145,29 @@ class SandboxSdkTests(unittest.TestCase):
 
         self.assertEqual(sandbox.id, "spec-one")
         self.assertEqual(deleted["deleted"]["spec"]["image"], "busybox")
+
+    def test_keyword_create_serializes_typed_nested_specs(self) -> None:
+        with running_gateway() as gateway:
+            client = SandboxClient(gateway.base_url)
+            sandbox = client.create_sandbox(
+                id="typed-nested-specs",
+                image=Image.from_registry("busybox"),
+                security=SandboxSecuritySpec(user="0:0", cap_add=("NET_RAW",)),
+                filesystem=SandboxFilesystemSpec(
+                    enforce_disk_quota=True,
+                    tmpfs_mb=32,
+                ),
+                ssh=SandboxSshSpec(enabled=True, user="root"),
+            )
+            payload = dict(gateway.state.last_payload)
+            sandbox.delete()
+
+        self.assertEqual(payload["security"]["user"], "0:0")
+        self.assertEqual(payload["security"]["cap_add"], ["NET_RAW"])
+        self.assertTrue(payload["filesystem"]["enforce_disk_quota"])
+        self.assertEqual(payload["filesystem"]["tmpfs_mb"], 32)
+        self.assertTrue(payload["ssh"]["enabled"])
+        self.assertEqual(payload["ssh"]["user"], "root")
 
     def test_sandbox_spec_only_sends_fork_fields_when_enabled(self) -> None:
         ordinary = SandboxSpec(
@@ -724,6 +750,7 @@ class SandboxSdkTests(unittest.TestCase):
                 memory_mb=1024,
                 disk_mb=2048,
                 image=Image.from_registry("busybox:latest"),
+                parkable=True,
                 ttl_seconds=600,
             )
             listed = client.list_prepared_capacity()
@@ -731,6 +758,7 @@ class SandboxSdkTests(unittest.TestCase):
 
         self.assertEqual(prepared["prepare"]["prepare_id"], "sdk-prep")
         self.assertEqual(prepared["prepare"]["image"], "busybox:latest")
+        self.assertTrue(gateway.state.last_payload["parkable"])
         self.assertEqual(prepared["demand"]["prepared_resources"]["vcpu"], 3.0)
         self.assertEqual(listed["prepared"][0]["count"], 3)
         self.assertEqual(deleted["deleted"]["prepare_id"], "sdk-prep")
@@ -1241,6 +1269,7 @@ class FakeGatewayState:
         self.files: dict[tuple[str, str], bytes] = {}
         self.exec_counter = 0
         self.last_headers: dict[str, str] = {}
+        self.last_payload: dict[str, object] = {}
 
     def next_exec_id(self) -> str:
         with self.lock:
@@ -1365,6 +1394,7 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         payload = self._read_json()
+        self.state.last_payload = dict(payload)
         if path == "/v1/sandboxes":
             sandbox_id = str(payload.get("id") or "")
             record = {"spec": dict(payload), "state": "running"}

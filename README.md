@@ -293,15 +293,18 @@ client.prepare_capacity(
     memory_mb=2048,
     disk_mb=10240,
     image=Image.from_registry("ucloud-sandbox-registry:5000/ucloud/python-base:latest"),
+    parkable=True,
     ttl_seconds=900,
 )
 ```
 
 The signal contributes `count * resources` to gateway demand until the
-executing autoscaler reacts and consumes it. The TTL is a cleanup bound for
-missed cycles or a stopped autoscaler. If `image` is set, the gateway also tries
-to prewarm that image on already-ready sandbox nodes that can fit the requested
-resources. Cancel it early when a run is abandoned:
+future sandbox claims it. Set `parkable=True` when the matching sandboxes are
+parkable; the gateway expands writable `disk_mb` into the same hard checkpoint
+reservation used by sandbox admission. The TTL is a cleanup bound for abandoned
+runs. If `image` is set, the gateway also tries to prewarm that image on
+already-ready sandbox nodes that can fit the requested resources. Cancel it
+early when a run is abandoned:
 
 ```python
 client.delete_prepared_capacity("mbpp-run")

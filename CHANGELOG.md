@@ -2,6 +2,21 @@
 
 This project uses semantic versioning.
 
+## 0.4.5 - 2026-07-30
+
+- Fixed JSON serialization of typed nested security, filesystem, and SSH
+  specifications supplied as keyword arguments to synchronous and asynchronous
+  sandbox creation.
+- Added registration-scoped HTTP tunnel capability URLs to
+  `HttpTunnelConfig` and `http_tunnel_url`, allowing arbitrary in-sandbox
+  harnesses to authenticate without injecting a shared relay header.
+
+## 0.4.4 - 2026-07-28
+
+- Added `parkable=True` to capacity preparation so the gateway can reserve the
+  full checkpoint disk shape and the matching parkable sandbox can consume the
+  prepared unit.
+
 ## 0.4.3 - 2026-07-28
 
 - Added `SandboxSpec.parkable` and the `parkable=True` create option so clients
