@@ -292,7 +292,7 @@ client.prepare_capacity(
     cpus=1,
     memory_mb=2048,
     disk_mb=10240,
-    image=Image.from_registry("ucloud-sandbox-registry:5000/ucloud/python-base:latest"),
+    image=Image.from_gateway_id("python-base"),
     parkable=True,
     ttl_seconds=900,
 )
@@ -326,17 +326,15 @@ reserve a builder, upload a context, or transfer images to sandbox nodes.
 
 ## Images
 
-Build images through the gateway and use registry tags as the durable cache
-between build-capable machines and sandbox nodes. With a control-plane-managed
-registry, use the registry's private-network host in the tag and set
-`push=True`.
+Build images through the gateway using a stable image id. The gateway owns the
+private registry name, assigns the internal tag, pushes the build durably, and
+later resolves the id for sandbox nodes. Clients do not configure the managed
+registry hostname or port.
 
 ```python
 image = Image.from_dockerfile(
-    name="python-base",
-    tag="ucloud-sandbox-registry:5000/ucloud/python-base:latest",
+    image_id="python-base",
     context_path="./docker/python-base",
-    push=True,
 )
 client.build_image(
     image,
@@ -348,7 +346,7 @@ client.build_image(
 )
 
 sandbox = client.create_sandbox(
-    image=Image.from_name("python-base"),
+    image=Image.from_gateway_id("python-base"),
     command=["python", "--version"],
     cpus=1,
     memory_mb=2048,
@@ -367,37 +365,29 @@ or builder VM, pass `upload_context=False`:
 ```python
 client.build_image(
     Image.from_dockerfile(
-        name="preloaded-context",
-        tag="ucloud-sandbox-registry:5000/ucloud/preloaded-context:latest",
+        image_id="preloaded-context",
         context_path="/work/ucloud-sandboxes/build-contexts/preloaded-context",
-        push=True,
     ),
     upload_context=False,
     timeout_seconds=3000,
 )
 ```
 
-Use `push=True` with a registry tag for any image that sandbox nodes should run.
-The builder/control-plane Docker daemon and sandbox-node Docker daemons are
-different machines. The registry tag is the durable handoff.
+Managed builds are always pushed by the gateway because the builder and sandbox
+node Docker daemons are different machines. `tag` remains optional for explicit
+external or advanced registry workflows, but normal SDK and integration code
+should omit it.
+
 For large Docker builds, pass `timeout_seconds` to `build_image()` as the
 overall wait deadline and context-upload request timeout. Status polls use the
 client's normal request timeout and return build state, command, node metadata,
 error text, and a rolling log tail.
 
-After a pushed build, sandbox creation can use either the registry tag or the
-recorded image id:
+After a managed build, create sandboxes with the recorded image id:
 
 ```python
 client.create_sandbox(
-    image=Image.from_registry("ucloud-sandbox-registry:5000/ucloud/python-base:latest"),
-    cpus=1,
-    memory_mb=2048,
-    disk_mb=10240,
-)
-
-client.create_sandbox(
-    image=Image.from_name("python-base"),
+    image=Image.from_gateway_id("python-base"),
     cpus=1,
     memory_mb=2048,
     disk_mb=10240,
@@ -409,7 +399,7 @@ id:
 
 ```python
 client.pull_image(
-    Image.from_registry("ucloud-sandbox-registry:5000/ucloud/python-base:latest"),
+    Image.from_registry("registry.example.org/ucloud/python-base:latest"),
     image_id="python-base",
     count=4,
     cpus=1,
@@ -423,9 +413,8 @@ client.snapshot_sandbox(
 ```
 
 Snapshots should also target a registry tag if another node will need to run the
-image later. Images built or snapshotted without `push=True` are local to the
-builder/control-plane Docker daemon and are not available after a builder VM
-scales down.
+image later. Snapshots that are not pushed are local to their source node and
+are not portable after that node scales down.
 
 ## Async Client
 
@@ -468,7 +457,6 @@ export UCLOUD_SANDBOX_IMAGE="python:3.12-slim"
 export UCLOUD_SANDBOX_CPUS="1"
 export UCLOUD_SANDBOX_MEMORY_MB="2048"
 export UCLOUD_SANDBOX_DISK_MB="10240"
-export UCLOUD_SANDBOX_BUILD_IMAGE_PREFIX="ucloud-sandbox-registry:5000/ucloud-inspect"
 export UCLOUD_SANDBOX_START_TIMEOUT_SECONDS="1800"
 export UCLOUD_SANDBOX_BUILD_TIMEOUT_SECONDS="1800"
 export UCLOUD_SANDBOX_RETRY_INTERVAL_SECONDS="10"
@@ -486,14 +474,13 @@ file, or a Dockerfile. Compose `image`, `build.context`, `build.dockerfile`,
 `network_mode` are mapped into a sandbox spec. `UCLOUD_SANDBOX_NETWORK`
 overrides Compose networking when set. Dockerfile configs and single-service
 Compose builds call `build_image`; local build contexts are uploaded to the
-gateway. Generated build tags use `UCLOUD_SANDBOX_BUILD_IMAGE_PREFIX`, falling back to
-`UCLOUD_SANDBOX_REGISTRY_PREFIX`, then
-`ucloud-sandbox-registry:5000/ucloud-inspect`. Explicit Compose `image:` values
-are preserved. Generated build image ids and tags are deterministic over the
-Dockerfile, build context, build args, explicit tag, and SDK compatibility
-version. Reusing an unchanged context across samples or runs reuses a pushed
-gateway image record; if another client already has the same build running, the
-provider waits for that build instead of submitting another copy of the context.
+gateway. Generated build image ids are deterministic over the Dockerfile,
+build context, build args, explicit Compose image value, and SDK compatibility
+version. Registry coordinates are assigned by the gateway and never enter the
+Inspect request. Reusing an unchanged context across samples or runs reuses a
+pushed gateway image record; if another client already has the same build
+running, the provider waits for that build instead of submitting another copy
+of the context.
 For Dockerfile and Compose builds, the provider adds empty
 writable Harbor harness directories (`/tests`, `/logs/agent`, `/logs/verifier`,
 `/task`, and `/oracle`) in the built image without copying test files into the

@@ -261,23 +261,25 @@ class SandboxSpec:
 @dataclass(frozen=True)
 class _ImageBuildSpec:
     id: str
-    tag: str
     context_path: str
+    tag: str | None = None
     dockerfile: str = "Dockerfile"
     push: bool = False
     build_args: Mapping[str, str] = field(default_factory=dict)
     labels: Mapping[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> JsonObject:
-        return {
+        payload: JsonObject = {
             "id": self.id,
-            "tag": self.tag,
             "context_path": self.context_path,
             "dockerfile": self.dockerfile,
             "push": self.push,
             "build_args": dict(self.build_args),
             "labels": dict(self.labels),
         }
+        if self.tag is not None:
+            payload["tag"] = self.tag
+        return payload
 
 
 @dataclass(frozen=True)
@@ -302,23 +304,31 @@ class Image:
         return cls.from_name(image_id)
 
     @classmethod
+    def from_gateway_id(cls, image_id: str) -> "Image":
+        return cls.from_name(image_id)
+
+    @classmethod
     def from_dockerfile(
         cls,
         *,
-        name: str,
-        tag: str,
+        name: str | None = None,
+        image_id: str | None = None,
+        tag: str | None = None,
         context_path: str | Path,
         dockerfile: str = "Dockerfile",
         push: bool = True,
         build_args: Mapping[str, str] | None = None,
         labels: Mapping[str, str] | None = None,
     ) -> "Image":
-        name = _non_empty_string("name", name)
-        tag = _non_empty_string("tag", tag)
+        if name is not None and image_id is not None and name != image_id:
+            raise ValueError("name and image_id must match when both are supplied")
+        name = _non_empty_string("image_id", image_id if image_id is not None else name)
+        if tag is not None:
+            tag = _non_empty_string("tag", tag)
         build_spec = _ImageBuildSpec(
             id=name,
-            tag=tag,
             context_path=str(context_path),
+            tag=tag,
             dockerfile=dockerfile,
             push=push,
             build_args=dict(build_args or {}),

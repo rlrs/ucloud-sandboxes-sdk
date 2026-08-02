@@ -54,7 +54,6 @@ DEFAULT_START_TIMEOUT_SECONDS = 1800
 DEFAULT_BUILD_TIMEOUT_SECONDS = 1800
 DEFAULT_RETRY_INTERVAL_SECONDS = 10.0
 DEFAULT_SCALE_UP_REQUEST_TIMEOUT_SECONDS = 30.0
-DEFAULT_BUILD_IMAGE_PREFIX = "ucloud-sandbox-registry:5000/ucloud-inspect"
 BUILD_CACHE_VERSION = "ucloud-inspect-build-v1"
 HARBOR_HARNESS_DIRS = ("/tests", "/logs/agent", "/logs/verifier", "/task", "/oracle")
 INSPECT_CREATED_BY = "inspect-ai"
@@ -398,7 +397,6 @@ async def _sandbox_launch_plan(
         )
         image = Image.from_dockerfile(
             name=image_id,
-            tag=_generated_build_image_tag(image_id),
             context_path=context_path,
             dockerfile=dockerfile,
             push=True,
@@ -509,7 +507,6 @@ def _compose_build_image(
     )
     return Image.from_dockerfile(
         name=image_id,
-        tag=str(raw_image) if raw_image else _generated_build_image_tag(image_id),
         context_path=context_path,
         dockerfile=dockerfile,
         push=True,
@@ -620,15 +617,6 @@ def _hash_text(digest: Any, *parts: str) -> None:
     for part in parts:
         digest.update(part.encode("utf-8", "surrogateescape"))
         digest.update(b"\0")
-
-
-def _generated_build_image_tag(image_id: str) -> str:
-    prefix = (
-        os.environ.get("UCLOUD_SANDBOX_BUILD_IMAGE_PREFIX")
-        or os.environ.get("UCLOUD_SANDBOX_REGISTRY_PREFIX")
-        or DEFAULT_BUILD_IMAGE_PREFIX
-    )
-    return f"{prefix.rstrip('/')}/{_docker_repository_component(image_id)}:latest"
 
 
 def _docker_repository_component(value: str) -> str:
@@ -907,7 +895,9 @@ async def _available_built_image(
     for record in images:
         if not isinstance(record, dict):
             continue
-        if record.get("id") != spec.id or record.get("tag") != spec.tag:
+        if record.get("id") != spec.id:
+            continue
+        if spec.tag is not None and record.get("tag") != spec.tag:
             continue
         if _image_record_available_to_sandboxes(record):
             return dict(record)
@@ -931,7 +921,7 @@ async def _active_image_build(
         for record in builds
         if isinstance(record, dict)
         and record.get("image_id") == spec.id
-        and record.get("tag") == spec.tag
+        and (spec.tag is None or record.get("tag") == spec.tag)
         and not _image_build_terminal(record)
     ]
     if not matches:

@@ -788,7 +788,7 @@ class InspectIntegrationTests(unittest.TestCase):
         build = client.images[0].to_build_spec()
         self.assertLessEqual(len(build.id), 64)
         self.assertEqual(build.id, expected_id)
-        self.assertEqual(build.tag, inspect_integration._generated_build_image_tag(expected_id))
+        self.assertIsNone(build.tag)
         self.assertNotEqual(build.context_path, str(context.resolve()))
         self.assertEqual(build.dockerfile, "Dockerfile")
         self.assertEqual(launch.image.name, client.images[0].name)
@@ -829,9 +829,8 @@ class InspectIntegrationTests(unittest.TestCase):
         first = clients[0].images[0].to_build_spec()
         second = clients[1].images[0].to_build_spec()
         self.assertEqual(first.id, second.id)
-        self.assertEqual(first.tag, second.tag)
-        self.assertNotIn("inspect-task-a", first.tag)
-        self.assertNotIn("inspect-task-b", first.tag)
+        self.assertIsNone(first.tag)
+        self.assertIsNone(second.tag)
 
     def test_compose_yaml_build_context_is_resolved_from_compose_dir(self) -> None:
         from ucloud_sandboxes_sdk.integrations import inspect as inspect_integration
@@ -883,7 +882,7 @@ class InspectIntegrationTests(unittest.TestCase):
         build = client.images[0].to_build_spec()
         self.assertNotEqual(build.context_path, str(context.resolve()))
         self.assertEqual(build.dockerfile, "Dockerfile.custom")
-        self.assertEqual(build.tag, "ucloud-sandbox-registry:5000/test/image:latest")
+        self.assertIsNone(build.tag)
         self.assertEqual(
             build.id,
             expected_id,
@@ -894,7 +893,7 @@ class InspectIntegrationTests(unittest.TestCase):
         self.assertEqual(launch.cpus, 4.0)
         self.assertEqual(launch.memory_mb, 2048)
 
-    def test_generated_build_tag_uses_configured_private_registry_prefix(self) -> None:
+    def test_registry_prefix_environment_does_not_leak_into_build_request(self) -> None:
         from inspect_ai.util import ComposeBuild, ComposeConfig, ComposeService
         from ucloud_sandboxes_sdk.integrations import inspect as inspect_integration
 
@@ -923,17 +922,8 @@ class InspectIntegrationTests(unittest.TestCase):
                         settings=_settings(inspect_integration),
                     )
                 )
-            expected_id = inspect_integration._build_image_id(
-                context_path=context.resolve(),
-                dockerfile="Dockerfile",
-                service_name="default",
-            )
-
         build = client.images[0].to_build_spec()
-        self.assertEqual(
-            build.tag,
-            f"registry.local:5000/Inspect/{expected_id}:latest",
-        )
+        self.assertIsNone(build.tag)
 
     def test_existing_pushed_generated_image_skips_build_submission(self) -> None:
         from inspect_ai.util import ComposeBuild, ComposeConfig, ComposeService
@@ -948,7 +938,7 @@ class InspectIntegrationTests(unittest.TestCase):
                 dockerfile="Dockerfile",
                 service_name="default",
             )
-            tag = inspect_integration._generated_build_image_tag(image_id)
+            tag = "sandbox-gateway-prod:5000/ucloud-managed/cached:latest"
             client = _CachedBuildClient(
                 [
                     {
@@ -992,7 +982,7 @@ class InspectIntegrationTests(unittest.TestCase):
                 dockerfile="Dockerfile",
                 service_name="default",
             )
-            tag = inspect_integration._generated_build_image_tag(image_id)
+            tag = "sandbox-gateway-prod:5000/ucloud-managed/active:latest"
             client = _CachedBuildClient(
                 [],
                 image_builds=[

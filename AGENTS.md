@@ -26,10 +26,11 @@ developer-facing examples.
   creation still uses the normal gateway placement path.
 - Prepared builder capacity is a separate expiring gateway demand signal for
   build-capable VMs. Future image builds still use `POST /v1/images/build`.
-- Treat registry tags as the durable builder-to-sandbox handoff. Builders push
-  tags, and sandbox nodes pull/cache tags before creating containers.
-- Do not treat image ids as transferred images. A pushed image id may resolve to
-  a recorded registry tag; an unpushed image id is builder-local only.
+- Managed builds submit stable image ids without registry coordinates. The
+  gateway owns the internal tag, forces the durable push, and resolves image ids
+  to worker-private digest references.
+- Keep explicit tags only for external or advanced registry workflows. SDK
+  integrations must not embed a deployment's private registry DNS name or port.
 
 ## Verification
 

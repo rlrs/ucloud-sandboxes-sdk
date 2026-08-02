@@ -34,6 +34,24 @@ from ucloud_sandboxes_sdk import (
 
 
 class SandboxSdkTests(unittest.TestCase):
+    def test_managed_build_payload_omits_registry_coordinates(self) -> None:
+        image = Image.from_dockerfile(
+            image_id="managed-image",
+            context_path="/tmp/context",
+        )
+
+        payload = client_module._image_build_payload(
+            image,
+            upload_context=False,
+        )
+
+        self.assertEqual(payload["id"], "managed-image")
+        self.assertNotIn("tag", payload)
+        self.assertEqual(
+            Image.from_gateway_id("managed-image").to_sandbox_image(),
+            "managed-image",
+        )
+
     def test_api_token_uses_public_link_safe_header(self) -> None:
         with running_gateway() as gateway:
             client = SandboxClient(gateway.base_url, api_token="secret-token")
@@ -95,8 +113,7 @@ class SandboxSdkTests(unittest.TestCase):
 
             built = client.build_image(
                 Image.from_dockerfile(
-                    name="python-base",
-                    tag="gateway-private-host:5000/python-base:latest",
+                    image_id="python-base",
                     context_path="/tmp/context",
                 )
             )
@@ -119,6 +136,7 @@ class SandboxSdkTests(unittest.TestCase):
             images = client.list_images()
 
         self.assertEqual(built["image"]["id"], "python-base")
+        self.assertEqual(built["image"]["tag"], "")
         self.assertTrue(built["image"]["received_push"])
         self.assertEqual(pulled["image"]["id"], "busybox")
         self.assertEqual(snapshot["image"]["id"], "snap-one")

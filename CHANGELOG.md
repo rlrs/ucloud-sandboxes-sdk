@@ -2,6 +2,13 @@
 
 This project uses semantic versioning.
 
+## 0.4.6 - 2026-08-02
+
+- Removed private registry host, port, and generated tag configuration from
+  managed SDK and Inspect build requests; the gateway now owns registry naming
+  and clients run completed builds by image id.
+- Kept optional explicit tags for external and advanced registry workflows.
+
 ## 0.4.5 - 2026-07-30
 
 - Fixed JSON serialization of typed nested security, filesystem, and SSH
