@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from .client import (
     AsyncExecHandle,
+    AsyncJobHandle,
     AsyncSandboxClient,
     AsyncSandboxHandle,
     Image,
+    JobHandle,
     SandboxApiError,
     SandboxClient,
     SandboxExecResult,
@@ -12,6 +14,8 @@ from .client import (
     SandboxForkProtocolSpec,
     SandboxForkSpec,
     SandboxHandle,
+    SandboxJobLogChunk,
+    SandboxJobRecord,
     SandboxSecuritySpec,
     SandboxSpec,
     SandboxSshSpec,
@@ -30,14 +34,16 @@ from .relay import (
     model_relay_env,
 )
 
-__version__ = "0.4.6"
+__version__ = "0.4.7"
 
 __all__ = [
     "AsyncExecHandle",
+    "AsyncJobHandle",
     "AsyncRelayWorkerClient",
     "AsyncSandboxClient",
     "AsyncSandboxHandle",
     "Image",
+    "JobHandle",
     "HttpTunnelConfig",
     "SandboxApiError",
     "SandboxClient",
@@ -46,6 +52,8 @@ __all__ = [
     "SandboxForkProtocolSpec",
     "SandboxForkSpec",
     "SandboxHandle",
+    "SandboxJobLogChunk",
+    "SandboxJobRecord",
     "SandboxSecuritySpec",
     "SandboxSpec",
     "SandboxSshSpec",

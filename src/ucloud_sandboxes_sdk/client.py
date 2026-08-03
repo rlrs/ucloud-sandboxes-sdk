@@ -9,15 +9,18 @@ import io
 import json
 from pathlib import Path
 import random
+import re
 import shlex
 import tarfile
 import time
 from typing import Any, AsyncIterator, Callable, Iterator, Mapping, Sequence
 from urllib import error, parse, request
+import uuid
 
 
 JsonObject = dict[str, Any]
 TERMINAL_EXEC_STATUSES = {"exited", "failed"}
+TERMINAL_JOB_STATES = {"exited", "signaled", "failed"}
 SANDBOX_TOKEN_HEADER = "X-UCloud-Sandbox-Token"
 UCLOUD_UNAVAILABLE_STATUS = 503
 UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS = 6
@@ -230,9 +233,14 @@ class SandboxSpec:
     labels: Mapping[str, str] = field(default_factory=dict)
     forkable: bool = False
     parkable: bool = False
+    managed_process: bool = False
     fork_protocol: SandboxForkProtocolSpec | Mapping[str, Any] | None = None
 
     def to_dict(self) -> JsonObject:
+        if self.managed_process and not self.parkable:
+            raise ValueError("managed_process requires parkable=True")
+        if self.managed_process and self.command:
+            raise ValueError("managed_process sandboxes are started with start_job()")
         payload: JsonObject = {
             "id": self.id,
             "image": _image_reference(self.image),
@@ -253,6 +261,8 @@ class SandboxSpec:
             payload["forkable"] = True
         if self.parkable:
             payload["parkable"] = True
+        if self.managed_process:
+            payload["managed_process"] = True
         if self.fork_protocol is not None:
             payload["fork_protocol"] = _nested_payload(self.fork_protocol)
         return payload
@@ -373,6 +383,108 @@ class SandboxExecResult:
         return self.exit_code == 0 and self.status == "exited"
 
 
+@dataclass(frozen=True)
+class SandboxJobRecord:
+    sandbox_id: str
+    sandbox_generation: int
+    job_id: str
+    spec_sha256: str
+    state: str
+    pid: int = 0
+    started_at: str = ""
+    completed_at: str = ""
+    exit_code: int | None = None
+    signal: int = 0
+    stdout_bytes: int = 0
+    stderr_bytes: int = 0
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
+    sequence: int = 0
+    updated_at: str = ""
+
+    @classmethod
+    def from_payload(cls, payload: object) -> "SandboxJobRecord":
+        if not isinstance(payload, dict):
+            raise SandboxApiError("gateway returned an invalid job payload", body=payload)
+        try:
+            record = cls(
+                sandbox_id=str(payload["sandbox_id"]),
+                sandbox_generation=int(payload["sandbox_generation"]),
+                job_id=str(payload["job_id"]),
+                spec_sha256=str(payload["spec_sha256"]),
+                state=str(payload["state"]),
+                pid=max(0, int(payload.get("pid") or 0)),
+                started_at=str(payload.get("started_at") or ""),
+                completed_at=str(payload.get("completed_at") or ""),
+                exit_code=(
+                    int(payload["exit_code"])
+                    if payload.get("exit_code") is not None
+                    else None
+                ),
+                signal=max(0, int(payload.get("signal") or 0)),
+                stdout_bytes=max(0, int(payload.get("stdout_bytes") or 0)),
+                stderr_bytes=max(0, int(payload.get("stderr_bytes") or 0)),
+                stdout_truncated=bool(payload.get("stdout_truncated", False)),
+                stderr_truncated=bool(payload.get("stderr_truncated", False)),
+                sequence=max(0, int(payload.get("sequence") or 0)),
+                updated_at=str(payload.get("updated_at") or ""),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SandboxApiError(
+                "gateway returned an invalid job payload",
+                body=payload,
+            ) from exc
+        if (
+            not record.sandbox_id
+            or record.sandbox_generation < 1
+            or not record.job_id
+            or record.state not in {"starting", "running", *TERMINAL_JOB_STATES}
+        ):
+            raise SandboxApiError("gateway returned an invalid job payload", body=payload)
+        return record
+
+    @property
+    def terminal(self) -> bool:
+        return self.state in TERMINAL_JOB_STATES
+
+    @property
+    def success(self) -> bool:
+        return self.state == "exited" and self.exit_code == 0
+
+
+@dataclass(frozen=True)
+class SandboxJobLogChunk:
+    stream: str
+    offset: int
+    next_offset: int
+    data: bytes
+    eof: bool
+
+    @classmethod
+    def from_payload(cls, payload: object) -> "SandboxJobLogChunk":
+        if not isinstance(payload, dict):
+            raise SandboxApiError("gateway returned an invalid job log payload", body=payload)
+        try:
+            stream = str(payload["stream"])
+            offset = int(payload["offset"])
+            next_offset = int(payload["next_offset"])
+            data = base64.b64decode(str(payload.get("data") or ""), validate=True)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SandboxApiError(
+                "gateway returned an invalid job log payload",
+                body=payload,
+            ) from exc
+        if stream not in {"stdout", "stderr"} or offset < 0 or next_offset != offset + len(data):
+            raise SandboxApiError("gateway returned an invalid job log payload", body=payload)
+        return cls(
+            stream=stream,
+            offset=offset,
+            next_offset=next_offset,
+            data=data,
+            eof=bool(payload.get("eof", False)),
+        )
+
+
 @dataclass
 class SandboxHandle:
     client: "SandboxClient"
@@ -406,6 +518,26 @@ class SandboxHandle:
             working_dir=working_dir,
             stdin=stdin,
             tty=tty,
+        )
+
+    def start_job(
+        self,
+        command: str | Sequence[str],
+        *,
+        job_id: str | None = None,
+        env: Mapping[str, str] | None = None,
+        working_dir: str | None = None,
+        max_stdout_bytes: int | None = None,
+        max_stderr_bytes: int | None = None,
+    ) -> "JobHandle":
+        return self.client.start_job(
+            self.id,
+            command,
+            job_id=job_id,
+            env=env,
+            working_dir=working_dir,
+            max_stdout_bytes=max_stdout_bytes,
+            max_stderr_bytes=max_stderr_bytes,
         )
 
     def exec(
@@ -596,6 +728,59 @@ class ExecHandle:
                     empty_terminal_drains += 1
                     if empty_terminal_drains >= 1:
                         return _exec_result(self.session_id, self.session, events)
+
+
+@dataclass
+class JobHandle:
+    client: "SandboxClient"
+    sandbox_id: str
+    job_id: str
+    record: SandboxJobRecord
+
+    def refresh(self) -> SandboxJobRecord:
+        self.record = self.client.get_job(self.sandbox_id, self.job_id)
+        return self.record
+
+    def wait(
+        self,
+        *,
+        timeout_seconds: float | None = None,
+        poll_seconds: float = 1.0,
+    ) -> SandboxJobRecord:
+        deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
+        while True:
+            record = self.refresh()
+            if record.terminal:
+                return record
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(f"sandbox job timed out: {self.job_id}")
+            delay = max(0.05, poll_seconds)
+            if deadline is not None:
+                delay = min(delay, max(0.0, deadline - time.monotonic()))
+            time.sleep(delay)
+
+    def logs(
+        self,
+        stream: str = "stdout",
+        *,
+        offset: int = 0,
+        limit: int = 1024 * 1024,
+    ) -> SandboxJobLogChunk:
+        return self.client.read_job_logs(
+            self.sandbox_id,
+            self.job_id,
+            stream=stream,
+            offset=offset,
+            limit=limit,
+        )
+
+    def signal(self, signal: int = 15) -> SandboxJobRecord:
+        self.record = self.client.signal_job(
+            self.sandbox_id,
+            self.job_id,
+            signal=signal,
+        )
+        return self.record
 
 
 class SandboxClient:
@@ -891,6 +1076,84 @@ class SandboxClient:
         if input is not None:
             handle.write_stdin(input, eof=True)
         return handle.wait(timeout_seconds=timeout_seconds)
+
+    def start_job(
+        self,
+        sandbox_id: str,
+        command: str | Sequence[str],
+        *,
+        job_id: str | None = None,
+        env: Mapping[str, str] | None = None,
+        working_dir: str | None = None,
+        max_stdout_bytes: int | None = None,
+        max_stderr_bytes: int | None = None,
+    ) -> JobHandle:
+        resolved_job_id = _job_id(job_id)
+        response = self._request_json(
+            "POST",
+            f"/v1/sandboxes/{_quote_segment(sandbox_id)}/jobs",
+            payload=_job_payload(
+                command,
+                job_id=resolved_job_id,
+                env=env,
+                working_dir=working_dir,
+                max_stdout_bytes=max_stdout_bytes,
+                max_stderr_bytes=max_stderr_bytes,
+            ),
+        )
+        record = _job_record(response)
+        if record.sandbox_id != sandbox_id or record.job_id != resolved_job_id:
+            raise SandboxApiError("gateway returned another sandbox job", body=response)
+        return JobHandle(self, sandbox_id, resolved_job_id, record)
+
+    def get_job(self, sandbox_id: str, job_id: str) -> SandboxJobRecord:
+        response = self._request_json(
+            "GET",
+            f"/v1/sandboxes/{_quote_segment(sandbox_id)}/jobs/{_quote_segment(job_id)}",
+        )
+        record = _job_record(response)
+        if record.sandbox_id != sandbox_id or record.job_id != job_id:
+            raise SandboxApiError("gateway returned another sandbox job", body=response)
+        return record
+
+    def read_job_logs(
+        self,
+        sandbox_id: str,
+        job_id: str,
+        *,
+        stream: str = "stdout",
+        offset: int = 0,
+        limit: int = 1024 * 1024,
+    ) -> SandboxJobLogChunk:
+        if stream not in {"stdout", "stderr"}:
+            raise ValueError("job log stream must be stdout or stderr")
+        query = parse.urlencode(
+            {"offset": max(0, int(offset)), "limit": max(1, int(limit))}
+        )
+        response = self._request_json(
+            "GET",
+            f"/v1/sandboxes/{_quote_segment(sandbox_id)}/jobs/"
+            f"{_quote_segment(job_id)}/logs/{stream}?{query}",
+        )
+        return SandboxJobLogChunk.from_payload(response)
+
+    def signal_job(
+        self,
+        sandbox_id: str,
+        job_id: str,
+        *,
+        signal: int = 15,
+    ) -> SandboxJobRecord:
+        response = self._request_json(
+            "POST",
+            f"/v1/sandboxes/{_quote_segment(sandbox_id)}/jobs/"
+            f"{_quote_segment(job_id)}/signal",
+            payload={"signal": int(signal)},
+        )
+        record = _job_record(response)
+        if record.sandbox_id != sandbox_id or record.job_id != job_id:
+            raise SandboxApiError("gateway returned another sandbox job", body=response)
+        return record
 
     def get_exec_session(self, session_id: str) -> JsonObject:
         return self._request_json("GET", f"/v1/exec/{_quote_segment(session_id)}")
@@ -1267,6 +1530,26 @@ class AsyncSandboxHandle:
             tty=tty,
         )
 
+    async def start_job(
+        self,
+        command: str | Sequence[str],
+        *,
+        job_id: str | None = None,
+        env: Mapping[str, str] | None = None,
+        working_dir: str | None = None,
+        max_stdout_bytes: int | None = None,
+        max_stderr_bytes: int | None = None,
+    ) -> "AsyncJobHandle":
+        return await self.client.start_job(
+            self.id,
+            command,
+            job_id=job_id,
+            env=env,
+            working_dir=working_dir,
+            max_stdout_bytes=max_stdout_bytes,
+            max_stderr_bytes=max_stderr_bytes,
+        )
+
     async def exec(
         self,
         command: str | Sequence[str],
@@ -1455,6 +1738,59 @@ class AsyncExecHandle:
                     empty_terminal_drains += 1
                     if empty_terminal_drains >= 1:
                         return _exec_result(self.session_id, self.session, events)
+
+
+@dataclass
+class AsyncJobHandle:
+    client: "AsyncSandboxClient"
+    sandbox_id: str
+    job_id: str
+    record: SandboxJobRecord
+
+    async def refresh(self) -> SandboxJobRecord:
+        self.record = await self.client.get_job(self.sandbox_id, self.job_id)
+        return self.record
+
+    async def wait(
+        self,
+        *,
+        timeout_seconds: float | None = None,
+        poll_seconds: float = 1.0,
+    ) -> SandboxJobRecord:
+        deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
+        while True:
+            record = await self.refresh()
+            if record.terminal:
+                return record
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(f"sandbox job timed out: {self.job_id}")
+            delay = max(0.05, poll_seconds)
+            if deadline is not None:
+                delay = min(delay, max(0.0, deadline - time.monotonic()))
+            await asyncio.sleep(delay)
+
+    async def logs(
+        self,
+        stream: str = "stdout",
+        *,
+        offset: int = 0,
+        limit: int = 1024 * 1024,
+    ) -> SandboxJobLogChunk:
+        return await self.client.read_job_logs(
+            self.sandbox_id,
+            self.job_id,
+            stream=stream,
+            offset=offset,
+            limit=limit,
+        )
+
+    async def signal(self, signal: int = 15) -> SandboxJobRecord:
+        self.record = await self.client.signal_job(
+            self.sandbox_id,
+            self.job_id,
+            signal=signal,
+        )
+        return self.record
 
 
 class AsyncSandboxClient:
@@ -1765,6 +2101,84 @@ class AsyncSandboxClient:
         if input is not None:
             await handle.write_stdin(input, eof=True)
         return await handle.wait(timeout_seconds=timeout_seconds)
+
+    async def start_job(
+        self,
+        sandbox_id: str,
+        command: str | Sequence[str],
+        *,
+        job_id: str | None = None,
+        env: Mapping[str, str] | None = None,
+        working_dir: str | None = None,
+        max_stdout_bytes: int | None = None,
+        max_stderr_bytes: int | None = None,
+    ) -> AsyncJobHandle:
+        resolved_job_id = _job_id(job_id)
+        response = await self._request_json(
+            "POST",
+            f"/v1/sandboxes/{_quote_segment(sandbox_id)}/jobs",
+            payload=_job_payload(
+                command,
+                job_id=resolved_job_id,
+                env=env,
+                working_dir=working_dir,
+                max_stdout_bytes=max_stdout_bytes,
+                max_stderr_bytes=max_stderr_bytes,
+            ),
+        )
+        record = _job_record(response)
+        if record.sandbox_id != sandbox_id or record.job_id != resolved_job_id:
+            raise SandboxApiError("gateway returned another sandbox job", body=response)
+        return AsyncJobHandle(self, sandbox_id, resolved_job_id, record)
+
+    async def get_job(self, sandbox_id: str, job_id: str) -> SandboxJobRecord:
+        response = await self._request_json(
+            "GET",
+            f"/v1/sandboxes/{_quote_segment(sandbox_id)}/jobs/{_quote_segment(job_id)}",
+        )
+        record = _job_record(response)
+        if record.sandbox_id != sandbox_id or record.job_id != job_id:
+            raise SandboxApiError("gateway returned another sandbox job", body=response)
+        return record
+
+    async def read_job_logs(
+        self,
+        sandbox_id: str,
+        job_id: str,
+        *,
+        stream: str = "stdout",
+        offset: int = 0,
+        limit: int = 1024 * 1024,
+    ) -> SandboxJobLogChunk:
+        if stream not in {"stdout", "stderr"}:
+            raise ValueError("job log stream must be stdout or stderr")
+        query = parse.urlencode(
+            {"offset": max(0, int(offset)), "limit": max(1, int(limit))}
+        )
+        response = await self._request_json(
+            "GET",
+            f"/v1/sandboxes/{_quote_segment(sandbox_id)}/jobs/"
+            f"{_quote_segment(job_id)}/logs/{stream}?{query}",
+        )
+        return SandboxJobLogChunk.from_payload(response)
+
+    async def signal_job(
+        self,
+        sandbox_id: str,
+        job_id: str,
+        *,
+        signal: int = 15,
+    ) -> SandboxJobRecord:
+        response = await self._request_json(
+            "POST",
+            f"/v1/sandboxes/{_quote_segment(sandbox_id)}/jobs/"
+            f"{_quote_segment(job_id)}/signal",
+            payload={"signal": int(signal)},
+        )
+        record = _job_record(response)
+        if record.sandbox_id != sandbox_id or record.job_id != job_id:
+            raise SandboxApiError("gateway returned another sandbox job", body=response)
+        return record
 
     async def get_exec_session(self, session_id: str) -> JsonObject:
         return await self._request_json("GET", f"/v1/exec/{_quote_segment(session_id)}")
@@ -2142,6 +2556,10 @@ def _sandbox_payload(
         raise ValueError("forkable sandboxes require fork_protocol")
     if payload.get("fork_protocol") and not bool(payload.get("forkable")):
         raise ValueError("fork_protocol requires forkable=True")
+    if bool(payload.get("managed_process")) and not bool(payload.get("parkable")):
+        raise ValueError("managed_process requires parkable=True")
+    if bool(payload.get("managed_process")) and payload.get("command"):
+        raise ValueError("managed_process sandboxes are started with start_job()")
     return payload
 
 
@@ -2436,6 +2854,41 @@ def _exec_payload(
         "stdin": stdin,
         "tty": tty,
     }
+
+
+def _job_id(value: str | None) -> str:
+    result = (value or f"job-{uuid.uuid4().hex}").strip()
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", result) is None:
+        raise ValueError("job_id must match [A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
+    return result
+
+
+def _job_payload(
+    command: str | Sequence[str],
+    *,
+    job_id: str,
+    env: Mapping[str, str] | None,
+    working_dir: str | None,
+    max_stdout_bytes: int | None,
+    max_stderr_bytes: int | None,
+) -> JsonObject:
+    payload: JsonObject = {
+        "job_id": job_id,
+        "argv": _command_list(command),
+        "env": dict(env or {}),
+        "cwd": working_dir or "/workspace",
+    }
+    if max_stdout_bytes is not None:
+        payload["max_stdout_bytes"] = int(max_stdout_bytes)
+    if max_stderr_bytes is not None:
+        payload["max_stderr_bytes"] = int(max_stderr_bytes)
+    return payload
+
+
+def _job_record(response: object) -> SandboxJobRecord:
+    if not isinstance(response, dict):
+        raise SandboxApiError("gateway returned an invalid job response", body=response)
+    return SandboxJobRecord.from_payload(response.get("job"))
 
 
 def _prepare_capacity_payload(

@@ -235,6 +235,69 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertNotIn("parkable", ordinary)
         self.assertTrue(parkable["parkable"])
 
+    def test_sync_managed_job_handle_uses_durable_job_api(self) -> None:
+        with running_gateway() as gateway:
+            client = SandboxClient(gateway.base_url)
+            sandbox = client.create_sandbox(
+                SandboxSpec(
+                    id="managed-sync",
+                    image=Image.from_registry("busybox"),
+                    memory_mb=128,
+                    disk_mb=64,
+                    parkable=True,
+                    managed_process=True,
+                )
+            )
+            job = sandbox.start_job(
+                ["/bin/sh", "-c", "run-harness"],
+                job_id="rollout-1",
+                env={"MODEL": "test"},
+            )
+            refreshed = job.refresh()
+            logs = job.logs(limit=4)
+            terminal = job.signal()
+
+        self.assertTrue(gateway.state.last_payload.get("signal") == 15)
+        self.assertTrue(sandbox.record["spec"]["managed_process"])
+        self.assertEqual(refreshed.state, "running")
+        self.assertEqual(logs.data, b"harn")
+        self.assertEqual(logs.next_offset, 4)
+        self.assertEqual(terminal.state, "signaled")
+        self.assertTrue(terminal.terminal)
+
+    def test_managed_job_id_uses_the_server_ascii_grammar(self) -> None:
+        with running_gateway() as gateway:
+            client = SandboxClient(gateway.base_url)
+            with self.assertRaisesRegex(ValueError, "job_id must match"):
+                client.start_job("managed-sync", ["true"], job_id="röllout")
+
+    def test_async_managed_job_handle_matches_sync_contract(self) -> None:
+        async def exercise(base_url: str) -> tuple[str, bytes, str]:
+            async with AsyncSandboxClient(base_url) as client:
+                sandbox = await client.create_sandbox(
+                    SandboxSpec(
+                        id="managed-async",
+                        image=Image.from_registry("busybox"),
+                        memory_mb=128,
+                        disk_mb=64,
+                        parkable=True,
+                        managed_process=True,
+                    )
+                )
+                job = await sandbox.start_job(
+                    ["/bin/sh", "-c", "run-harness"],
+                    job_id="rollout-2",
+                )
+                record = await job.refresh()
+                logs = await job.logs()
+                terminal = await job.signal(2)
+                return record.state, logs.data, terminal.state
+
+        with running_gateway() as gateway:
+            result = asyncio.run(exercise(gateway.base_url))
+
+        self.assertEqual(result, ("running", b"harness", "signaled"))
+
     def test_sync_client_forks_single_and_batch_from_handle(self) -> None:
         protocol = SandboxForkProtocolSpec(
             prepare_command=("fork-agent", "prepare"),
@@ -1282,6 +1345,8 @@ class FakeGatewayState:
         self.builds: dict[str, dict] = {}
         self.exec_sessions: dict[str, dict] = {}
         self.exec_events: dict[str, list[dict]] = {}
+        self.jobs: dict[tuple[str, str], dict] = {}
+        self.job_logs: dict[tuple[str, str, str], bytes] = {}
         self.prepared: dict[str, dict] = {}
         self.prepared_builders: dict[str, dict] = {}
         self.files: dict[tuple[str, str], bytes] = {}
@@ -1357,6 +1422,35 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
                 {
                     "prepared_builders": prepared_builders,
                     "demand": self._demand(),
+                }
+            )
+            return
+        job_path = _job_path(path)
+        if job_path is not None and job_path[2] == "status":
+            sandbox_id, job_id, _action = job_path
+            with self.state.lock:
+                job = self.state.jobs.get((sandbox_id, job_id))
+            if job is None:
+                self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
+                return
+            self._write_json({"job": job})
+            return
+        if job_path is not None and job_path[2].startswith("logs:"):
+            sandbox_id, job_id, action = job_path
+            stream = action.split(":", 1)[1]
+            query = parse_qs(parsed.query)
+            offset = max(0, int(query.get("offset", ["0"])[0]))
+            limit = max(1, int(query.get("limit", [str(1024 * 1024)])[0]))
+            with self.state.lock:
+                data = self.state.job_logs.get((sandbox_id, job_id, stream), b"")
+            chunk = data[offset : offset + limit]
+            self._write_json(
+                {
+                    "stream": stream,
+                    "offset": offset,
+                    "next_offset": offset + len(chunk),
+                    "data": client_module.base64.b64encode(chunk).decode("ascii"),
+                    "eof": offset + len(chunk) >= len(data),
                 }
             )
             return
@@ -1589,6 +1683,54 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
                 status=HTTPStatus.CREATED,
             )
             return
+        job_path = _job_path(path)
+        if job_path is not None and job_path[2] == "collection":
+            sandbox_id, _empty_job_id, _action = job_path
+            job_id = str(payload.get("job_id") or "")
+            job = {
+                "sandbox_id": sandbox_id,
+                "sandbox_generation": 1,
+                "job_id": job_id,
+                "spec_sha256": "a" * 64,
+                "state": "running",
+                "pid": 42,
+                "started_at": "2026-08-03T00:00:00+00:00",
+                "completed_at": "",
+                "exit_code": None,
+                "signal": 0,
+                "stdout_bytes": 7,
+                "stderr_bytes": 0,
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+                "sequence": 2,
+                "updated_at": "2026-08-03T00:00:00+00:00",
+            }
+            with self.state.lock:
+                self.state.jobs[(sandbox_id, job_id)] = job
+                self.state.job_logs[(sandbox_id, job_id, "stdout")] = b"harness"
+            self._write_json({"job": job}, status=HTTPStatus.CREATED)
+            return
+        if job_path is not None and job_path[2] == "signal":
+            sandbox_id, job_id, _action = job_path
+            with self.state.lock:
+                job = self.state.jobs.get((sandbox_id, job_id))
+                if job is not None:
+                    job = dict(job)
+                    job.update(
+                        {
+                            "state": "signaled",
+                            "pid": 0,
+                            "signal": int(payload.get("signal") or 15),
+                            "completed_at": "2026-08-03T00:00:01+00:00",
+                            "sequence": 3,
+                        }
+                    )
+                    self.state.jobs[(sandbox_id, job_id)] = job
+            if job is None:
+                self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
+                return
+            self._write_json({"job": job})
+            return
         sandbox_id = _sandbox_id_from_path(path)
         if sandbox_id is not None and path.endswith("/exec"):
             exec_id = self.state.next_exec_id()
@@ -1763,6 +1905,21 @@ def _sandbox_id_from_path(path: str) -> str | None:
     if not rest:
         return None
     return unquote(rest.split("/", 1)[0])
+
+
+def _job_path(path: str) -> tuple[str, str, str] | None:
+    parts = [unquote(item) for item in path.split("/") if item]
+    if len(parts) < 4 or parts[:2] != ["v1", "sandboxes"] or parts[3] != "jobs":
+        return None
+    if len(parts) == 4:
+        return parts[2], "", "collection"
+    if len(parts) == 5:
+        return parts[2], parts[4], "status"
+    if len(parts) == 6 and parts[5] == "signal":
+        return parts[2], parts[4], "signal"
+    if len(parts) == 7 and parts[5] == "logs":
+        return parts[2], parts[4], f"logs:{parts[6]}"
+    return None
 
 
 def _fork_source_id_from_path(path: str) -> str | None:
