@@ -19,6 +19,7 @@ with `src/ucloud_sandboxes_sdk/client.py` when endpoints are added.
 - `POST /v1/exec/<session-id>/close-stdin`
 - `GET /v1/images`
 - `POST /v1/images/build`
+- `GET /v1/image-contexts/<sha256-digest>`
 - `PUT /v1/image-contexts/<sha256-digest>`
 - `POST /v1/images/pull`
 - `POST /v1/sandboxes/<sandbox-id>/snapshot`
@@ -62,8 +63,7 @@ variables and passes them as `security` on `POST /v1/sandboxes`. Use
 `UCLOUD_SANDBOX_SECURITY_PIDS_LIMIT`,
 `UCLOUD_SANDBOX_SECURITY_READ_ONLY_ROOTFS`, and
 `UCLOUD_SANDBOX_SECURITY_INIT`. Empty `USER`, empty `CAP_DROP`, and
-`PIDS_LIMIT=none` are accepted when compatibility with root-oriented benchmark
-images is required.
+`PIDS_LIMIT=none` allow root-oriented benchmark images when explicitly chosen.
 
 ## Images
 
@@ -84,9 +84,10 @@ images is required.
 }
 ```
 
-The SDK creates a tar.gz archive from the local context, hashes the archive,
-uploads it with `PUT /v1/image-contexts/<sha256-digest>`, and submits only the
-digest, size, and format in the build request.
+The SDK creates a deterministic tar.gz archive from the local context, hashes
+it, probes `GET /v1/image-contexts/<sha256-digest>`, and streams a `PUT` only
+when the gateway does not already hold the exact digest and size. The build
+request contains only the digest, size, and format.
 `build_image()` submits with `wait: false`, then polls
 `GET /v1/images/builds/{build_id}` until the tracked build reaches
 `succeeded` or `failed`. SDK callers can use `on_status` to receive each status
@@ -142,7 +143,8 @@ pushed by the gateway service.
 Exec is session based. `POST /v1/sandboxes/<id>/exec` starts a session and
 returns a session object. The SDK then polls `GET /v1/exec/<session>/events`.
 Events are ordered by integer `sequence`; clients pass `after` to avoid
-re-reading events.
+re-reading events. A missing, repeated, or out-of-order sequence raises
+`ExecEventHistoryLostError`; the SDK never returns partial output as complete.
 
 Terminal statuses are:
 
@@ -239,6 +241,10 @@ only exists on the builder/control-plane Docker daemon that built it.
 Sync and async clients raise `SandboxApiError` for non-2xx HTTP responses and
 malformed JSON/object payloads. `status_code` is set for HTTP errors, and
 `body` contains the decoded JSON error body when possible.
+
+The clients reject redirects and bound JSON, file, build-context, and relay
+bodies. A call-level timeout is one deadline shared by all retries rather than
+a fresh timeout for each attempt.
 
 Inspect integration retries transient scale-up and gateway errors. Normal SDK
 methods make one gateway request per method call.

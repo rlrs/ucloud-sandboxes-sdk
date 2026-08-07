@@ -8,9 +8,12 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from threading import Lock, Thread
+import time
 import unittest
+from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
+import ucloud_sandboxes_sdk.relay as relay_module
 from ucloud_sandboxes_sdk import (
     AsyncRelayWorkerClient,
     HttpTunnelConfig,
@@ -79,8 +82,156 @@ class ModelRelayConfigTests(unittest.TestCase):
         )
         self.assertEqual(config.headers(), {})
 
+    def test_rejects_invalid_tunnel_registration_capability(self) -> None:
+        with self.assertRaisesRegex(RelayApiError, "registration_token"):
+            http_tunnel_url(
+                "https://relay.example.org",
+                "run-001",
+                registration_token="not-a-capability",
+            )
+
 
 class RelayWorkerClientTests(unittest.TestCase):
+    def test_relay_request_requires_exact_identity(self) -> None:
+        valid = _relay_request(rollout_id="run-001", leased_by="worker-1")
+
+        for field in ("request_id", "rollout_id", "registration_token", "lease_id"):
+            with self.subTest(field=field):
+                payload = dict(valid)
+                payload[field] = 123
+                with self.assertRaises(RelayApiError):
+                    RelayRequest.from_payload(payload)
+
+        for token in ("", "A" * 32, "g" * 32, "0" * 31):
+            with self.subTest(token=token):
+                payload = dict(valid)
+                payload["registration_token"] = token
+                with self.assertRaises(RelayApiError):
+                    RelayRequest.from_payload(payload)
+
+    def test_registration_requires_matching_rollout_and_valid_token(self) -> None:
+        with running_relay() as relay:
+            client = RelayWorkerClient(relay.base_url, worker_token="worker-token")
+            relay.state.registration_rollout_id = "wrong-rollout"
+            with self.assertRaisesRegex(RelayApiError, "rollout_id does not match"):
+                client.register_rollout("run-001")
+
+            relay.state.registration_rollout_id = None
+            relay.state.registration_token = "not-a-capability"
+            with self.assertRaisesRegex(RelayApiError, "registration_token"):
+                client.register_rollout("run-001")
+
+    def test_poll_requires_requested_rollout_and_registration(self) -> None:
+        with running_relay() as relay:
+            client = RelayWorkerClient(relay.base_url, worker_token="worker-token")
+            client.register_rollout("run-001")
+
+            relay.state.poll_rollout_id = "wrong-rollout"
+            with self.assertRaisesRegex(RelayApiError, "different rollout"):
+                client.poll("run-001", timeout_seconds=0)
+
+            relay.state.poll_rollout_id = None
+            relay.state.poll_registration_token = "a" * 32
+            with self.assertRaisesRegex(RelayApiError, "different registration"):
+                client.poll("run-001", timeout_seconds=0)
+
+    def test_poll_timeout_includes_server_wait_for_sync_and_async(self) -> None:
+        async def poll_async(base_url: str) -> None:
+            async with AsyncRelayWorkerClient(
+                base_url,
+                worker_token="worker-token",
+                timeout_seconds=0.02,
+            ) as client:
+                await client.register_rollout("run-async")
+                result = await client.poll("run-async", timeout_seconds=0.1)
+                self.assertIsNotNone(result.request)
+
+        with running_relay() as relay:
+            relay.state.poll_delay_seconds = 0.05
+            sync_client = RelayWorkerClient(
+                relay.base_url,
+                worker_token="worker-token",
+                timeout_seconds=0.02,
+            )
+            sync_client.register_rollout("run-sync")
+            self.assertIsNotNone(
+                sync_client.poll("run-sync", timeout_seconds=0.1).request
+            )
+            asyncio.run(poll_async(relay.base_url))
+
+    def test_relay_transport_does_not_follow_redirects(self) -> None:
+        async def stats_async(base_url: str) -> RelayApiError:
+            async with AsyncRelayWorkerClient(
+                base_url, worker_token="worker-token"
+            ) as client:
+                with self.assertRaises(RelayApiError) as raised:
+                    await client.stats()
+                return raised.exception
+
+        with running_relay() as relay:
+            relay.state.stats_redirect = True
+            sync_client = RelayWorkerClient(relay.base_url, worker_token="worker-token")
+            with self.assertRaises(RelayApiError) as raised:
+                sync_client.stats()
+            async_error = asyncio.run(stats_async(relay.base_url))
+
+        self.assertEqual(raised.exception.status_code, HTTPStatus.FOUND)
+        self.assertEqual(async_error.status_code, HTTPStatus.FOUND)
+        self.assertEqual(raised.exception.headers["X-Relay-Request-Id"], "relay-test")
+        self.assertEqual(async_error.headers["X-Relay-Request-Id"], "relay-test")
+
+    def test_relay_transport_bounds_json_requests_and_responses(self) -> None:
+        async def oversized_request_async() -> None:
+            client = AsyncRelayWorkerClient("https://relay.invalid")
+            with self.assertRaisesRegex(RelayApiError, "request body exceeds"):
+                await client.register_rollout("run", metadata={"value": "x" * 128})
+
+        async def oversized_response_async(base_url: str) -> RelayApiError:
+            async with AsyncRelayWorkerClient(
+                base_url, worker_token="worker-token"
+            ) as client:
+                with self.assertRaises(RelayApiError) as raised:
+                    await client.stats()
+                return raised.exception
+
+        with patch.object(relay_module, "MAX_RELAY_JSON_BYTES", 64):
+            client = RelayWorkerClient("https://relay.invalid")
+            with self.assertRaisesRegex(RelayApiError, "request body exceeds"):
+                client.register_rollout("run", metadata={"value": "x" * 128})
+            asyncio.run(oversized_request_async())
+
+            with running_relay() as relay:
+                relay.state.stats_body = json.dumps({"value": "x" * 128}).encode()
+                client = RelayWorkerClient(relay.base_url, worker_token="worker-token")
+                with self.assertRaises(RelayApiError) as raised:
+                    client.stats()
+                async_error = asyncio.run(oversized_response_async(relay.base_url))
+
+        self.assertEqual(raised.exception.status_code, HTTPStatus.OK)
+        self.assertIn("64 byte limit", str(raised.exception))
+        self.assertEqual(async_error.status_code, HTTPStatus.OK)
+        self.assertIn("64 byte limit", str(async_error))
+
+    def test_successful_relay_response_must_be_json(self) -> None:
+        async def stats_async(base_url: str) -> RelayApiError:
+            async with AsyncRelayWorkerClient(
+                base_url, worker_token="worker-token"
+            ) as client:
+                with self.assertRaises(RelayApiError) as raised:
+                    await client.stats()
+                return raised.exception
+
+        with running_relay() as relay:
+            relay.state.stats_body = b"not-json"
+            client = RelayWorkerClient(relay.base_url, worker_token="worker-token")
+            with self.assertRaisesRegex(RelayApiError, "invalid JSON") as raised:
+                client.stats()
+            async_error = asyncio.run(stats_async(relay.base_url))
+
+        self.assertEqual(raised.exception.status_code, HTTPStatus.OK)
+        self.assertIn("invalid JSON", str(async_error))
+        self.assertEqual(async_error.status_code, HTTPStatus.OK)
+
     def test_sync_worker_client_supports_full_lease_lifecycle(self) -> None:
         with running_relay() as relay:
             client = RelayWorkerClient(relay.base_url, worker_token="worker-token")
@@ -178,6 +329,60 @@ class RelayWorkerClientTests(unittest.TestCase):
             b"\xffresponse",
         )
 
+    def test_binary_response_limit_is_checked_before_base64_encoding(self) -> None:
+        async def respond_async() -> None:
+            client = AsyncRelayWorkerClient("https://relay.invalid")
+            with self.assertRaisesRegex(RelayApiError, "4 byte limit"):
+                await client.respond_bytes(
+                    "req-1",
+                    "lease-1",
+                    b"12345",
+                    registration_token=REGISTRATION_TOKEN,
+                )
+
+        with (
+            patch.object(relay_module, "MAX_RELAY_HTTP_BODY_BYTES", 4),
+            patch.object(relay_module.base64, "b64encode") as encode,
+        ):
+            client = RelayWorkerClient("https://relay.invalid")
+            with self.assertRaisesRegex(RelayApiError, "4 byte limit"):
+                client.respond_bytes(
+                    "req-1",
+                    "lease-1",
+                    b"12345",
+                    registration_token=REGISTRATION_TOKEN,
+                )
+            asyncio.run(respond_async())
+
+        encode.assert_not_called()
+
+    def test_forwarding_bounds_sync_and_async_upstream_responses(self) -> None:
+        async def forward_async(base_url: str, relay_request: RelayRequest) -> None:
+            async with AsyncRelayWorkerClient(
+                base_url, worker_token="worker-token"
+            ) as client:
+                with self.assertRaisesRegex(RelayApiError, "4 byte limit"):
+                    await client.forward_to(relay_request, base_url)
+
+        with patch.object(relay_module, "MAX_RELAY_HTTP_BODY_BYTES", 4):
+            relay_request = RelayRequest.from_payload(
+                _relay_request(
+                    rollout_id="bounded-tunnel",
+                    leased_by="worker-1",
+                    endpoint="/upstream/echo",
+                    body=b"x",
+                    content_type="application/octet-stream",
+                )
+            )
+            with running_relay() as relay:
+                relay.state.upstream_response_body = b"12345"
+                client = RelayWorkerClient(relay.base_url, worker_token="worker-token")
+                with self.assertRaisesRegex(RelayApiError, "4 byte limit"):
+                    client.forward_to(relay_request, relay.base_url)
+                asyncio.run(forward_async(relay.base_url, relay_request))
+
+        self.assertEqual(relay.state.respond_attempts, 0)
+
     def test_sync_response_commit_retries_wake_pending_503(self) -> None:
         with running_relay() as relay:
             relay.state.respond_failures = 1
@@ -204,6 +409,7 @@ class RelayWorkerClientTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.status_code, HTTPStatus.UNAUTHORIZED)
         self.assertEqual(raised.exception.body, {"error": "unauthorized"})
+        self.assertEqual(raised.exception.headers["X-Relay-Request-Id"], "relay-test")
 
     def test_async_worker_client_supports_lease_renewal(self) -> None:
         async def scenario(base_url: str) -> tuple[str, float | None, str]:
@@ -300,8 +506,16 @@ class FakeRelayState:
         self.upstream_method = ""
         self.upstream_path = ""
         self.upstream_body = b""
+        self.upstream_response_body = b"\xffresponse"
         self.respond_failures = 0
         self.respond_attempts = 0
+        self.registration_rollout_id: str | None = None
+        self.registration_token = REGISTRATION_TOKEN
+        self.poll_rollout_id: str | None = None
+        self.poll_registration_token: str | None = None
+        self.poll_delay_seconds = 0.0
+        self.stats_redirect = False
+        self.stats_body: bytes | None = None
 
 
 class FakeRelayHandler(BaseHTTPRequestHandler):
@@ -319,7 +533,22 @@ class FakeRelayHandler(BaseHTTPRequestHandler):
         if not self._check_authorized():
             return
         if parsed.path == "/v1/relay/stats":
+            if self.state.stats_redirect:
+                self._write_bytes(
+                    b"",
+                    status=HTTPStatus.FOUND,
+                    headers={"Location": "/redirect-target"},
+                )
+                return
+            if self.state.stats_body is not None:
+                self._write_bytes(
+                    self.state.stats_body, content_type="application/json"
+                )
+                return
             self._write_json({"counters": {"lease_renewed": 1}})
+            return
+        if parsed.path == "/redirect-target":
+            self._write_json({"redirected": True})
             return
         if parsed.path == "/v1/relay/rollouts":
             with self.state.lock:
@@ -328,11 +557,19 @@ class FakeRelayHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/worker/poll":
             query = parse_qs(parsed.query)
+            if self.state.poll_delay_seconds:
+                time.sleep(self.state.poll_delay_seconds)
             with self.state.lock:
                 self.state.last_poll_query = query
             request = _relay_request(
-                rollout_id=query.get("rollout_id", [""])[0],
+                rollout_id=(
+                    self.state.poll_rollout_id or query.get("rollout_id", [""])[0]
+                ),
                 leased_by=query.get("worker_id", [""])[0],
+                registration_token=(
+                    self.state.poll_registration_token
+                    or query.get("registration_token", [""])[0]
+                ),
             )
             self._write_json({"request": request, "requests": [request]})
             return
@@ -347,7 +584,7 @@ class FakeRelayHandler(BaseHTTPRequestHandler):
                 self.state.upstream_path = self.path
                 self.state.upstream_body = body
             self._write_bytes(
-                b"\xffresponse",
+                self.state.upstream_response_body,
                 status=207,
                 content_type="application/octet-stream",
             )
@@ -358,8 +595,8 @@ class FakeRelayHandler(BaseHTTPRequestHandler):
         if parsed.path == "/v1/relay/rollouts":
             rollout_id = str(payload.get("rollout_id") or "")
             record = {
-                "rollout_id": rollout_id,
-                "registration_token": REGISTRATION_TOKEN,
+                "rollout_id": self.state.registration_rollout_id or rollout_id,
+                "registration_token": self.state.registration_token,
                 "metadata": dict(payload.get("metadata") or {}),
             }
             with self.state.lock:
@@ -456,11 +693,7 @@ class FakeRelayHandler(BaseHTTPRequestHandler):
         status: HTTPStatus = HTTPStatus.OK,
     ) -> None:
         body = json.dumps(payload).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        self._write_bytes(body, status=status, content_type="application/json")
 
     def _write_bytes(
         self,
@@ -468,10 +701,14 @@ class FakeRelayHandler(BaseHTTPRequestHandler):
         *,
         status: int = 200,
         content_type: str = "application/octet-stream",
+        headers: dict[str, str] | None = None,
     ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Relay-Request-Id", "relay-test")
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
@@ -484,13 +721,14 @@ def _relay_request(
     endpoint: str = "/v1/chat/completions",
     body: bytes | None = None,
     content_type: str = "application/json",
+    registration_token: str = REGISTRATION_TOKEN,
 ) -> dict:
     json_body = {"model": "test-model", "messages": []}
     raw_body = body if body is not None else json.dumps(json_body).encode("utf-8")
     return {
         "request_id": "req-1",
         "rollout_id": rollout_id,
-        "registration_token": REGISTRATION_TOKEN,
+        "registration_token": registration_token,
         "endpoint": endpoint,
         "method": "POST",
         "headers": {"X-Relay": "yes", "Content-Type": content_type},

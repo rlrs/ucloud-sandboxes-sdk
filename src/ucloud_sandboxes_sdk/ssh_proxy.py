@@ -20,8 +20,7 @@ def websocket_url(gateway_url: str, sandbox_id: str) -> str:
         "wss": "wss",
     }[parsed.scheme]
     path = (
-        parsed.path.rstrip("/")
-        + f"/v1/sandboxes/{quote(sandbox_id, safe='')}/ssh/ws"
+        parsed.path.rstrip("/") + f"/v1/sandboxes/{quote(sandbox_id, safe='')}/ssh/ws"
     )
     return urlunsplit((scheme, parsed.netloc, path, "", ""))
 
@@ -34,7 +33,7 @@ async def run_proxy(
     token_env: str | None = "UCLOUD_SANDBOX_API_TOKEN",
 ) -> int:
     try:
-        from aiohttp import ClientSession, WSMsgType
+        from aiohttp import ClientSession, TraceConfig, WSMsgType
     except ImportError as exc:
         raise RuntimeError(
             "SSH proxy requires aiohttp. Install ucloud-sandboxes-sdk[async]."
@@ -45,7 +44,13 @@ async def run_proxy(
         effective_token = os.environ.get(token_env)
     headers = sandbox_auth_headers(effective_token)
 
-    async with ClientSession(headers=headers) as session:
+    trace = TraceConfig()
+
+    async def reject_redirect(*_args: object) -> None:
+        raise RuntimeError("SSH websocket redirects are not allowed")
+
+    trace.on_request_redirect.append(reject_redirect)
+    async with ClientSession(headers=headers, trace_configs=[trace]) as session:
         async with session.ws_connect(
             websocket_url(gateway_url, sandbox_id),
             heartbeat=30.0,

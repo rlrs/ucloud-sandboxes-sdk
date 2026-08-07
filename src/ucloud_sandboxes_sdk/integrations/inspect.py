@@ -54,6 +54,7 @@ DEFAULT_START_TIMEOUT_SECONDS = 1800
 DEFAULT_BUILD_TIMEOUT_SECONDS = 1800
 DEFAULT_RETRY_INTERVAL_SECONDS = 10.0
 DEFAULT_SCALE_UP_REQUEST_TIMEOUT_SECONDS = 30.0
+DEFAULT_CLEANUP_TIMEOUT_SECONDS = 60.0
 BUILD_CACHE_VERSION = "ucloud-inspect-build-v1"
 HARBOR_HARNESS_DIRS = ("/tests", "/logs/agent", "/logs/verifier", "/task", "/oracle")
 INSPECT_CREATED_BY = "inspect-ai"
@@ -100,6 +101,15 @@ def sandbox_cleanup_startup() -> None:
 
 def running_sandboxes() -> list[tuple[str, str, dict[str, str]]]:
     return _running_sandboxes.get([])
+
+
+def _forget_running_sandbox(sandbox_id: str, *, base_url: str) -> None:
+    records = running_sandboxes()
+    records[:] = [
+        record
+        for record in records
+        if not (record[0] == base_url and record[1] == sandbox_id)
+    ]
 
 
 @sandboxenv(name="ucloud")
@@ -196,12 +206,19 @@ class UCloudSandboxEnvironment(SandboxEnvironment):
             )
         except Exception:
             try:
-                await client.delete_sandbox(sandbox_id)
-            except SandboxApiError:
-                pass
-            await client.close()
+                await _delete_sandbox_with_wait(client, sandbox_id)
+            except Exception as cleanup_exc:
+                logger.warning(
+                    "Failed to clean up sandbox %s after sample initialization: %s",
+                    sandbox_id,
+                    cleanup_exc,
+                )
+            finally:
+                await client.close()
             raise
-        running_sandboxes().append((settings.base_url, sandbox_id, dict(settings.headers)))
+        running_sandboxes().append(
+            (settings.base_url, sandbox_id, dict(settings.headers))
+        )
         return {"default": cls(handle, client)}
 
     @classmethod
@@ -219,7 +236,14 @@ class UCloudSandboxEnvironment(SandboxEnvironment):
             sandbox = env.as_type(UCloudSandboxEnvironment)
             try:
                 if not interrupted:
-                    await sandbox.handle.delete()
+                    await _delete_sandbox_with_wait(
+                        sandbox.client,
+                        sandbox.handle.id,
+                    )
+                    _forget_running_sandbox(
+                        sandbox.handle.id,
+                        base_url=sandbox.client.base_url,
+                    )
             finally:
                 await sandbox.client.close()
 
@@ -233,15 +257,19 @@ class UCloudSandboxEnvironment(SandboxEnvironment):
         del task_name, config
         if not cleanup:
             return
+        failures: list[tuple[str, BaseException]] = []
         for base_url, sandbox_id, headers in running_sandboxes().copy():
             client = AsyncSandboxClient(base_url, headers=headers)
             try:
-                await client.delete_sandbox(sandbox_id)
-            except SandboxApiError:
-                pass
+                await _delete_sandbox_with_wait(client, sandbox_id)
+                _forget_running_sandbox(sandbox_id, base_url=base_url)
+            except Exception as exc:
+                failures.append((sandbox_id, exc))
             finally:
                 await client.close()
-        running_sandboxes().clear()
+        if failures:
+            details = "; ".join(f"{sandbox_id}: {exc}" for sandbox_id, exc in failures)
+            raise RuntimeError(f"Failed to clean up UCloud sandboxes: {details}")
 
     @classmethod
     async def cli_cleanup(cls, id: str | None) -> None:
@@ -308,7 +336,9 @@ class UCloudSandboxEnvironment(SandboxEnvironment):
 
     async def write_file(self, file: str, contents: str | bytes) -> None:
         parent = str(PurePosixPath(file).parent)
-        content_bytes = contents.encode("utf-8") if isinstance(contents, str) else contents
+        content_bytes = (
+            contents.encode("utf-8") if isinstance(contents, str) else contents
+        )
         if parent and parent not in {"/", "."}:
             result = await self.exec(["mkdir", "-p", parent])
             if not result.success:
@@ -574,7 +604,9 @@ def _build_context_fingerprint(
             "version": BUILD_CACHE_VERSION,
             "dockerfile": dockerfile,
             "service_name": service_name,
-            "build_args": {str(key): str(value) for key, value in sorted(build_args.items())},
+            "build_args": {
+                str(key): str(value) for key, value in sorted(build_args.items())
+            },
             "tag": tag,
             "harbor_harness_dirs": HARBOR_HARNESS_DIRS,
         },
@@ -582,7 +614,10 @@ def _build_context_fingerprint(
     if not context_path.is_dir():
         _hash_text(digest, "missing-context", str(context_path))
         return digest.hexdigest()
-    for path in sorted(context_path.rglob("*"), key=lambda item: item.relative_to(context_path).as_posix()):
+    for path in sorted(
+        context_path.rglob("*"),
+        key=lambda item: item.relative_to(context_path).as_posix(),
+    ):
         rel = path.relative_to(context_path).as_posix()
         try:
             stat = path.lstat()
@@ -610,7 +645,9 @@ def _build_context_fingerprint(
 
 
 def _hash_json(digest: Any, value: object) -> None:
-    digest.update(json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    digest.update(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
     digest.update(b"\0")
 
 
@@ -731,7 +768,9 @@ def _settings_from_env() -> _InspectSettings:
     return _InspectSettings(
         base_url=base_url,
         headers=headers,
-        image=_registry_image(os.environ.get("UCLOUD_SANDBOX_IMAGE", DEFAULT_INSPECT_IMAGE)),
+        image=_registry_image(
+            os.environ.get("UCLOUD_SANDBOX_IMAGE", DEFAULT_INSPECT_IMAGE)
+        ),
         cpus=cpus or DEFAULT_INSPECT_CPUS,
         memory_mb=memory_mb or DEFAULT_INSPECT_MEMORY_MB,
         disk_mb=disk_mb or DEFAULT_INSPECT_DISK_MB,
@@ -834,6 +873,39 @@ async def _create_sandbox_with_wait(
             ),
         ),
     )
+
+
+async def _delete_sandbox_with_wait(
+    client: AsyncSandboxClient,
+    sandbox_id: str,
+    *,
+    timeout_seconds: float = DEFAULT_CLEANUP_TIMEOUT_SECONDS,
+    retry_interval_seconds: float = 1.0,
+) -> dict[str, Any] | None:
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    last_error: BaseException | None = None
+    while True:
+        try:
+            return await client.delete_sandbox(sandbox_id)
+        except SandboxApiError as exc:
+            if exc.status_code == 404:
+                return None
+            if not _is_retryable_gateway_error(exc):
+                raise
+            last_error = exc
+            delay = max(
+                retry_interval_seconds,
+                exc.retry_after_seconds or 0.0,
+            )
+        except (ClientError, TimeoutError) as exc:
+            last_error = exc
+            delay = retry_interval_seconds
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"Timed out deleting UCloud sandbox {sandbox_id}: {last_error}"
+            ) from last_error
+        await asyncio.sleep(min(max(0.0, delay), remaining))
 
 
 async def _build_image_with_wait(
@@ -971,6 +1043,10 @@ async def _submit_image_build_with_recovery(
                 f"Timed out waiting for UCloud builder node readiness "
                 f"after {timeout_seconds}s and {attempts - 1} attempt(s): {last_error}"
             ) from last_error
+        active = await _active_image_build(client, image)
+        if active is not None:
+            return active
+        known_build_ids = await _known_image_build_ids(client, spec.id, spec.tag)
         try:
             return await client.submit_image_build(
                 image,
@@ -980,12 +1056,29 @@ async def _submit_image_build_with_recovery(
             last_error = exc
             if not _is_retryable_gateway_error(exc):
                 raise
-            await _sleep_with_deadline(retry_interval_seconds, deadline)
+            if _build_submit_error_may_be_ambiguous(exc):
+                recovered = await _recover_submitted_image_build(
+                    client,
+                    spec.id,
+                    tag=spec.tag,
+                    known_build_ids=known_build_ids,
+                    deadline=deadline,
+                    retry_interval_seconds=retry_interval_seconds,
+                )
+                if recovered is not None:
+                    return recovered
+            else:
+                await _sleep_with_deadline(
+                    max(retry_interval_seconds, exc.retry_after_seconds or 0.0),
+                    deadline,
+                )
         except (ClientError, TimeoutError) as exc:
             last_error = exc
             recovered = await _recover_submitted_image_build(
                 client,
                 spec.id,
+                tag=spec.tag,
+                known_build_ids=known_build_ids,
                 deadline=deadline,
                 retry_interval_seconds=retry_interval_seconds,
             )
@@ -997,6 +1090,8 @@ async def _recover_submitted_image_build(
     client: AsyncSandboxClient,
     image_id: str,
     *,
+    tag: str | None,
+    known_build_ids: set[str] | None,
     deadline: float,
     retry_interval_seconds: float,
 ) -> dict[str, Any] | None:
@@ -1006,20 +1101,91 @@ async def _recover_submitted_image_build(
         if remaining <= 0:
             return None
         try:
-            return await client.get_image_build(
+            recovered = await client.get_image_build(
                 image_id,
                 timeout_seconds=max(
                     0.001,
                     min(DEFAULT_SCALE_UP_REQUEST_TIMEOUT_SECONDS, remaining),
                 ),
             )
+            if _recovered_build_matches_attempt(
+                recovered,
+                image_id=image_id,
+                tag=tag,
+                known_build_ids=known_build_ids,
+            ):
+                return recovered
         except SandboxApiError as exc:
-            if exc.status_code != 404:
+            if exc.status_code != 404 and not _is_retryable_gateway_error(exc):
                 raise
+        except (ClientError, TimeoutError):
+            pass
         remaining_poll = poll_deadline - time.monotonic()
         if remaining_poll <= 0:
             return None
         await asyncio.sleep(min(1.0, remaining_poll))
+
+
+def _build_submit_error_may_be_ambiguous(exc: SandboxApiError) -> bool:
+    if not isinstance(exc.body, dict):
+        return True
+    if _is_scale_up_pending_body(exc.body):
+        return False
+    text = _body_text(exc.body).lower()
+    return not any(
+        marker in text
+        for marker in (
+            "registry image-use state is unavailable",
+            "routing state unavailable",
+            "job is unavailable",
+        )
+    )
+
+
+async def _known_image_build_ids(
+    client: AsyncSandboxClient,
+    image_id: str,
+    tag: str | None,
+) -> set[str] | None:
+    list_builds = getattr(client, "list_image_builds", None)
+    if not callable(list_builds):
+        return None
+    try:
+        builds = await list_builds()
+    except (SandboxApiError, ClientError, TimeoutError):
+        return None
+    return {
+        str(build["build_id"])
+        for build in builds
+        if isinstance(build, dict)
+        and build.get("image_id") == image_id
+        and (tag is None or not build.get("tag") or build.get("tag") == tag)
+        and isinstance(build.get("build_id"), str)
+        and build["build_id"]
+    }
+
+
+def _recovered_build_matches_attempt(
+    build: Mapping[str, Any],
+    *,
+    image_id: str,
+    tag: str | None,
+    known_build_ids: set[str] | None,
+) -> bool:
+    if build.get("image_id") != image_id:
+        return False
+    recovered_tag = build.get("tag")
+    if tag is not None and recovered_tag not in {None, "", tag}:
+        return False
+    if not _image_build_terminal(build):
+        return True
+    build_id = build.get("build_id")
+    return (
+        known_build_ids is not None
+        and isinstance(build_id, str)
+        and bool(build_id)
+        and build_id not in known_build_ids
+    )
 
 
 async def _sleep_with_deadline(seconds: float, deadline: float) -> None:
@@ -1181,6 +1347,11 @@ async def _retry_scale_up(
 def _is_retryable_gateway_error(exc: SandboxApiError) -> bool:
     if not isinstance(exc.body, dict):
         return False
+    if (
+        exc.status_code in {408, 425, 429, 500, 502, 503, 504}
+        and exc.body.get("retryable") is True
+    ):
+        return True
     if exc.status_code == 503 and _is_scale_up_pending_body(exc.body):
         return True
     if exc.status_code not in {502, 503, 504}:

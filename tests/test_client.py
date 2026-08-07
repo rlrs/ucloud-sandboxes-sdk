@@ -20,6 +20,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 import ucloud_sandboxes_sdk.client as client_module
 from ucloud_sandboxes_sdk import (
     AsyncSandboxClient,
+    ExecEventHistoryLostError,
     Image,
     SandboxApiError,
     SandboxClient,
@@ -32,20 +33,168 @@ from ucloud_sandboxes_sdk import (
 
 
 class SandboxSdkTests(unittest.TestCase):
+    def test_credentialed_clients_reject_redirects(self) -> None:
+        with running_redirect_gateway() as gateway:
+            sync_client = SandboxClient(gateway.base_url, api_token="secret-token")
+            with self.assertRaises(SandboxApiError) as sync_raised:
+                sync_client.health()
+
+            async def scenario() -> None:
+                async with AsyncSandboxClient(
+                    gateway.base_url,
+                    api_token="secret-token",
+                ) as async_client:
+                    with self.assertRaises(SandboxApiError) as async_raised:
+                        await async_client.health()
+                    self.assertEqual(async_raised.exception.status_code, 302)
+
+            asyncio.run(scenario())
+
+        self.assertEqual(sync_raised.exception.status_code, 302)
+        self.assertEqual(gateway.state.redirected_hits, 0)
+        self.assertEqual(
+            gateway.state.initial_tokens,
+            ["secret-token", "secret-token"],
+        )
+
+    def test_exec_wait_rejects_noncontiguous_event_history(self) -> None:
+        class GapClient:
+            def read_exec_events(self, *_args: object, **_kwargs: object) -> dict:
+                return {
+                    "events": [{"sequence": 2, "stream": "stdout", "data": "tail"}],
+                    "session": {"status": "exited", "exit_code": 0},
+                }
+
+        handle = client_module.ExecHandle(GapClient(), "exec-gap", "sandbox-one")
+        with self.assertRaises(ExecEventHistoryLostError) as raised:
+            handle.wait(timeout_seconds=1)
+
+        self.assertEqual(raised.exception.expected_sequence, 1)
+        self.assertEqual(raised.exception.received_sequence, 2)
+
+    def test_async_exec_wait_rejects_noncontiguous_event_history(self) -> None:
+        class GapClient:
+            async def read_exec_events(
+                self,
+                *_args: object,
+                **_kwargs: object,
+            ) -> dict:
+                return {
+                    "events": [{"sequence": 4, "stream": "stderr", "data": "tail"}],
+                    "session": {"status": "failed", "exit_code": 1},
+                }
+
+        async def scenario() -> None:
+            handle = client_module.AsyncExecHandle(
+                GapClient(),
+                "exec-async-gap",
+                "sandbox-one",
+            )
+            with self.assertRaises(ExecEventHistoryLostError) as raised:
+                await handle.wait(timeout_seconds=1)
+            self.assertEqual(raised.exception.expected_sequence, 1)
+            self.assertEqual(raised.exception.received_sequence, 4)
+
+        asyncio.run(scenario())
+
+    def test_async_client_rejects_malformed_success_json(self) -> None:
+        class FakeResponse:
+            status = 200
+            headers: dict[str, str] = {}
+
+            async def __aenter__(self) -> "FakeResponse":
+                return self
+
+            async def __aexit__(self, *args: object) -> None:
+                del args
+
+            async def text(self) -> str:
+                return "<html>not json</html>"
+
+        class FakeSession:
+            def request(self, *_args: object, **_kwargs: object) -> FakeResponse:
+                return FakeResponse()
+
+        async def scenario() -> None:
+            client = AsyncSandboxClient("http://gateway.invalid", session=FakeSession())
+            with self.assertRaises(SandboxApiError) as raised:
+                await client.health()
+            self.assertEqual(raised.exception.status_code, 200)
+
+        asyncio.run(scenario())
+
+    def test_request_and_local_file_uploads_are_bounded(self) -> None:
+        client = SandboxClient("http://gateway.invalid")
+        with patch.object(client_module, "MAX_FILE_BODY_BYTES", 3):
+            with self.assertRaisesRegex(SandboxApiError, "request body exceeds"):
+                client.upload_file("sandbox", "/workspace/data", b"four")
+            with TemporaryDirectory() as raw_dir:
+                path = Path(raw_dir) / "data"
+                path.write_bytes(b"four")
+                with self.assertRaisesRegex(SandboxApiError, "file exceeds"):
+                    client.upload_file_from_path(
+                        "sandbox",
+                        path,
+                        "/workspace/data",
+                    )
+
+    def test_sync_and_async_json_responses_are_bounded(self) -> None:
+        class SyncResponse:
+            status = 200
+            headers = {"Content-Length": "4"}
+
+            def __enter__(self) -> "SyncResponse":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                del args
+
+            def read(self, _size: int | None = None) -> bytes:
+                return b"four"
+
+        with patch.object(client_module, "MAX_JSON_RESPONSE_BYTES", 3), patch.object(
+            client_module,
+            "open_no_redirect",
+            lambda *_args, **_kwargs: SyncResponse(),
+        ):
+            with self.assertRaisesRegex(SandboxApiError, "response exceeds"):
+                SandboxClient("http://gateway.invalid").health()
+
+        class AsyncResponse:
+            status = 200
+            headers = {"Content-Length": "4"}
+
+            async def __aenter__(self) -> "AsyncResponse":
+                return self
+
+            async def __aexit__(self, *args: object) -> None:
+                del args
+
+        class AsyncSession:
+            def request(self, *_args: object, **_kwargs: object) -> AsyncResponse:
+                return AsyncResponse()
+
+        async def scenario() -> None:
+            client = AsyncSandboxClient(
+                "http://gateway.invalid",
+                session=AsyncSession(),
+            )
+            with self.assertRaisesRegex(SandboxApiError, "response exceeds"):
+                await client.health()
+
+        with patch.object(client_module, "MAX_JSON_RESPONSE_BYTES", 3):
+            asyncio.run(scenario())
+
     def test_managed_build_payload_omits_registry_coordinates(self) -> None:
         with docker_context() as context:
-            payload, archive = client_module._image_build_request(
-                Image.from_dockerfile(
-                    name="managed-image",
-                    context_path=context,
-                )
-            )
-            repeated_payload, repeated_archive = client_module._image_build_request(
-                Image.from_dockerfile(
-                    name="managed-image",
-                    context_path=context,
-                )
-            )
+            with client_module._image_build_request(
+                Image.from_dockerfile(name="managed-image", context_path=context)
+            ) as (payload, archive_stream):
+                archive = archive_stream.read()
+            with client_module._image_build_request(
+                Image.from_dockerfile(name="managed-image", context_path=context)
+            ) as (repeated_payload, repeated_archive_stream):
+                repeated_archive = repeated_archive_stream.read()
 
         self.assertEqual(payload["id"], "managed-image")
         self.assertNotIn("tag", payload)
@@ -300,7 +449,7 @@ class SandboxSdkTests(unittest.TestCase):
             )
 
         client = SandboxClient("http://gateway.invalid", timeout_seconds=11)
-        with patch.object(client_module.request, "urlopen", fake_urlopen):
+        with patch.object(client_module, "open_no_redirect", fake_urlopen):
             sandbox = client.create_sandbox(
                 id="timeout-one",
                 image=Image.from_registry("busybox"),
@@ -309,7 +458,8 @@ class SandboxSdkTests(unittest.TestCase):
             )
 
         self.assertEqual(sandbox.id, "timeout-one")
-        self.assertEqual(captured_timeouts, [7])
+        self.assertEqual(len(captured_timeouts), 1)
+        self.assertAlmostEqual(float(captured_timeouts[0]), 7, places=3)
 
     def test_sync_client_uploads_local_build_context(self) -> None:
         with TemporaryDirectory() as raw_dir:
@@ -336,6 +486,24 @@ class SandboxSdkTests(unittest.TestCase):
         digest = submitted["context_archive_digest"]
         self.assertEqual(submitted["context_archive_format"], "tar.gz")
         self.assertEqual(submitted["context_archive_size"], len(uploaded[digest]))
+
+    def test_sync_client_skips_existing_build_context_upload(self) -> None:
+        with docker_context() as context, running_gateway() as gateway:
+            client = SandboxClient(gateway.base_url)
+            image = Image.from_dockerfile(
+                name="deduplicated-context",
+                context_path=context,
+            )
+
+            first = client.build_image(image)
+            second = client.build_image(image)
+
+        self.assertEqual(
+            first["image"]["received_archive_bytes"],
+            second["image"]["received_archive_bytes"],
+        )
+        self.assertEqual(gateway.state.build_context_puts, 1)
+        self.assertEqual(len(gateway.state.build_contexts), 1)
 
     def test_sync_client_can_submit_and_poll_image_builds(self) -> None:
         with docker_context() as context, running_gateway() as gateway:
@@ -390,7 +558,7 @@ class SandboxSdkTests(unittest.TestCase):
 
         client = SandboxClient("http://gateway.invalid", timeout_seconds=11)
         with docker_context() as context, patch.object(
-            client_module.request, "urlopen", fake_urlopen
+            client_module, "open_no_redirect", fake_urlopen
         ):
             client.build_image(
                 Image.from_dockerfile(
@@ -401,7 +569,11 @@ class SandboxSdkTests(unittest.TestCase):
                 timeout_seconds=123,
             )
 
-        self.assertEqual(captured_timeouts, [123, 123, 11])
+        self.assertEqual(len(captured_timeouts), 4)
+        for timeout in captured_timeouts[:3]:
+            self.assertGreater(float(timeout), 120)
+            self.assertLessEqual(float(timeout), 123)
+        self.assertAlmostEqual(float(captured_timeouts[3]), 11, places=3)
 
     def test_sync_client_surfaces_api_errors(self) -> None:
         with docker_context() as context, running_gateway() as gateway:
@@ -446,7 +618,9 @@ class SandboxSdkTests(unittest.TestCase):
             return FakeResponse()
 
         client = SandboxClient("http://gateway.invalid")
-        with patch.object(client_module.request, "urlopen", fake_urlopen), patch.object(
+        with patch.object(
+            client_module, "open_no_redirect", fake_urlopen
+        ), patch.object(
             client_module.time,
             "sleep",
             lambda _delay: None,
@@ -470,7 +644,7 @@ class SandboxSdkTests(unittest.TestCase):
             )
 
         client = SandboxClient("http://gateway.invalid")
-        with patch.object(client_module.request, "urlopen", fake_urlopen):
+        with patch.object(client_module, "open_no_redirect", fake_urlopen):
             with self.assertRaises(SandboxApiError) as raised:
                 client.health()
 
@@ -507,7 +681,9 @@ class SandboxSdkTests(unittest.TestCase):
             return FakeResponse()
 
         client = SandboxClient("http://gateway.invalid")
-        with patch.object(client_module.request, "urlopen", fake_urlopen), patch.object(
+        with patch.object(
+            client_module, "open_no_redirect", fake_urlopen
+        ), patch.object(
             client_module.time,
             "sleep",
             lambda _delay: None,
@@ -588,7 +764,9 @@ class SandboxSdkTests(unittest.TestCase):
             return FakeResponse()
 
         client = SandboxClient("http://gateway.invalid")
-        with patch.object(client_module.request, "urlopen", fake_urlopen), patch.object(
+        with patch.object(
+            client_module, "open_no_redirect", fake_urlopen
+        ), patch.object(
             client_module.time,
             "sleep",
             lambda _delay: None,
@@ -601,10 +779,13 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(sandbox.id, "tmax-task-one")
         self.assertEqual(len(payloads), 2)
         self.assertEqual(payloads[0], payloads[1])
-        self.assertEqual(
-            timeouts,
-            [client_module.DEFAULT_CREATE_TIMEOUT_SECONDS] * 2,
-        )
+        self.assertEqual(len(timeouts), 2)
+        for timeout in timeouts:
+            self.assertAlmostEqual(
+                float(timeout),
+                client_module.DEFAULT_CREATE_TIMEOUT_SECONDS,
+                places=3,
+            )
 
     def test_sync_stable_create_retries_beyond_safe_read_budget(self) -> None:
         class FakeResponse:
@@ -633,7 +814,9 @@ class SandboxSdkTests(unittest.TestCase):
             return FakeResponse()
 
         client = SandboxClient("http://gateway.invalid")
-        with patch.object(client_module.request, "urlopen", fake_urlopen), patch.object(
+        with patch.object(
+            client_module, "open_no_redirect", fake_urlopen
+        ), patch.object(
             client_module.time,
             "sleep",
             lambda _delay: None,
@@ -664,7 +847,7 @@ class SandboxSdkTests(unittest.TestCase):
             )
 
         client = SandboxClient("http://gateway.invalid")
-        with patch.object(client_module.request, "urlopen", fake_urlopen):
+        with patch.object(client_module, "open_no_redirect", fake_urlopen):
             with self.assertRaises(SandboxApiError):
                 client.start_exec("sandbox-one", ["true"])
 
@@ -733,7 +916,9 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(deleted["demand"]["prepared_builder_count"], 0)
 
     def test_async_client_lifecycle_and_exec(self) -> None:
-        async def scenario(base_url: str) -> tuple[str, int | None, list[str], int, bytes]:
+        async def scenario(
+            base_url: str,
+        ) -> tuple[str, int | None, list[str], int, bytes]:
             async with AsyncSandboxClient(base_url) as client:
                 handle = await client.create_sandbox(
                     id="async-one",
@@ -747,9 +932,13 @@ class SandboxSdkTests(unittest.TestCase):
                 )
                 downloaded = await handle.download_file("/workspace/out.txt")
                 await handle.delete()
-                return handle.id, result.exit_code, [
-                    event["stream"] for event in result.events
-                ], uploaded["size"], downloaded
+                return (
+                    handle.id,
+                    result.exit_code,
+                    [event["stream"] for event in result.events],
+                    uploaded["size"],
+                    downloaded,
+                )
 
         with running_gateway() as gateway:
             sandbox_id, exit_code, streams, size, downloaded = asyncio.run(
@@ -773,13 +962,17 @@ class SandboxSdkTests(unittest.TestCase):
                 return None
 
             async def text(self) -> str:
-                return '{"sandbox": {"spec": {"id": "timeout-one", "image": "busybox"}}}'
+                return (
+                    '{"sandbox": {"spec": {"id": "timeout-one", "image": "busybox"}}}'
+                )
 
         class FakeSession:
             def __init__(self) -> None:
                 self.timeouts: list[object] = []
 
-            def request(self, _method: object, _url: object, **kwargs: object) -> FakeResponse:
+            def request(
+                self, _method: object, _url: object, **kwargs: object
+            ) -> FakeResponse:
                 self.timeouts.append(kwargs.get("timeout"))
                 return FakeResponse()
 
@@ -801,11 +994,13 @@ class SandboxSdkTests(unittest.TestCase):
         sandbox_id, timeouts = asyncio.run(scenario())
 
         self.assertEqual(sandbox_id, "timeout-one")
-        self.assertEqual([_timeout_total(timeout) for timeout in timeouts], [7])
+        self.assertEqual(len(timeouts), 1)
+        self.assertAlmostEqual(float(_timeout_total(timeouts[0])), 7, places=3)
 
     def test_async_build_image_accepts_per_call_timeout(self) -> None:
         class FakeResponse:
             status = 200
+
             def __init__(self, body: str) -> None:
                 self.body = body
 
@@ -822,7 +1017,9 @@ class SandboxSdkTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.timeouts: list[object] = []
 
-            def request(self, _method: object, url: object, **kwargs: object) -> FakeResponse:
+            def request(
+                self, _method: object, url: object, **kwargs: object
+            ) -> FakeResponse:
                 self.timeouts.append(kwargs.get("timeout"))
                 if str(url).endswith("/v1/images/build"):
                     return FakeResponse(
@@ -852,10 +1049,30 @@ class SandboxSdkTests(unittest.TestCase):
 
         timeouts = asyncio.run(scenario())
 
+        self.assertEqual(len(timeouts), 4)
+        for timeout in timeouts[:3]:
+            self.assertGreater(float(_timeout_total(timeout)), 120)
+            self.assertLessEqual(float(_timeout_total(timeout)), 123)
+        self.assertAlmostEqual(float(_timeout_total(timeouts[3])), 11, places=3)
+
+    def test_async_client_streams_and_deduplicates_build_context(self) -> None:
+        async def scenario(base_url: str, context: str) -> tuple[dict, dict]:
+            async with AsyncSandboxClient(base_url) as client:
+                image = Image.from_dockerfile(
+                    name="async-deduplicated-context",
+                    context_path=context,
+                )
+                return await client.build_image(image), await client.build_image(image)
+
+        with docker_context() as context, running_gateway() as gateway:
+            first, second = asyncio.run(scenario(gateway.base_url, context))
+
         self.assertEqual(
-            [_timeout_total(timeout) for timeout in timeouts],
-            [123, 123, 11],
+            first["image"]["received_archive_bytes"],
+            second["image"]["received_archive_bytes"],
         )
+        self.assertGreater(first["image"]["received_archive_bytes"], 0)
+        self.assertEqual(gateway.state.build_context_puts, 1)
 
     def test_async_client_retries_ucloud_unavailable_html(self) -> None:
         class FakeResponse:
@@ -876,7 +1093,9 @@ class SandboxSdkTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.calls = 0
 
-            def request(self, _method: object, _url: object, **_kwargs: object) -> FakeResponse:
+            def request(
+                self, _method: object, _url: object, **_kwargs: object
+            ) -> FakeResponse:
                 self.calls += 1
                 if self.calls == 1:
                     return FakeResponse(
@@ -920,7 +1139,9 @@ class SandboxSdkTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.calls = 0
 
-            def request(self, _method: object, _url: object, **_kwargs: object) -> FakeResponse:
+            def request(
+                self, _method: object, _url: object, **_kwargs: object
+            ) -> FakeResponse:
                 self.calls += 1
                 if self.calls == 1:
                     return FakeResponse(
@@ -965,7 +1186,9 @@ class SandboxSdkTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.payloads: list[dict] = []
 
-            def request(self, _method: object, _url: object, **kwargs: object) -> FakeResponse:
+            def request(
+                self, _method: object, _url: object, **kwargs: object
+            ) -> FakeResponse:
                 self.payloads.append(dict(kwargs.get("json") or {}))
                 if len(self.payloads) == 1:
                     return FakeResponse(
@@ -1017,7 +1240,9 @@ class SandboxSdkTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.calls = 0
 
-            def request(self, _method: object, _url: object, **_kwargs: object) -> FakeResponse:
+            def request(
+                self, _method: object, _url: object, **_kwargs: object
+            ) -> FakeResponse:
                 self.calls += 1
                 if self.calls <= client_module.UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS:
                     return FakeResponse(
@@ -1068,7 +1293,9 @@ class SandboxSdkTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.calls = 0
 
-            def request(self, _method: object, _url: object, **_kwargs: object) -> FakeResponse:
+            def request(
+                self, _method: object, _url: object, **_kwargs: object
+            ) -> FakeResponse:
                 self.calls += 1
                 return FakeResponse()
 
@@ -1086,6 +1313,57 @@ class SandboxSdkTests(unittest.TestCase):
 
 def _timeout_total(timeout: object) -> object:
     return getattr(timeout, "total", timeout)
+
+
+class RedirectGatewayState:
+    def __init__(self) -> None:
+        self.initial_tokens: list[str] = []
+        self.redirected_hits = 0
+
+
+class RedirectGatewayHandle:
+    def __init__(self, base_url: str, state: RedirectGatewayState) -> None:
+        self.base_url = base_url
+        self.state = state
+
+
+@contextmanager
+def running_redirect_gateway() -> Iterator[RedirectGatewayHandle]:
+    state = RedirectGatewayState()
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, _format: str, *_args: object) -> None:
+            return
+
+        def do_GET(self) -> None:
+            if self.path == "/healthz":
+                state.initial_tokens.append(
+                    self.headers.get("X-UCloud-Sandbox-Token") or ""
+                )
+                self.send_response(HTTPStatus.FOUND)
+                self.send_header("Location", "/redirected")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if self.path == "/redirected":
+                state.redirected_hits += 1
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "12")
+                self.end_headers()
+                self.wfile.write(b'{"ok": true}')
+                return
+            self.send_error(HTTPStatus.NOT_FOUND)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        yield RedirectGatewayHandle(f"http://{host}:{port}", state)
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 @contextmanager
@@ -1135,6 +1413,7 @@ class FakeGatewayState:
         self.prepared_builders: dict[str, dict] = {}
         self.files: dict[tuple[str, str], bytes] = {}
         self.build_contexts: dict[str, bytes] = {}
+        self.build_context_puts = 0
         self.exec_counter = 0
         self.last_headers: dict[str, str] = {}
         self.last_payload: dict[str, object] = {}
@@ -1176,6 +1455,18 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
             with self.state.lock:
                 builds = [self.state.builds[key] for key in sorted(self.state.builds)]
             self._write_json({"builds": builds})
+            return
+        context_digest = _image_context_digest_from_path(path)
+        if context_digest is not None:
+            with self.state.lock:
+                content = self.state.build_contexts.get(context_digest)
+            if content is None:
+                self._write_json(
+                    {"error": "build context not found"},
+                    status=HTTPStatus.NOT_FOUND,
+                )
+                return
+            self._write_json({"digest": context_digest, "size": len(content)})
             return
         build_key = _image_build_key_from_path(path)
         if build_key is not None:
@@ -1245,7 +1536,9 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
             with self.state.lock:
                 content = self.state.files.get((sandbox_id, file_path or ""))
             if content is None:
-                self._write_json({"error": "file not found"}, status=HTTPStatus.NOT_FOUND)
+                self._write_json(
+                    {"error": "file not found"}, status=HTTPStatus.NOT_FOUND
+                )
                 return
             self._write_bytes(
                 content,
@@ -1281,7 +1574,7 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
                         "host": "127.0.0.1",
                         "port": 22000,
                         "user": "sandbox",
-                    }
+                    },
                 }
             )
             return
@@ -1488,6 +1781,7 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
             with self.state.lock:
                 deduplicated = context_digest in self.state.build_contexts
                 self.state.build_contexts[context_digest] = content
+                self.state.build_context_puts += 1
             self._write_json(
                 {
                     "deduplicated": deduplicated,
@@ -1533,17 +1827,13 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
         if prepare_id is not None:
             with self.state.lock:
                 deleted = self.state.prepared.pop(prepare_id, None)
-            self._write_json(
-                {"ok": True, "deleted": deleted, "demand": self._demand()}
-            )
+            self._write_json({"ok": True, "deleted": deleted, "demand": self._demand()})
             return
         builder_prepare_id = _builder_prepare_id_from_path(path)
         if builder_prepare_id is not None:
             with self.state.lock:
                 deleted = self.state.prepared_builders.pop(builder_prepare_id, None)
-            self._write_json(
-                {"ok": True, "deleted": deleted, "demand": self._demand()}
-            )
+            self._write_json({"ok": True, "deleted": deleted, "demand": self._demand()})
             return
         self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
@@ -1602,7 +1892,9 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
         total = {"vcpu": 0.0, "memory_mb": 0, "disk_mb": 0}
         for item in prepared:
             total = _add_resources(total, item["total_resources"])
-        prepared_builder_count = sum(int(item.get("count") or 0) for item in prepared_builders)
+        prepared_builder_count = sum(
+            int(item.get("count") or 0) for item in prepared_builders
+        )
         return {
             "pending_resources": {"vcpu": 0.0, "memory_mb": 0, "disk_mb": 0},
             "prepared_resources": total,
@@ -1619,7 +1911,7 @@ def _sandbox_id_from_path(path: str) -> str | None:
     prefix = "/v1/sandboxes/"
     if not path.startswith(prefix):
         return None
-    rest = path[len(prefix):]
+    rest = path[len(prefix) :]
     if not rest:
         return None
     return unquote(rest.split("/", 1)[0])
@@ -1644,7 +1936,7 @@ def _exec_id_from_path(path: str) -> str | None:
     prefix = "/v1/exec/"
     if not path.startswith(prefix):
         return None
-    rest = path[len(prefix):]
+    rest = path[len(prefix) :]
     if not rest:
         return None
     return unquote(rest.split("/", 1)[0])
@@ -1654,7 +1946,7 @@ def _image_build_key_from_path(path: str) -> str | None:
     prefix = "/v1/images/builds/"
     if not path.startswith(prefix):
         return None
-    rest = path[len(prefix):]
+    rest = path[len(prefix) :]
     if not rest:
         return None
     return unquote(rest.split("/", 1)[0])
@@ -1664,7 +1956,7 @@ def _prepare_id_from_path(path: str) -> str | None:
     prefix = "/v1/capacity/prepare/"
     if not path.startswith(prefix):
         return None
-    rest = path[len(prefix):]
+    rest = path[len(prefix) :]
     if not rest:
         return None
     return unquote(rest.split("/", 1)[0])
@@ -1674,7 +1966,7 @@ def _builder_prepare_id_from_path(path: str) -> str | None:
     prefix = "/v1/builders/prepare/"
     if not path.startswith(prefix):
         return None
-    rest = path[len(prefix):]
+    rest = path[len(prefix) :]
     if not rest:
         return None
     return unquote(rest.split("/", 1)[0])

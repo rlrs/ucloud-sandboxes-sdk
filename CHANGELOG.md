@@ -13,3 +13,7 @@
   resource mapping alternatives, and response-key fallbacks.
 - Made interrupted Inspect cleanup close the original async client while
   preserving the inspected sandbox.
+- Bounded request and response bodies, disabled redirects, enforced contiguous
+  exec event sequences, and carried one deadline across retries.
+- Streamed and deduplicated deterministic build contexts, fenced relay response
+  identities, and made Inspect cleanup and ambiguous build recovery explicit.

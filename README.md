@@ -203,8 +203,8 @@ tunnel = HttpTunnelConfig(
 
 The tunnel preserves methods, percent-encoded paths, query strings, headers,
 status codes, and binary request/response bodies. This first implementation is
-buffered HTTP with a 32 MiB body limit; WebSockets, streaming responses, and raw
-TCP tunnels are not included.
+buffered HTTP with a 16 MiB raw body limit; WebSockets, streaming responses, and
+raw TCP tunnels are not included.
 
 ## Prepared Capacity
 
@@ -281,8 +281,9 @@ sandbox = client.create_sandbox(
 ```
 
 `Image.from_dockerfile(...)` describes a Docker build. `client.build_image(...)`
-archives `context_path`, uploads it by SHA-256 digest, submits a tracked build
-that references the immutable archive, and polls until it succeeds or fails.
+archives `context_path` deterministically, probes the SHA-256 digest, streams an
+upload only when the exact archive is absent, submits a tracked build that
+references the immutable archive, and polls until it succeeds or fails.
 The same lower-level flow is available as `submit_image_build(...)`,
 `get_image_build(...)`, `list_image_builds()`, and `wait_for_image_build(...)`.
 
