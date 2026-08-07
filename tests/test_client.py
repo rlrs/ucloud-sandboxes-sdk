@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 import io
+import hashlib
 import json
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -19,13 +20,10 @@ from urllib.parse import parse_qs, unquote, urlparse
 import ucloud_sandboxes_sdk.client as client_module
 from ucloud_sandboxes_sdk import (
     AsyncSandboxClient,
-    AsyncSandboxHandle,
     Image,
     SandboxApiError,
     SandboxClient,
     SandboxFilesystemSpec,
-    SandboxForkProtocolSpec,
-    SandboxForkSpec,
     SandboxSecuritySpec,
     SandboxSpec,
     SandboxSshSpec,
@@ -35,20 +33,31 @@ from ucloud_sandboxes_sdk import (
 
 class SandboxSdkTests(unittest.TestCase):
     def test_managed_build_payload_omits_registry_coordinates(self) -> None:
-        image = Image.from_dockerfile(
-            image_id="managed-image",
-            context_path="/tmp/context",
-        )
-
-        payload = client_module._image_build_payload(
-            image,
-            upload_context=False,
-        )
+        with docker_context() as context:
+            payload, archive = client_module._image_build_request(
+                Image.from_dockerfile(
+                    name="managed-image",
+                    context_path=context,
+                )
+            )
+            repeated_payload, repeated_archive = client_module._image_build_request(
+                Image.from_dockerfile(
+                    name="managed-image",
+                    context_path=context,
+                )
+            )
 
         self.assertEqual(payload["id"], "managed-image")
         self.assertNotIn("tag", payload)
+        self.assertEqual(payload["context_archive_size"], len(archive))
         self.assertEqual(
-            Image.from_gateway_id("managed-image").to_sandbox_image(),
+            payload["context_archive_digest"],
+            f"sha256:{hashlib.sha256(archive).hexdigest()}",
+        )
+        self.assertEqual(repeated_payload, payload)
+        self.assertEqual(repeated_archive, archive)
+        self.assertEqual(
+            Image.from_name("managed-image").to_sandbox_image(),
             "managed-image",
         )
 
@@ -108,13 +117,13 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(deleted["deleted"]["spec"]["id"], "sdk-one")
 
     def test_sync_client_image_cache_methods(self) -> None:
-        with running_gateway() as gateway:
+        with docker_context() as context, running_gateway() as gateway:
             client = SandboxClient(gateway.base_url)
 
             built = client.build_image(
                 Image.from_dockerfile(
-                    image_id="python-base",
-                    context_path="/tmp/context",
+                    name="python-base",
+                    context_path=context,
                 )
             )
             pulled = client.pull_image(
@@ -186,38 +195,6 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(payload["filesystem"]["tmpfs_mb"], 32)
         self.assertTrue(payload["ssh"]["enabled"])
         self.assertEqual(payload["ssh"]["user"], "root")
-
-    def test_sandbox_spec_only_sends_fork_fields_when_enabled(self) -> None:
-        ordinary = SandboxSpec(
-            id="ordinary",
-            image=Image.from_registry("busybox"),
-        ).to_dict()
-        protocol = SandboxForkProtocolSpec(
-            prepare_command=("fork-agent", "prepare"),
-            ready_command=("fork-agent", "ready"),
-            timeout_seconds=20,
-        )
-        forkable = SandboxSpec(
-            id="forkable",
-            image=Image.from_registry("busybox"),
-            memory_mb=128,
-            disk_mb=64,
-            forkable=True,
-            fork_protocol=protocol,
-        ).to_dict()
-
-        self.assertNotIn("forkable", ordinary)
-        self.assertNotIn("fork_protocol", ordinary)
-        self.assertTrue(forkable["forkable"])
-        self.assertEqual(
-            forkable["fork_protocol"],
-            {
-                "version": "agent-v1",
-                "prepare_command": ["fork-agent", "prepare"],
-                "ready_command": ["fork-agent", "ready"],
-                "timeout_seconds": 20,
-            },
-        )
 
     def test_sandbox_spec_sends_parkable_only_when_enabled(self) -> None:
         ordinary = SandboxSpec(
@@ -298,76 +275,6 @@ class SandboxSdkTests(unittest.TestCase):
 
         self.assertEqual(result, ("running", b"harness", "signaled"))
 
-    def test_sync_client_forks_single_and_batch_from_handle(self) -> None:
-        protocol = SandboxForkProtocolSpec(
-            prepare_command=("fork-agent", "prepare"),
-            ready_command=("fork-agent", "ready"),
-        )
-        with running_gateway() as gateway:
-            client = SandboxClient(gateway.base_url)
-            source = client.create_sandbox(
-                SandboxSpec(
-                    id="fork-source",
-                    image=Image.from_registry("busybox"),
-                    env={"SOURCE": "yes"},
-                    labels={"tree": "root"},
-                    memory_mb=128,
-                    cpus=0.5,
-                    disk_mb=64,
-                    forkable=True,
-                    fork_protocol=protocol,
-                )
-            )
-
-            child = source.fork(
-                id="fork-child",
-                env={"BRANCH": "single"},
-                labels={"leaf": "one"},
-                ttl_seconds=300,
-            )
-            batch = source.fork_many(
-                (
-                    SandboxForkSpec(id="fork-child-a", env={"BRANCH": "a"}),
-                    SandboxForkSpec(id="fork-child-b", cpus=0.25),
-                )
-            )
-
-        self.assertEqual(child.id, "fork-child")
-        self.assertEqual(child.record["creation_kind"], "restore")
-        self.assertEqual(child.record["spec"]["env"]["SOURCE"], "yes")
-        self.assertEqual(child.record["spec"]["env"]["BRANCH"], "single")
-        self.assertEqual(child.record["spec"]["labels"]["leaf"], "one")
-        self.assertEqual(child.fork_metadata["checkpoint_id"], "fork-set-sdk-test")
-        self.assertTrue(child.create_response["intent_persisted"])
-        self.assertEqual([item.id for item in batch], ["fork-child-a", "fork-child-b"])
-        self.assertEqual(
-            {item.fork_metadata["checkpoint_id"] for item in batch},
-            {"fork-set-sdk-test"},
-        )
-        self.assertEqual(batch[1].record["spec"]["cpus"], 0.25)
-
-    def test_sync_fork_error_exposes_durable_intent_state(self) -> None:
-        with running_gateway() as gateway:
-            client = SandboxClient(gateway.base_url)
-            source = client.create_sandbox(
-                id="fork-error-source",
-                image=Image.from_registry("busybox"),
-                memory_mb=128,
-                disk_mb=64,
-                forkable=True,
-                fork_protocol=SandboxForkProtocolSpec(
-                    prepare_command=("fork-agent", "prepare"),
-                    ready_command=("fork-agent", "ready"),
-                ),
-            )
-            with self.assertRaises(SandboxApiError) as raised:
-                source.fork(id="fork-error")
-
-        self.assertEqual(raised.exception.status_code, 409)
-        self.assertTrue(raised.exception.retryable)
-        self.assertTrue(raised.exception.intent_persisted)
-        self.assertEqual(raised.exception.intents[0]["sandbox_id"], "fork-error")
-
     def test_sync_create_sandbox_accepts_per_call_request_timeout(self) -> None:
         class FakeResponse:
             status = 200
@@ -404,53 +311,6 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(sandbox.id, "timeout-one")
         self.assertEqual(captured_timeouts, [7])
 
-    def test_sync_fork_uses_long_default_request_timeout(self) -> None:
-        class FakeResponse:
-            def __enter__(self) -> "FakeResponse":
-                return self
-
-            def __exit__(self, *args: object) -> None:
-                return None
-
-            def read(self) -> bytes:
-                return json.dumps(
-                    {
-                        "intent_persisted": True,
-                        "sandbox": {
-                            "id": "timeout-child",
-                            "spec": {"id": "timeout-child"},
-                        },
-                        "fork": {
-                            "sandbox_id": "timeout-child",
-                            "checkpoint_id": "fork-timeout",
-                            "restored": True,
-                        },
-                    }
-                ).encode()
-
-        captured_timeouts: list[object] = []
-
-        def fake_urlopen(req: object, timeout: object = None) -> FakeResponse:
-            captured_timeouts.append(timeout)
-            return FakeResponse()
-
-        client = SandboxClient("http://gateway.invalid", timeout_seconds=11)
-        with patch.object(client_module.request, "urlopen", fake_urlopen):
-            child = client.fork_sandbox("source", id="timeout-child")
-
-        self.assertEqual(child.id, "timeout-child")
-        self.assertEqual(captured_timeouts, [3600.0])
-
-    def test_fork_batch_requires_unique_bounded_targets(self) -> None:
-        client = SandboxClient("http://gateway.invalid")
-        with self.assertRaisesRegex(ValueError, "batch size"):
-            client.fork_sandboxes("source", ())
-        with self.assertRaisesRegex(ValueError, "must be unique"):
-            client.fork_sandboxes(
-                "source",
-                (SandboxForkSpec(id="same"), SandboxForkSpec(id="same")),
-            )
-
     def test_sync_client_uploads_local_build_context(self) -> None:
         with TemporaryDirectory() as raw_dir:
             context = Path(raw_dir) / "context"
@@ -466,13 +326,19 @@ class SandboxSdkTests(unittest.TestCase):
                         context_path=str(context),
                     )
                 )
+                submitted = dict(gateway.state.last_payload)
+                uploaded = dict(gateway.state.build_contexts)
 
         self.assertEqual(built["image"]["id"], "local-context")
+        self.assertEqual(built["exit_code"], 0)
         self.assertEqual(built["image"]["received_context_path"], ".")
         self.assertGreater(built["image"]["received_archive_bytes"], 0)
+        digest = submitted["context_archive_digest"]
+        self.assertEqual(submitted["context_archive_format"], "tar.gz")
+        self.assertEqual(submitted["context_archive_size"], len(uploaded[digest]))
 
     def test_sync_client_can_submit_and_poll_image_builds(self) -> None:
-        with running_gateway() as gateway:
+        with docker_context() as context, running_gateway() as gateway:
             client = SandboxClient(gateway.base_url)
             statuses: list[str] = []
 
@@ -480,7 +346,7 @@ class SandboxSdkTests(unittest.TestCase):
                 Image.from_dockerfile(
                     name="python-base",
                     tag="gateway-private-host:5000/python-base:latest",
-                    context_path="/tmp/context",
+                    context_path=context,
                 )
             )
             listed = client.list_image_builds()
@@ -523,20 +389,22 @@ class SandboxSdkTests(unittest.TestCase):
             )
 
         client = SandboxClient("http://gateway.invalid", timeout_seconds=11)
-        with patch.object(client_module.request, "urlopen", fake_urlopen):
+        with docker_context() as context, patch.object(
+            client_module.request, "urlopen", fake_urlopen
+        ):
             client.build_image(
                 Image.from_dockerfile(
                     name="slow-build",
                     tag="registry.invalid/slow-build:latest",
-                    context_path="/tmp/context",
+                    context_path=context,
                 ),
                 timeout_seconds=123,
             )
 
-        self.assertEqual(captured_timeouts, [123, 11])
+        self.assertEqual(captured_timeouts, [123, 123, 11])
 
     def test_sync_client_surfaces_api_errors(self) -> None:
-        with running_gateway() as gateway:
+        with docker_context() as context, running_gateway() as gateway:
             client = SandboxClient(gateway.base_url)
 
             with self.assertRaises(SandboxApiError) as raised:
@@ -544,7 +412,7 @@ class SandboxSdkTests(unittest.TestCase):
                     Image.from_dockerfile(
                         name="denied",
                         tag="local/denied:latest",
-                        context_path="/tmp/context",
+                        context_path=context,
                     )
                 )
 
@@ -894,47 +762,6 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(size, 12)
         self.assertEqual(downloaded, b"async bytes\n")
 
-    def test_async_client_forks_single_and_batch_from_handle(self) -> None:
-        async def scenario(
-            base_url: str,
-        ) -> tuple[AsyncSandboxHandle, tuple[AsyncSandboxHandle, ...]]:
-            async with AsyncSandboxClient(base_url) as client:
-                source = await client.create_sandbox(
-                    id="async-fork-source",
-                    image=Image.from_registry("busybox"),
-                    memory_mb=128,
-                    disk_mb=64,
-                    forkable=True,
-                    fork_protocol=SandboxForkProtocolSpec(
-                        prepare_command=("fork-agent", "prepare"),
-                        ready_command=("fork-agent", "ready"),
-                    ),
-                )
-                child = await source.fork(
-                    SandboxForkSpec(
-                        id="async-fork-child",
-                        env={"BRANCH": "single"},
-                    )
-                )
-                batch = await source.fork_many(
-                    (
-                        SandboxForkSpec(id="async-fork-child-a"),
-                        SandboxForkSpec(id="async-fork-child-b"),
-                    )
-                )
-                return child, batch
-
-        with running_gateway() as gateway:
-            child, batch = asyncio.run(scenario(gateway.base_url))
-
-        self.assertEqual(child.id, "async-fork-child")
-        self.assertEqual(child.record["spec"]["env"]["BRANCH"], "single")
-        self.assertTrue(child.fork_metadata["restored"])
-        self.assertEqual(
-            [item.id for item in batch],
-            ["async-fork-child-a", "async-fork-child-b"],
-        )
-
     def test_async_create_sandbox_accepts_per_call_request_timeout(self) -> None:
         class FakeResponse:
             status = 200
@@ -976,61 +803,6 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(sandbox_id, "timeout-one")
         self.assertEqual([_timeout_total(timeout) for timeout in timeouts], [7])
 
-    def test_async_fork_uses_long_default_request_timeout(self) -> None:
-        class FakeResponse:
-            status = 201
-
-            async def __aenter__(self) -> "FakeResponse":
-                return self
-
-            async def __aexit__(self, *args: object) -> None:
-                return None
-
-            async def text(self) -> str:
-                return json.dumps(
-                    {
-                        "intent_persisted": True,
-                        "sandbox": {
-                            "id": "async-timeout-child",
-                            "spec": {"id": "async-timeout-child"},
-                        },
-                        "fork": {
-                            "sandbox_id": "async-timeout-child",
-                            "checkpoint_id": "fork-timeout",
-                            "restored": True,
-                        },
-                    }
-                )
-
-        class FakeSession:
-            def __init__(self) -> None:
-                self.timeouts: list[object] = []
-
-            def request(self, _method: object, _url: object, **kwargs: object) -> FakeResponse:
-                self.timeouts.append(kwargs.get("timeout"))
-                return FakeResponse()
-
-        async def scenario() -> tuple[str, list[object]]:
-            session = FakeSession()
-            client = AsyncSandboxClient(
-                "http://gateway.invalid",
-                session=session,
-                timeout_seconds=11,
-            )
-            child = await client.fork_sandbox(
-                "source",
-                id="async-timeout-child",
-            )
-            return child.id, session.timeouts
-
-        sandbox_id, timeouts = asyncio.run(scenario())
-
-        self.assertEqual(sandbox_id, "async-timeout-child")
-        self.assertEqual(
-            [_timeout_total(timeout) for timeout in timeouts],
-            [3600.0],
-        )
-
     def test_async_build_image_accepts_per_call_timeout(self) -> None:
         class FakeResponse:
             status = 200
@@ -1067,19 +839,23 @@ class SandboxSdkTests(unittest.TestCase):
                 session=session,
                 timeout_seconds=11,
             )
-            await client.build_image(
-                Image.from_dockerfile(
-                    name="slow-build",
-                    tag="registry.invalid/slow-build:latest",
-                    context_path="/tmp/context",
-                ),
-                timeout_seconds=123,
-            )
+            with docker_context() as context:
+                await client.build_image(
+                    Image.from_dockerfile(
+                        name="slow-build",
+                        tag="registry.invalid/slow-build:latest",
+                        context_path=context,
+                    ),
+                    timeout_seconds=123,
+                )
             return session.timeouts
 
         timeouts = asyncio.run(scenario())
 
-        self.assertEqual([_timeout_total(timeout) for timeout in timeouts], [123, 11])
+        self.assertEqual(
+            [_timeout_total(timeout) for timeout in timeouts],
+            [123, 123, 11],
+        )
 
     def test_async_client_retries_ucloud_unavailable_html(self) -> None:
         class FakeResponse:
@@ -1331,6 +1107,14 @@ def running_gateway() -> Iterator["GatewayHandle"]:
         server.server_close()
 
 
+@contextmanager
+def docker_context() -> Iterator[str]:
+    with TemporaryDirectory() as raw_dir:
+        context = Path(raw_dir)
+        (context / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+        yield str(context)
+
+
 class GatewayHandle:
     def __init__(self, *, base_url: str, state: "FakeGatewayState") -> None:
         self.base_url = base_url
@@ -1350,6 +1134,7 @@ class FakeGatewayState:
         self.prepared: dict[str, dict] = {}
         self.prepared_builders: dict[str, dict] = {}
         self.files: dict[tuple[str, str], bytes] = {}
+        self.build_contexts: dict[str, bytes] = {}
         self.exec_counter = 0
         self.last_headers: dict[str, str] = {}
         self.last_payload: dict[str, object] = {}
@@ -1491,6 +1276,7 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
         if sandbox_id is not None and path.endswith("/ssh"):
             self._write_json(
                 {
+                    "sandbox_id": sandbox_id,
                     "ssh": {
                         "host": "127.0.0.1",
                         "port": 22000,
@@ -1514,98 +1300,6 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
                 self.state.sandboxes[sandbox_id] = record
             self._write_json({"sandbox": record}, status=HTTPStatus.CREATED)
             return
-        fork_source_id = _fork_source_id_from_path(path)
-        if fork_source_id is not None:
-            batch = isinstance(payload.get("sandboxes"), list)
-            raw_targets = (
-                payload.get("sandboxes")
-                if batch
-                else [payload.get("sandbox")]
-            )
-            targets = (
-                [item for item in raw_targets if isinstance(item, dict)]
-                if isinstance(raw_targets, list)
-                else []
-            )
-            if len(targets) != len(raw_targets or []):
-                self._write_json(
-                    {"error": "invalid fork targets"},
-                    status=HTTPStatus.BAD_REQUEST,
-                )
-                return
-            if any(item.get("id") == "fork-error" for item in targets):
-                self._write_json(
-                    {
-                        "error": "fork restore outcome is ambiguous",
-                        "intent_persisted": True,
-                        "retryable": True,
-                        "intents": [
-                            {
-                                "sandbox_id": str(item.get("id") or ""),
-                                "intent_persisted": True,
-                            }
-                            for item in targets
-                        ],
-                    },
-                    status=HTTPStatus.CONFLICT,
-                )
-                return
-            with self.state.lock:
-                source = self.state.sandboxes.get(fork_source_id)
-            if not isinstance(source, dict):
-                self._write_json(
-                    {"error": "sandbox route not found"},
-                    status=HTTPStatus.NOT_FOUND,
-                )
-                return
-            source_spec = source.get("spec")
-            if not isinstance(source_spec, dict):
-                self._write_json(
-                    {"error": "source spec missing"},
-                    status=HTTPStatus.CONFLICT,
-                )
-                return
-            checkpoint_id = "fork-set-sdk-test"
-            records: list[dict] = []
-            forks: list[dict] = []
-            for target in targets:
-                sandbox_id = str(target.get("id") or "")
-                spec = dict(source_spec)
-                spec["id"] = sandbox_id
-                for key in ("ttl_seconds", "memory_mb", "cpus"):
-                    if target.get(key) is not None:
-                        spec[key] = target[key]
-                for key in ("env", "labels"):
-                    merged = dict(source_spec.get(key) or {})
-                    if isinstance(target.get(key), dict):
-                        merged.update(target[key])
-                    spec[key] = merged
-                record = {
-                    "id": sandbox_id,
-                    "sandbox_id": sandbox_id,
-                    "spec": spec,
-                    "state": "running",
-                    "creation_kind": "restore",
-                    "source_sandbox_id": fork_source_id,
-                    "checkpoint_id": checkpoint_id,
-                }
-                fork = {
-                    "sandbox_id": sandbox_id,
-                    "checkpoint_id": checkpoint_id,
-                    "restored": True,
-                    "commands": [],
-                }
-                records.append(record)
-                forks.append(fork)
-                with self.state.lock:
-                    self.state.sandboxes[sandbox_id] = record
-            response = {"intent_persisted": True}
-            if batch:
-                response.update({"sandboxes": records, "forks": forks})
-            else:
-                response.update({"sandbox": records[0], "fork": forks[0]})
-            self._write_json(response, status=HTTPStatus.CREATED)
-            return
         if path == "/v1/images/build":
             if payload.get("id") == "denied":
                 self._write_json(
@@ -1613,12 +1307,14 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
                     status=HTTPStatus.FORBIDDEN,
                 )
                 return
-            archive = payload.get("context_archive_base64")
+            digest = str(payload.get("context_archive_digest") or "")
+            with self.state.lock:
+                archive = self.state.build_contexts.get(digest, b"")
             image = {
                 "id": str(payload.get("id") or payload.get("tag") or "image"),
                 "tag": str(payload.get("tag") or ""),
                 "received_context_path": payload.get("context_path"),
-                "received_archive_bytes": len(archive or ""),
+                "received_archive_bytes": len(archive),
                 "received_push": bool(payload.get("push")),
             }
             build = {
@@ -1779,6 +1475,28 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
         self._record_headers()
         parsed = urlparse(self.path)
         path = parsed.path
+        context_digest = _image_context_digest_from_path(path)
+        if context_digest is not None:
+            content = self._read_body()
+            actual_digest = f"sha256:{hashlib.sha256(content).hexdigest()}"
+            if context_digest != actual_digest:
+                self._write_json(
+                    {"error": "build context digest mismatch"},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
+            with self.state.lock:
+                deduplicated = context_digest in self.state.build_contexts
+                self.state.build_contexts[context_digest] = content
+            self._write_json(
+                {
+                    "deduplicated": deduplicated,
+                    "digest": context_digest,
+                    "size": len(content),
+                },
+                status=HTTPStatus.OK if deduplicated else HTTPStatus.CREATED,
+            )
+            return
         sandbox_id = _sandbox_id_from_path(path)
         if sandbox_id is not None and path.endswith("/files"):
             file_path = _file_path(parsed)
@@ -1794,7 +1512,7 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
             self._write_json(
                 {
                     "ok": True,
-                    "sandboxId": sandbox_id,
+                    "sandbox_id": sandbox_id,
                     "path": file_path,
                     "size": len(content),
                 }
@@ -1922,17 +1640,6 @@ def _job_path(path: str) -> tuple[str, str, str] | None:
     return None
 
 
-def _fork_source_id_from_path(path: str) -> str | None:
-    prefix = "/v1/sandboxes/"
-    suffix = "/forks"
-    if not path.startswith(prefix) or not path.endswith(suffix):
-        return None
-    encoded = path[len(prefix) : -len(suffix)]
-    if not encoded or "/" in encoded:
-        return None
-    return unquote(encoded)
-
-
 def _exec_id_from_path(path: str) -> str | None:
     prefix = "/v1/exec/"
     if not path.startswith(prefix):
@@ -1973,6 +1680,14 @@ def _builder_prepare_id_from_path(path: str) -> str | None:
     return unquote(rest.split("/", 1)[0])
 
 
+def _image_context_digest_from_path(path: str) -> str | None:
+    prefix = "/v1/image-contexts/"
+    if not path.startswith(prefix):
+        return None
+    digest = unquote(path[len(prefix) :])
+    return digest or None
+
+
 def _file_path(parsed) -> str | None:
     raw = parse_qs(parsed.query).get("path") or [""]
     value = raw[0].strip()
@@ -1980,20 +1695,10 @@ def _file_path(parsed) -> str | None:
 
 
 def _resources_from_prepare(payload: dict) -> dict:
-    nested = payload.get("resources")
-    resources = dict(nested) if isinstance(nested, dict) else {}
-    if payload.get("cpus") is not None:
-        resources["vcpu"] = payload.get("cpus")
-    if payload.get("vcpu") is not None:
-        resources["vcpu"] = payload.get("vcpu")
-    if payload.get("memory_mb") is not None:
-        resources["memory_mb"] = payload.get("memory_mb")
-    if payload.get("disk_mb") is not None:
-        resources["disk_mb"] = payload.get("disk_mb")
     return {
-        "vcpu": float(resources.get("vcpu") or 0.0),
-        "memory_mb": int(resources.get("memory_mb") or 0),
-        "disk_mb": int(resources.get("disk_mb") or 0),
+        "vcpu": float(payload.get("cpus") or 0.0),
+        "memory_mb": int(payload.get("memory_mb") or 0),
+        "disk_mb": int(payload.get("disk_mb") or 0),
     }
 
 

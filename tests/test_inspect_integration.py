@@ -46,6 +46,39 @@ class _CachedBuildClient(_BuildCaptureClient):
 
 @unittest.skipUnless(INSPECT_AVAILABLE, "inspect-ai is not installed")
 class InspectIntegrationTests(unittest.TestCase):
+    def test_interrupted_sample_cleanup_closes_original_client_without_deleting(self) -> None:
+        from ucloud_sandboxes_sdk.integrations import inspect as inspect_integration
+
+        class FakeHandle:
+            def __init__(self) -> None:
+                self.deleted = False
+
+            async def delete(self) -> None:
+                self.deleted = True
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.closed = False
+
+            async def close(self) -> None:
+                self.closed = True
+
+        handle = FakeHandle()
+        client = FakeClient()
+        sandbox = inspect_integration.UCloudSandboxEnvironment(handle, client)
+
+        asyncio.run(
+            inspect_integration.UCloudSandboxEnvironment.sample_cleanup(
+                "task",
+                None,
+                {"default": sandbox},
+                interrupted=True,
+            )
+        )
+
+        self.assertFalse(handle.deleted)
+        self.assertTrue(client.closed)
+
     def test_settings_from_env_parses_security_profile(self) -> None:
         from ucloud_sandboxes_sdk.integrations import inspect as inspect_integration
 

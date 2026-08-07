@@ -76,80 +76,6 @@ its filesystem and process state remain intact. Parking is opt-in because its
 disk admission includes the complete memory backing required by the sandbox's
 hard limit.
 
-## Live Forking
-
-Forkable workloads must implement the gateway's `agent-v1` quiesce/readiness
-protocol in their initial process tree. The SDK describes the hook commands;
-the commands themselves must be present in the image and coordinate with the
-long-running agent process:
-
-```python
-from ucloud_sandboxes_sdk import (
-    Image,
-    SandboxClient,
-    SandboxForkProtocolSpec,
-    SandboxForkSpec,
-    SandboxSpec,
-)
-
-client = SandboxClient(
-    "https://app-sandboxes.cloud.sdu.dk",
-    api_token="<token>",
-)
-source = client.create_sandbox(
-    SandboxSpec(
-        id="agent-source",
-        image=Image.from_registry("registry.example.org/agent:latest"),
-        command=["/usr/local/bin/agent"],
-        memory_mb=2048,
-        cpus=1,
-        disk_mb=10240,
-        network="bridge",
-        forkable=True,
-        fork_protocol=SandboxForkProtocolSpec(
-            prepare_command=("/usr/local/bin/fork-agent", "prepare"),
-            ready_command=("/usr/local/bin/fork-agent", "ready"),
-            timeout_seconds=30,
-        ),
-    )
-)
-
-child = source.fork(
-    id="agent-child",
-    env={"AGENT_BRANCH": "child"},
-    ttl_seconds=900,
-)
-assert child.fork_metadata["restored"] is True
-
-children = source.fork_many(
-    (
-        SandboxForkSpec(id="agent-child-a", env={"AGENT_BRANCH": "a"}),
-        SandboxForkSpec(id="agent-child-b", env={"AGENT_BRANCH": "b"}),
-    )
-)
-```
-
-The gateway appends `<checkpoint-id> <nonce> <role>` to each hook command. The
-prepare hook must print `UCLOUD_FORK_PREPARED=<nonce>` after the initial process
-has quiesced and opened `/proc/gvisor/checkpoint`. Ready hooks must print
-`UCLOUD_FORK_READY=<nonce>:<role>` only after the source resumed or the child
-read its new identity from `/proc/gvisor/spec_environ` and rekeyed inherited
-state. Forkable sources require explicit memory and disk limits and cannot use
-the direct SSH option.
-
-The corresponding client methods are `fork_sandbox()` and
-`fork_sandboxes()`; async clients and handles expose the same operations. A
-returned child handle keeps the normal sandbox record in `record`, its
-per-child checkpoint result in `fork_metadata`, and the complete gateway
-response in `create_response`.
-
-Fork calls use a one-hour request timeout by default so the maximum 64-child
-fan-out can complete within the gateway's bounded restore window. Override it
-with `timeout_seconds`. If a fork raises `SandboxApiError`, inspect
-`intent_persisted`, `intents`, and `retryable`. Replay the exact same request
-when intent state is `True` or unknown; do not submit a different child id while
-the original outcome is ambiguous.
-
 ## Files
 
 Upload and download files as raw bytes through the gateway:
@@ -254,7 +180,7 @@ relay = RelayWorkerClient(
     "https://relay.example.org",
     worker_token="<worker-relay-token>",
 )
-relay.register_tunnel("dev-api")
+relay.register_rollout("dev-api")
 
 while True:
     for request in relay.poll("dev-api", timeout_seconds=30).requests:
@@ -292,7 +218,7 @@ client.prepare_capacity(
     cpus=1,
     memory_mb=2048,
     disk_mb=10240,
-    image=Image.from_gateway_id("python-base"),
+    image=Image.from_name("python-base"),
     parkable=True,
     ttl_seconds=900,
 )
@@ -333,7 +259,7 @@ registry hostname or port.
 
 ```python
 image = Image.from_dockerfile(
-    image_id="python-base",
+    name="python-base",
     context_path="./docker/python-base",
 )
 client.build_image(
@@ -346,7 +272,7 @@ client.build_image(
 )
 
 sandbox = client.create_sandbox(
-    image=Image.from_gateway_id("python-base"),
+    image=Image.from_name("python-base"),
     command=["python", "--version"],
     cpus=1,
     memory_mb=2048,
@@ -355,23 +281,10 @@ sandbox = client.create_sandbox(
 ```
 
 `Image.from_dockerfile(...)` describes a Docker build. `client.build_image(...)`
-uploads `context_path` as a compressed tarball by default, submits a tracked
-build to the gateway, and polls build status until it succeeds or fails. The
-same lower-level flow is available as `submit_image_build(...)`,
-`get_image_build(...)`, `list_image_builds()`, and
-`wait_for_image_build(...)`. If the build context already exists on the gateway
-or builder VM, pass `upload_context=False`:
-
-```python
-client.build_image(
-    Image.from_dockerfile(
-        image_id="preloaded-context",
-        context_path="/work/ucloud-sandboxes/build-contexts/preloaded-context",
-    ),
-    upload_context=False,
-    timeout_seconds=3000,
-)
-```
+archives `context_path`, uploads it by SHA-256 digest, submits a tracked build
+that references the immutable archive, and polls until it succeeds or fails.
+The same lower-level flow is available as `submit_image_build(...)`,
+`get_image_build(...)`, `list_image_builds()`, and `wait_for_image_build(...)`.
 
 Managed builds are always pushed by the gateway because the builder and sandbox
 node Docker daemons are different machines. `tag` remains optional for explicit
@@ -387,7 +300,7 @@ After a managed build, create sandboxes with the recorded image id:
 
 ```python
 client.create_sandbox(
-    image=Image.from_gateway_id("python-base"),
+    image=Image.from_name("python-base"),
     cpus=1,
     memory_mb=2048,
     disk_mb=10240,
@@ -475,8 +388,8 @@ file, or a Dockerfile. Compose `image`, `build.context`, `build.dockerfile`,
 overrides Compose networking when set. Dockerfile configs and single-service
 Compose builds call `build_image`; local build contexts are uploaded to the
 gateway. Generated build image ids are deterministic over the Dockerfile,
-build context, build args, explicit Compose image value, and SDK compatibility
-version. Registry coordinates are assigned by the gateway and never enter the
+build context, build args, explicit Compose image value, and build-cache schema.
+Registry coordinates are assigned by the gateway and never enter the
 Inspect request. Reusing an unchanged context across samples or runs reuses a
 pushed gateway image record; if another client already has the same build
 running, the provider waits for that build instead of submitting another copy

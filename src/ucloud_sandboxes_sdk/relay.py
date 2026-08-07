@@ -32,14 +32,11 @@ class ModelRelayConfig:
     relay_url: str
     rollout_id: str
     api_key: str = "intercepted"
-    path_scoped_base_url: bool = True
 
     @property
     def openai_base_url(self) -> str:
         base = self.relay_url.rstrip("/")
-        if self.path_scoped_base_url:
-            return f"{base}/rollouts/{quote(self.rollout_id, safe='')}/v1"
-        return f"{base}/v1"
+        return f"{base}/rollouts/{quote(self.rollout_id, safe='')}/v1"
 
     def env(self) -> dict[str, str]:
         return {
@@ -54,20 +51,18 @@ def model_relay_env(
     rollout_id: str,
     *,
     api_key: str = "intercepted",
-    path_scoped_base_url: bool = True,
 ) -> dict[str, str]:
     return ModelRelayConfig(
         relay_url=relay_url,
         rollout_id=rollout_id,
         api_key=api_key,
-        path_scoped_base_url=path_scoped_base_url,
     ).env()
 
 
 @dataclass(frozen=True)
 class HttpTunnelConfig:
     relay_url: str
-    tunnel_id: str
+    rollout_id: str
     relay_token: str | None = None
     registration_token: str | None = None
 
@@ -75,7 +70,7 @@ class HttpTunnelConfig:
     def base_url(self) -> str:
         return http_tunnel_url(
             self.relay_url,
-            self.tunnel_id,
+            self.rollout_id,
             registration_token=self.registration_token,
         )
 
@@ -87,13 +82,13 @@ class HttpTunnelConfig:
 
 def http_tunnel_url(
     relay_url: str,
-    tunnel_id: str,
+    rollout_id: str,
     path: str = "/",
     *,
     registration_token: str | None = None,
 ) -> str:
     suffix = "/" + path.lstrip("/")
-    base = f"{relay_url.rstrip('/')}/tunnels/{quote(tunnel_id, safe='')}"
+    base = f"{relay_url.rstrip('/')}/tunnels/{quote(rollout_id, safe='')}"
     if registration_token is not None:
         if not registration_token:
             raise ValueError("registration_token cannot be empty")
@@ -121,10 +116,6 @@ class RelayRequest:
     sandbox_id: str | None = None
     sandbox_generation: int | None = None
 
-    @property
-    def tunnel_id(self) -> str:
-        return self.rollout_id
-
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "RelayRequest":
         headers = payload.get("headers")
@@ -132,7 +123,7 @@ class RelayRequest:
         body_bytes = _decode_body_bytes(payload, body)
         return cls(
             request_id=str(payload.get("request_id") or ""),
-            rollout_id=str(payload.get("rollout_id") or payload.get("tunnel_id") or ""),
+            rollout_id=str(payload.get("rollout_id") or ""),
             registration_token=str(payload.get("registration_token") or ""),
             endpoint=str(payload.get("endpoint") or ""),
             method=str(payload.get("method") or "POST"),
@@ -194,7 +185,56 @@ class RelayPollResult:
         )
 
 
-class RelayWorkerClient:
+class _RelayWorkerState:
+    def __init__(self) -> None:
+        self._registration_tokens: dict[str, str] = {}
+        self._request_tokens: dict[str, str] = {}
+
+    def _remember_registration(
+        self, rollout_id: str, payload: Mapping[str, Any]
+    ) -> None:
+        record = payload.get("rollout")
+        token = (
+            record.get("registration_token") if isinstance(record, Mapping) else None
+        )
+        if not isinstance(token, str) or not token:
+            raise RelayApiError(
+                "relay registration omitted registration_token", body=payload
+            )
+        self._registration_tokens[rollout_id] = token
+
+    def _registration_token(self, rollout_id: str) -> str:
+        token = self._registration_tokens.get(rollout_id)
+        if token is None:
+            raise RelayApiError(
+                f"rollout is not registered by this client: {rollout_id}"
+            )
+        return token
+
+    def _request_token(self, request_id: str) -> str:
+        token = self._request_tokens.get(request_id)
+        if token is None:
+            raise RelayApiError(f"request was not polled by this client: {request_id}")
+        return token
+
+    def _remember_requests(self, result: RelayPollResult) -> None:
+        for item in result.requests:
+            token = item.registration_token or self._registration_tokens.get(
+                item.rollout_id
+            )
+            if token:
+                self._request_tokens[item.request_id] = token
+
+    def _forget_registration(self, rollout_id: str, token: str) -> None:
+        self._registration_tokens.pop(rollout_id, None)
+        self._request_tokens = {
+            request_id: request_token
+            for request_id, request_token in self._request_tokens.items()
+            if request_token != token
+        }
+
+
+class RelayWorkerClient(_RelayWorkerState):
     def __init__(
         self,
         relay_url: str,
@@ -203,13 +243,12 @@ class RelayWorkerClient:
         timeout_seconds: float = 30.0,
         headers: Mapping[str, str] | None = None,
     ) -> None:
+        super().__init__()
         self.relay_url = relay_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
         self.headers = dict(headers or {})
         if worker_token is not None:
             self.headers["Authorization"] = f"Bearer {worker_token}"
-        self._registration_tokens: dict[str, str] = {}
-        self._request_tokens: dict[str, str] = {}
 
     def health(self) -> JsonObject:
         return self._request_json("GET", "/healthz")
@@ -218,21 +257,8 @@ class RelayWorkerClient:
         return self._request_json("GET", "/v1/relay/stats")
 
     def list_rollouts(self) -> list[JsonObject]:
-        payload = self._request_json("GET", "/v1/relay/rollouts")
-        rollouts = payload.get("rollouts")
-        return (
-            [dict(item) for item in rollouts if isinstance(item, dict)]
-            if isinstance(rollouts, list)
-            else []
-        )
-
-    def list_tunnels(self) -> list[JsonObject]:
-        payload = self._request_json("GET", "/v1/tunnels")
-        tunnels = payload.get("rollouts")
-        return (
-            [dict(item) for item in tunnels if isinstance(item, dict)]
-            if isinstance(tunnels, list)
-            else []
+        return _rollout_records(
+            self._request_json("GET", "/v1/relay/rollouts")
         )
 
     def register_rollout(
@@ -241,44 +267,13 @@ class RelayWorkerClient:
         *,
         metadata: Mapping[str, Any] | None = None,
     ) -> JsonObject:
-        payload: JsonObject = {"rollout_id": rollout_id}
-        if metadata is not None:
-            payload["metadata"] = dict(metadata)
-        response = self._request_json("POST", "/register_rollout", payload=payload)
+        response = self._request_json(
+            "POST",
+            "/v1/relay/rollouts",
+            payload=_registration_payload(rollout_id, metadata),
+        )
         self._remember_registration(rollout_id, response)
         return response
-
-    def register_tunnel(
-        self,
-        tunnel_id: str,
-        *,
-        metadata: Mapping[str, Any] | None = None,
-    ) -> JsonObject:
-        payload: JsonObject = {"tunnel_id": tunnel_id}
-        if metadata is not None:
-            payload["metadata"] = dict(metadata)
-        response = self._request_json("POST", "/v1/tunnels/register", payload=payload)
-        self._remember_registration(tunnel_id, response)
-        return response
-
-    def register_sandbox_tunnel(
-        self,
-        tunnel_id: str,
-        *,
-        sandbox_id: str,
-        sandbox_generation: int,
-        metadata: Mapping[str, Any] | None = None,
-    ) -> JsonObject:
-        if sandbox_generation < 1:
-            raise ValueError("sandbox_generation must be positive")
-        binding = dict(metadata or {})
-        binding.update(
-            {
-                "sandbox_id": sandbox_id,
-                "sandbox_generation": sandbox_generation,
-            }
-        )
-        return self.register_tunnel(tunnel_id, metadata=binding)
 
     def unregister_rollout(
         self,
@@ -288,26 +283,11 @@ class RelayWorkerClient:
     ) -> JsonObject:
         token = registration_token or self._registration_token(rollout_id)
         response = self._request_json(
-            "POST",
-            "/unregister_rollout",
-            payload={"rollout_id": rollout_id, "registration_token": token},
+            "DELETE",
+            _unregistration_path(rollout_id),
+            payload={"registration_token": token},
         )
         self._forget_registration(rollout_id, token)
-        return response
-
-    def unregister_tunnel(
-        self,
-        tunnel_id: str,
-        *,
-        registration_token: str | None = None,
-    ) -> JsonObject:
-        token = registration_token or self._registration_token(tunnel_id)
-        response = self._request_json(
-            "POST",
-            "/v1/tunnels/unregister",
-            payload={"tunnel_id": tunnel_id, "registration_token": token},
-        )
-        self._forget_registration(tunnel_id, token)
         return response
 
     def heartbeat(
@@ -318,15 +298,16 @@ class RelayWorkerClient:
         metadata: Mapping[str, Any] | None = None,
         registration_token: str | None = None,
     ) -> JsonObject:
-        payload: JsonObject = {
-            "rollout_id": rollout_id,
-            "registration_token": registration_token
-            or self._registration_token(rollout_id),
-            "worker_id": worker_id,
-        }
-        if metadata is not None:
-            payload["metadata"] = dict(metadata)
-        return self._request_json("POST", "/worker/heartbeat", payload=payload)
+        return self._request_json(
+            "POST",
+            "/worker/heartbeat",
+            payload=_heartbeat_payload(
+                rollout_id,
+                registration_token or self._registration_token(rollout_id),
+                worker_id,
+                metadata,
+            ),
+        )
 
     def poll(
         self,
@@ -338,20 +319,17 @@ class RelayWorkerClient:
         lease_seconds: float | None = None,
         registration_token: str | None = None,
     ) -> RelayPollResult:
-        query: dict[str, str] = {
-            "rollout_id": rollout_id,
-            "registration_token": registration_token
-            or self._registration_token(rollout_id),
-        }
-        if worker_id is not None:
-            query["worker_id"] = worker_id
-        if timeout_seconds is not None:
-            query["timeout_seconds"] = _format_number(timeout_seconds)
-        if limit is not None:
-            query["limit"] = str(limit)
-        if lease_seconds is not None:
-            query["lease_seconds"] = _format_number(lease_seconds)
-        payload = self._request_json("GET", f"/worker/poll?{parse.urlencode(query)}")
+        payload = self._request_json(
+            "GET",
+            _poll_path(
+                rollout_id,
+                registration_token or self._registration_token(rollout_id),
+                worker_id=worker_id,
+                timeout_seconds=timeout_seconds,
+                limit=limit,
+                lease_seconds=lease_seconds,
+            ),
+        )
         result = RelayPollResult.from_payload(payload)
         self._remember_requests(result)
         return result
@@ -583,49 +561,6 @@ class RelayWorkerClient:
             registration_token=relay_request.registration_token,
         )
 
-    def _remember_registration(
-        self, rollout_id: str, payload: Mapping[str, Any]
-    ) -> None:
-        record = payload.get("rollout")
-        token = (
-            record.get("registration_token") if isinstance(record, Mapping) else None
-        )
-        if not isinstance(token, str) or not token:
-            raise RelayApiError(
-                "relay registration omitted registration_token", body=payload
-            )
-        self._registration_tokens[rollout_id] = token
-
-    def _registration_token(self, rollout_id: str) -> str:
-        token = self._registration_tokens.get(rollout_id)
-        if token is None:
-            raise RelayApiError(
-                f"rollout is not registered by this client: {rollout_id}"
-            )
-        return token
-
-    def _request_token(self, request_id: str) -> str:
-        token = self._request_tokens.get(request_id)
-        if token is None:
-            raise RelayApiError(f"request was not polled by this client: {request_id}")
-        return token
-
-    def _remember_requests(self, result: RelayPollResult) -> None:
-        for item in result.requests:
-            token = item.registration_token or self._registration_tokens.get(
-                item.rollout_id
-            )
-            if token:
-                self._request_tokens[item.request_id] = token
-
-    def _forget_registration(self, rollout_id: str, token: str) -> None:
-        self._registration_tokens.pop(rollout_id, None)
-        self._request_tokens = {
-            request_id: request_token
-            for request_id, request_token in self._request_tokens.items()
-            if request_token != token
-        }
-
     def _request_json(
         self,
         method: str,
@@ -665,7 +600,7 @@ class RelayWorkerClient:
         return decoded
 
 
-class AsyncRelayWorkerClient:
+class AsyncRelayWorkerClient(_RelayWorkerState):
     def __init__(
         self,
         relay_url: str,
@@ -675,6 +610,7 @@ class AsyncRelayWorkerClient:
         headers: Mapping[str, str] | None = None,
         session: Any | None = None,
     ) -> None:
+        super().__init__()
         self.relay_url = relay_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
         self.headers = dict(headers or {})
@@ -682,8 +618,6 @@ class AsyncRelayWorkerClient:
             self.headers["Authorization"] = f"Bearer {worker_token}"
         self._session = session
         self._owned_session: Any | None = None
-        self._registration_tokens: dict[str, str] = {}
-        self._request_tokens: dict[str, str] = {}
 
     async def __aenter__(self) -> "AsyncRelayWorkerClient":
         await self._client()
@@ -704,21 +638,8 @@ class AsyncRelayWorkerClient:
         return await self._request_json("GET", "/v1/relay/stats")
 
     async def list_rollouts(self) -> list[JsonObject]:
-        payload = await self._request_json("GET", "/v1/relay/rollouts")
-        rollouts = payload.get("rollouts")
-        return (
-            [dict(item) for item in rollouts if isinstance(item, dict)]
-            if isinstance(rollouts, list)
-            else []
-        )
-
-    async def list_tunnels(self) -> list[JsonObject]:
-        payload = await self._request_json("GET", "/v1/tunnels")
-        tunnels = payload.get("rollouts")
-        return (
-            [dict(item) for item in tunnels if isinstance(item, dict)]
-            if isinstance(tunnels, list)
-            else []
+        return _rollout_records(
+            await self._request_json("GET", "/v1/relay/rollouts")
         )
 
     async def register_rollout(
@@ -727,48 +648,13 @@ class AsyncRelayWorkerClient:
         *,
         metadata: Mapping[str, Any] | None = None,
     ) -> JsonObject:
-        payload: JsonObject = {"rollout_id": rollout_id}
-        if metadata is not None:
-            payload["metadata"] = dict(metadata)
         response = await self._request_json(
-            "POST", "/register_rollout", payload=payload
+            "POST",
+            "/v1/relay/rollouts",
+            payload=_registration_payload(rollout_id, metadata),
         )
         self._remember_registration(rollout_id, response)
         return response
-
-    async def register_tunnel(
-        self,
-        tunnel_id: str,
-        *,
-        metadata: Mapping[str, Any] | None = None,
-    ) -> JsonObject:
-        payload: JsonObject = {"tunnel_id": tunnel_id}
-        if metadata is not None:
-            payload["metadata"] = dict(metadata)
-        response = await self._request_json(
-            "POST", "/v1/tunnels/register", payload=payload
-        )
-        self._remember_registration(tunnel_id, response)
-        return response
-
-    async def register_sandbox_tunnel(
-        self,
-        tunnel_id: str,
-        *,
-        sandbox_id: str,
-        sandbox_generation: int,
-        metadata: Mapping[str, Any] | None = None,
-    ) -> JsonObject:
-        if sandbox_generation < 1:
-            raise ValueError("sandbox_generation must be positive")
-        binding = dict(metadata or {})
-        binding.update(
-            {
-                "sandbox_id": sandbox_id,
-                "sandbox_generation": sandbox_generation,
-            }
-        )
-        return await self.register_tunnel(tunnel_id, metadata=binding)
 
     async def unregister_rollout(
         self,
@@ -778,26 +664,11 @@ class AsyncRelayWorkerClient:
     ) -> JsonObject:
         token = registration_token or self._registration_token(rollout_id)
         response = await self._request_json(
-            "POST",
-            "/unregister_rollout",
-            payload={"rollout_id": rollout_id, "registration_token": token},
+            "DELETE",
+            _unregistration_path(rollout_id),
+            payload={"registration_token": token},
         )
         self._forget_registration(rollout_id, token)
-        return response
-
-    async def unregister_tunnel(
-        self,
-        tunnel_id: str,
-        *,
-        registration_token: str | None = None,
-    ) -> JsonObject:
-        token = registration_token or self._registration_token(tunnel_id)
-        response = await self._request_json(
-            "POST",
-            "/v1/tunnels/unregister",
-            payload={"tunnel_id": tunnel_id, "registration_token": token},
-        )
-        self._forget_registration(tunnel_id, token)
         return response
 
     async def heartbeat(
@@ -808,15 +679,16 @@ class AsyncRelayWorkerClient:
         metadata: Mapping[str, Any] | None = None,
         registration_token: str | None = None,
     ) -> JsonObject:
-        payload: JsonObject = {
-            "rollout_id": rollout_id,
-            "registration_token": registration_token
-            or self._registration_token(rollout_id),
-            "worker_id": worker_id,
-        }
-        if metadata is not None:
-            payload["metadata"] = dict(metadata)
-        return await self._request_json("POST", "/worker/heartbeat", payload=payload)
+        return await self._request_json(
+            "POST",
+            "/worker/heartbeat",
+            payload=_heartbeat_payload(
+                rollout_id,
+                registration_token or self._registration_token(rollout_id),
+                worker_id,
+                metadata,
+            ),
+        )
 
     async def poll(
         self,
@@ -828,21 +700,16 @@ class AsyncRelayWorkerClient:
         lease_seconds: float | None = None,
         registration_token: str | None = None,
     ) -> RelayPollResult:
-        query: dict[str, str] = {
-            "rollout_id": rollout_id,
-            "registration_token": registration_token
-            or self._registration_token(rollout_id),
-        }
-        if worker_id is not None:
-            query["worker_id"] = worker_id
-        if timeout_seconds is not None:
-            query["timeout_seconds"] = _format_number(timeout_seconds)
-        if limit is not None:
-            query["limit"] = str(limit)
-        if lease_seconds is not None:
-            query["lease_seconds"] = _format_number(lease_seconds)
         payload = await self._request_json(
-            "GET", f"/worker/poll?{parse.urlencode(query)}"
+            "GET",
+            _poll_path(
+                rollout_id,
+                registration_token or self._registration_token(rollout_id),
+                worker_id=worker_id,
+                timeout_seconds=timeout_seconds,
+                limit=limit,
+                lease_seconds=lease_seconds,
+            ),
         )
         result = RelayPollResult.from_payload(payload)
         self._remember_requests(result)
@@ -1072,49 +939,6 @@ class AsyncRelayWorkerClient:
             registration_token=relay_request.registration_token,
         )
 
-    def _remember_registration(
-        self, rollout_id: str, payload: Mapping[str, Any]
-    ) -> None:
-        record = payload.get("rollout")
-        token = (
-            record.get("registration_token") if isinstance(record, Mapping) else None
-        )
-        if not isinstance(token, str) or not token:
-            raise RelayApiError(
-                "relay registration omitted registration_token", body=payload
-            )
-        self._registration_tokens[rollout_id] = token
-
-    def _registration_token(self, rollout_id: str) -> str:
-        token = self._registration_tokens.get(rollout_id)
-        if token is None:
-            raise RelayApiError(
-                f"rollout is not registered by this client: {rollout_id}"
-            )
-        return token
-
-    def _request_token(self, request_id: str) -> str:
-        token = self._request_tokens.get(request_id)
-        if token is None:
-            raise RelayApiError(f"request was not polled by this client: {request_id}")
-        return token
-
-    def _remember_requests(self, result: RelayPollResult) -> None:
-        for item in result.requests:
-            token = item.registration_token or self._registration_tokens.get(
-                item.rollout_id
-            )
-            if token:
-                self._request_tokens[item.request_id] = token
-
-    def _forget_registration(self, rollout_id: str, token: str) -> None:
-        self._registration_tokens.pop(rollout_id, None)
-        self._request_tokens = {
-            request_id: request_token
-            for request_id, request_token in self._request_tokens.items()
-            if request_token != token
-        }
-
     async def _client(self) -> Any:
         if self._session is not None:
             return self._session
@@ -1162,6 +986,67 @@ class AsyncRelayWorkerClient:
                 "relay returned a non-object JSON payload", body=decoded
             )
         return decoded
+
+
+def _rollout_records(payload: Mapping[str, Any]) -> list[JsonObject]:
+    rollouts = payload.get("rollouts")
+    if not isinstance(rollouts, list):
+        return []
+    return [dict(item) for item in rollouts if isinstance(item, dict)]
+
+
+def _registration_payload(
+    rollout_id: str,
+    metadata: Mapping[str, Any] | None,
+) -> JsonObject:
+    payload: JsonObject = {"rollout_id": rollout_id}
+    if metadata is not None:
+        payload["metadata"] = dict(metadata)
+    return payload
+
+
+def _unregistration_path(rollout_id: str) -> str:
+    return f"/v1/relay/rollouts/{quote(rollout_id, safe='')}"
+
+
+def _heartbeat_payload(
+    rollout_id: str,
+    registration_token: str,
+    worker_id: str,
+    metadata: Mapping[str, Any] | None,
+) -> JsonObject:
+    payload: JsonObject = {
+        "rollout_id": rollout_id,
+        "registration_token": registration_token,
+        "worker_id": worker_id,
+    }
+    if metadata is not None:
+        payload["metadata"] = dict(metadata)
+    return payload
+
+
+def _poll_path(
+    rollout_id: str,
+    registration_token: str,
+    *,
+    worker_id: str | None,
+    timeout_seconds: float | None,
+    limit: int | None,
+    lease_seconds: float | None,
+) -> str:
+    query = {
+        "rollout_id": rollout_id,
+        "registration_token": registration_token,
+    }
+    if worker_id is not None:
+        query["worker_id"] = worker_id
+    if timeout_seconds is not None:
+        query["timeout_seconds"] = _format_number(timeout_seconds)
+    if limit is not None:
+        query["limit"] = str(limit)
+    if lease_seconds is not None:
+        query["lease_seconds"] = _format_number(lease_seconds)
+    return f"/worker/poll?{parse.urlencode(query)}"
 
 
 def _decode_json_error(raw: str) -> object:

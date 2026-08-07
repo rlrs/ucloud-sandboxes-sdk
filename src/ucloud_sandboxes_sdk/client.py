@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+import gzip
 import io
 import json
 from pathlib import Path
@@ -30,8 +32,6 @@ UCLOUD_UNAVAILABLE_RETRY_MAX_DELAY_SECONDS = 4.0
 UCLOUD_CREATE_RETRY_MAX_DELAY_SECONDS = 30.0
 UCLOUD_RETRY_AFTER_JITTER_RATIO = 0.25
 DEFAULT_CREATE_TIMEOUT_SECONDS = 10 * 60.0
-DEFAULT_FORK_TIMEOUT_SECONDS = 3600.0
-MAX_FORK_BATCH_SIZE = 64
 
 
 class SandboxApiError(RuntimeError):
@@ -138,7 +138,8 @@ class SandboxSshTarget:
     @classmethod
     def from_payload(cls, sandbox_id: str, payload: JsonObject) -> "SandboxSshTarget":
         ssh = payload.get("ssh")
-        if not isinstance(ssh, dict):
+        response_sandbox_id = payload.get("sandbox_id")
+        if not isinstance(ssh, dict) or response_sandbox_id != sandbox_id:
             raise SandboxApiError("gateway returned an invalid SSH payload", body=payload)
         host = ssh.get("host")
         port = ssh.get("port")
@@ -146,7 +147,7 @@ class SandboxSshTarget:
         if not isinstance(host, str) or not isinstance(port, int):
             raise SandboxApiError("gateway SSH payload is missing host/port", body=payload)
         return cls(
-            sandbox_id=str(payload.get("sandboxId") or sandbox_id),
+            sandbox_id=sandbox_id,
             user=str(user),
             host=host,
             port=port,
@@ -156,63 +157,6 @@ class SandboxSshTarget:
 
     def direct_argv(self) -> list[str]:
         return ["ssh", "-p", str(self.port), f"{self.user}@{self.host}"]
-
-
-@dataclass(frozen=True)
-class SandboxForkProtocolSpec:
-    prepare_command: Sequence[str]
-    ready_command: Sequence[str]
-    version: str = "agent-v1"
-    timeout_seconds: int = 30
-
-    def to_dict(self) -> JsonObject:
-        if self.version != "agent-v1":
-            raise ValueError("fork protocol version must be 'agent-v1'")
-        if isinstance(self.prepare_command, (str, bytes)) or isinstance(
-            self.ready_command, (str, bytes)
-        ):
-            raise TypeError("fork protocol commands must be sequences of arguments")
-        prepare = [str(item) for item in self.prepare_command]
-        ready = [str(item) for item in self.ready_command]
-        if not prepare or not ready or any(not item for item in (*prepare, *ready)):
-            raise ValueError("fork protocol prepare and ready commands are required")
-        if not 1 <= self.timeout_seconds <= 60:
-            raise ValueError("fork protocol timeout_seconds must be in [1, 60]")
-        return {
-            "version": self.version,
-            "prepare_command": prepare,
-            "ready_command": ready,
-            "timeout_seconds": self.timeout_seconds,
-        }
-
-
-@dataclass(frozen=True)
-class SandboxForkSpec:
-    id: str
-    env: Mapping[str, str] = field(default_factory=dict)
-    labels: Mapping[str, str] = field(default_factory=dict)
-    ttl_seconds: int | None = None
-    memory_mb: int | None = None
-    cpus: float | None = None
-
-    def to_dict(self) -> JsonObject:
-        sandbox_id = self.id.strip()
-        if not sandbox_id:
-            raise ValueError("fork sandbox id cannot be empty")
-        payload: JsonObject = {"id": sandbox_id}
-        if self.env:
-            payload["env"] = {str(key): str(value) for key, value in self.env.items()}
-        if self.labels:
-            payload["labels"] = {
-                str(key): str(value) for key, value in self.labels.items()
-            }
-        if self.ttl_seconds is not None:
-            payload["ttl_seconds"] = self.ttl_seconds
-        if self.memory_mb is not None:
-            payload["memory_mb"] = self.memory_mb
-        if self.cpus is not None:
-            payload["cpus"] = self.cpus
-        return payload
 
 
 @dataclass(frozen=True)
@@ -231,10 +175,8 @@ class SandboxSpec:
     security: SandboxSecuritySpec | Mapping[str, Any] | None = SandboxSecuritySpec()
     filesystem: SandboxFilesystemSpec | Mapping[str, Any] | None = SandboxFilesystemSpec()
     labels: Mapping[str, str] = field(default_factory=dict)
-    forkable: bool = False
     parkable: bool = False
     managed_process: bool = False
-    fork_protocol: SandboxForkProtocolSpec | Mapping[str, Any] | None = None
 
     def to_dict(self) -> JsonObject:
         if self.managed_process and not self.parkable:
@@ -257,14 +199,10 @@ class SandboxSpec:
             "filesystem": _nested_payload(self.filesystem),
             "labels": dict(self.labels),
         }
-        if self.forkable:
-            payload["forkable"] = True
         if self.parkable:
             payload["parkable"] = True
         if self.managed_process:
             payload["managed_process"] = True
-        if self.fork_protocol is not None:
-            payload["fork_protocol"] = _nested_payload(self.fork_protocol)
         return payload
 
 
@@ -310,19 +248,10 @@ class Image:
         return cls(reference=name, name=name)
 
     @classmethod
-    def from_id(cls, image_id: str) -> "Image":
-        return cls.from_name(image_id)
-
-    @classmethod
-    def from_gateway_id(cls, image_id: str) -> "Image":
-        return cls.from_name(image_id)
-
-    @classmethod
     def from_dockerfile(
         cls,
         *,
-        name: str | None = None,
-        image_id: str | None = None,
+        name: str,
         tag: str | None = None,
         context_path: str | Path,
         dockerfile: str = "Dockerfile",
@@ -330,9 +259,7 @@ class Image:
         build_args: Mapping[str, str] | None = None,
         labels: Mapping[str, str] | None = None,
     ) -> "Image":
-        if name is not None and image_id is not None and name != image_id:
-            raise ValueError("name and image_id must match when both are supplied")
-        name = _non_empty_string("image_id", image_id if image_id is not None else name)
+        name = _non_empty_string("name", name)
         if tag is not None:
             tag = _non_empty_string("tag", tag)
         build_spec = _ImageBuildSpec(
@@ -491,7 +418,6 @@ class SandboxHandle:
     id: str
     record: JsonObject = field(default_factory=dict)
     create_response: JsonObject = field(default_factory=dict)
-    fork_metadata: JsonObject = field(default_factory=dict)
 
     def refresh(self) -> "SandboxHandle":
         record = self.client.get_sandbox(self.id)
@@ -600,42 +526,6 @@ class SandboxHandle:
         local_path: str | Path,
     ) -> Path:
         return self.client.download_file_to_path(self.id, container_path, local_path)
-
-    def fork(
-        self,
-        spec: SandboxForkSpec | None = None,
-        *,
-        id: str | None = None,
-        env: Mapping[str, str] | None = None,
-        labels: Mapping[str, str] | None = None,
-        ttl_seconds: int | None = None,
-        memory_mb: int | None = None,
-        cpus: float | None = None,
-        timeout_seconds: float = DEFAULT_FORK_TIMEOUT_SECONDS,
-    ) -> "SandboxHandle":
-        return self.client.fork_sandbox(
-            self.id,
-            spec,
-            id=id,
-            env=env,
-            labels=labels,
-            ttl_seconds=ttl_seconds,
-            memory_mb=memory_mb,
-            cpus=cpus,
-            timeout_seconds=timeout_seconds,
-        )
-
-    def fork_many(
-        self,
-        sandboxes: Sequence[SandboxForkSpec],
-        *,
-        timeout_seconds: float = DEFAULT_FORK_TIMEOUT_SECONDS,
-    ) -> tuple["SandboxHandle", ...]:
-        return self.client.fork_sandboxes(
-            self.id,
-            sandboxes,
-            timeout_seconds=timeout_seconds,
-        )
 
     def snapshot(self, image: Image, *, image_id: str | None = None) -> JsonObject:
         return self.client.snapshot_sandbox(self.id, image, image_id=image_id)
@@ -818,7 +708,6 @@ class SandboxClient:
         cpus: float | None = None,
         memory_mb: int | None = None,
         disk_mb: int | None = None,
-        resources: Mapping[str, Any] | None = None,
         image: Image | None = None,
         parkable: bool = False,
         ttl_seconds: int = 900,
@@ -832,7 +721,6 @@ class SandboxClient:
                 cpus=cpus,
                 memory_mb=memory_mb,
                 disk_mb=disk_mb,
-                resources=resources,
                 image=image,
                 parkable=parkable,
                 ttl_seconds=ttl_seconds,
@@ -905,71 +793,6 @@ class SandboxClient:
         if not isinstance(sandbox_id, str) or not sandbox_id:
             raise SandboxApiError("node-agent sandbox payload is missing spec.id", body=response)
         return SandboxHandle(self, sandbox_id, record=record, create_response=response)
-
-    def fork_sandbox(
-        self,
-        source_sandbox_id: str,
-        spec: SandboxForkSpec | None = None,
-        *,
-        id: str | None = None,
-        env: Mapping[str, str] | None = None,
-        labels: Mapping[str, str] | None = None,
-        ttl_seconds: int | None = None,
-        memory_mb: int | None = None,
-        cpus: float | None = None,
-        timeout_seconds: float = DEFAULT_FORK_TIMEOUT_SECONDS,
-    ) -> SandboxHandle:
-        target = _fork_sandbox_payload(
-            spec,
-            id=id,
-            env=env,
-            labels=labels,
-            ttl_seconds=ttl_seconds,
-            memory_mb=memory_mb,
-            cpus=cpus,
-        )
-        response = self._request_json(
-            "POST",
-            f"/v1/sandboxes/{_quote_segment(source_sandbox_id)}/forks",
-            payload={"sandbox": target},
-            timeout_seconds=timeout_seconds,
-        )
-        items = _fork_response_items(response, (str(target["id"]),), batch=False)
-        record, metadata = items[0]
-        return SandboxHandle(
-            self,
-            str(target["id"]),
-            record=record,
-            create_response=response,
-            fork_metadata=metadata,
-        )
-
-    def fork_sandboxes(
-        self,
-        source_sandbox_id: str,
-        sandboxes: Sequence[SandboxForkSpec],
-        *,
-        timeout_seconds: float = DEFAULT_FORK_TIMEOUT_SECONDS,
-    ) -> tuple[SandboxHandle, ...]:
-        targets = _fork_batch_payload(sandboxes)
-        expected_ids = tuple(str(item["id"]) for item in targets)
-        response = self._request_json(
-            "POST",
-            f"/v1/sandboxes/{_quote_segment(source_sandbox_id)}/forks",
-            payload={"sandboxes": targets},
-            timeout_seconds=timeout_seconds,
-        )
-        items = _fork_response_items(response, expected_ids, batch=True)
-        return tuple(
-            SandboxHandle(
-                self,
-                sandbox_id,
-                record=record,
-                create_response=response,
-                fork_metadata=metadata,
-            )
-            for sandbox_id, (record, metadata) in zip(expected_ids, items)
-        )
 
     def create_ssh_sandbox(
         self,
@@ -1254,19 +1077,22 @@ class SandboxClient:
             f"/v1/images/builds/{_quote_segment(build_id_or_image_id)}",
             timeout_seconds=timeout_seconds,
         )
-        build = payload.get("build")
-        if not isinstance(build, dict):
-            raise SandboxApiError("gateway returned an invalid image build payload", body=payload)
-        return build
+        return _image_build_response(payload)
 
     def submit_image_build(
         self,
         image: Image,
         *,
-        upload_context: bool = True,
         timeout_seconds: float | None = None,
     ) -> JsonObject:
-        payload = _image_build_payload(image, upload_context=upload_context)
+        payload, archive = _image_build_request(image)
+        self._request_json(
+            "PUT",
+            f"/v1/image-contexts/{_quote_segment(str(payload['context_archive_digest']))}",
+            body=archive,
+            content_type="application/gzip",
+            timeout_seconds=timeout_seconds,
+        )
         payload["wait"] = False
         submitted = self._request_json(
             "POST",
@@ -1274,10 +1100,7 @@ class SandboxClient:
             payload=payload,
             timeout_seconds=timeout_seconds,
         )
-        build = submitted.get("build")
-        if not isinstance(build, dict):
-            raise SandboxApiError("gateway returned an invalid image build payload", body=submitted)
-        return build
+        return _image_build_response(submitted)
 
     def wait_for_image_build(
         self,
@@ -1323,7 +1146,6 @@ class SandboxClient:
         self,
         image: Image,
         *,
-        upload_context: bool = True,
         timeout_seconds: float | None = None,
         poll_interval_seconds: float = 5.0,
         on_status: Callable[[JsonObject], object] | None = None,
@@ -1331,11 +1153,10 @@ class SandboxClient:
         deadline = _deadline(timeout_seconds)
         submitted = self.submit_image_build(
             image,
-            upload_context=upload_context,
             timeout_seconds=timeout_seconds,
         )
         build = self.wait_for_image_build(
-            str(submitted.get("build_id") or submitted.get("image_id") or ""),
+            submitted["build_id"],
             timeout_seconds=_remaining_seconds(deadline),
             poll_interval_seconds=poll_interval_seconds,
             on_status=on_status,
@@ -1356,7 +1177,6 @@ class SandboxClient:
         cpus: float | None = None,
         memory_mb: int | None = None,
         disk_mb: int | None = None,
-        resources: Mapping[str, Any] | None = None,
         sandbox_nodes_only: bool = True,
     ) -> JsonObject:
         payload = _image_pull_payload(
@@ -1366,7 +1186,6 @@ class SandboxClient:
             cpus=cpus,
             memory_mb=memory_mb,
             disk_mb=disk_mb,
-            resources=resources,
             sandbox_nodes_only=sandbox_nodes_only,
         )
         return self._request_json("POST", "/v1/images/pull", payload=payload)
@@ -1501,7 +1320,6 @@ class AsyncSandboxHandle:
     id: str
     record: JsonObject = field(default_factory=dict)
     create_response: JsonObject = field(default_factory=dict)
-    fork_metadata: JsonObject = field(default_factory=dict)
 
     async def refresh(self) -> "AsyncSandboxHandle":
         record = await self.client.get_sandbox(self.id)
@@ -1610,42 +1428,6 @@ class AsyncSandboxHandle:
         local_path: str | Path,
     ) -> Path:
         return await self.client.download_file_to_path(self.id, container_path, local_path)
-
-    async def fork(
-        self,
-        spec: SandboxForkSpec | None = None,
-        *,
-        id: str | None = None,
-        env: Mapping[str, str] | None = None,
-        labels: Mapping[str, str] | None = None,
-        ttl_seconds: int | None = None,
-        memory_mb: int | None = None,
-        cpus: float | None = None,
-        timeout_seconds: float = DEFAULT_FORK_TIMEOUT_SECONDS,
-    ) -> "AsyncSandboxHandle":
-        return await self.client.fork_sandbox(
-            self.id,
-            spec,
-            id=id,
-            env=env,
-            labels=labels,
-            ttl_seconds=ttl_seconds,
-            memory_mb=memory_mb,
-            cpus=cpus,
-            timeout_seconds=timeout_seconds,
-        )
-
-    async def fork_many(
-        self,
-        sandboxes: Sequence[SandboxForkSpec],
-        *,
-        timeout_seconds: float = DEFAULT_FORK_TIMEOUT_SECONDS,
-    ) -> tuple["AsyncSandboxHandle", ...]:
-        return await self.client.fork_sandboxes(
-            self.id,
-            sandboxes,
-            timeout_seconds=timeout_seconds,
-        )
 
     async def snapshot(self, image: Image, *, image_id: str | None = None) -> JsonObject:
         return await self.client.snapshot_sandbox(self.id, image, image_id=image_id)
@@ -1843,7 +1625,6 @@ class AsyncSandboxClient:
         cpus: float | None = None,
         memory_mb: int | None = None,
         disk_mb: int | None = None,
-        resources: Mapping[str, Any] | None = None,
         image: Image | None = None,
         parkable: bool = False,
         ttl_seconds: int = 900,
@@ -1857,7 +1638,6 @@ class AsyncSandboxClient:
                 cpus=cpus,
                 memory_mb=memory_mb,
                 disk_mb=disk_mb,
-                resources=resources,
                 image=image,
                 parkable=parkable,
                 ttl_seconds=ttl_seconds,
@@ -1930,71 +1710,6 @@ class AsyncSandboxClient:
         if not isinstance(sandbox_id, str) or not sandbox_id:
             raise SandboxApiError("node-agent sandbox payload is missing spec.id", body=response)
         return AsyncSandboxHandle(self, sandbox_id, record=record, create_response=response)
-
-    async def fork_sandbox(
-        self,
-        source_sandbox_id: str,
-        spec: SandboxForkSpec | None = None,
-        *,
-        id: str | None = None,
-        env: Mapping[str, str] | None = None,
-        labels: Mapping[str, str] | None = None,
-        ttl_seconds: int | None = None,
-        memory_mb: int | None = None,
-        cpus: float | None = None,
-        timeout_seconds: float = DEFAULT_FORK_TIMEOUT_SECONDS,
-    ) -> AsyncSandboxHandle:
-        target = _fork_sandbox_payload(
-            spec,
-            id=id,
-            env=env,
-            labels=labels,
-            ttl_seconds=ttl_seconds,
-            memory_mb=memory_mb,
-            cpus=cpus,
-        )
-        response = await self._request_json(
-            "POST",
-            f"/v1/sandboxes/{_quote_segment(source_sandbox_id)}/forks",
-            payload={"sandbox": target},
-            timeout_seconds=timeout_seconds,
-        )
-        items = _fork_response_items(response, (str(target["id"]),), batch=False)
-        record, metadata = items[0]
-        return AsyncSandboxHandle(
-            self,
-            str(target["id"]),
-            record=record,
-            create_response=response,
-            fork_metadata=metadata,
-        )
-
-    async def fork_sandboxes(
-        self,
-        source_sandbox_id: str,
-        sandboxes: Sequence[SandboxForkSpec],
-        *,
-        timeout_seconds: float = DEFAULT_FORK_TIMEOUT_SECONDS,
-    ) -> tuple[AsyncSandboxHandle, ...]:
-        targets = _fork_batch_payload(sandboxes)
-        expected_ids = tuple(str(item["id"]) for item in targets)
-        response = await self._request_json(
-            "POST",
-            f"/v1/sandboxes/{_quote_segment(source_sandbox_id)}/forks",
-            payload={"sandboxes": targets},
-            timeout_seconds=timeout_seconds,
-        )
-        items = _fork_response_items(response, expected_ids, batch=True)
-        return tuple(
-            AsyncSandboxHandle(
-                self,
-                sandbox_id,
-                record=record,
-                create_response=response,
-                fork_metadata=metadata,
-            )
-            for sandbox_id, (record, metadata) in zip(expected_ids, items)
-        )
 
     async def create_ssh_sandbox(
         self,
@@ -2282,19 +1997,22 @@ class AsyncSandboxClient:
             f"/v1/images/builds/{_quote_segment(build_id_or_image_id)}",
             timeout_seconds=timeout_seconds,
         )
-        build = payload.get("build")
-        if not isinstance(build, dict):
-            raise SandboxApiError("gateway returned an invalid image build payload", body=payload)
-        return build
+        return _image_build_response(payload)
 
     async def submit_image_build(
         self,
         image: Image,
         *,
-        upload_context: bool = True,
         timeout_seconds: float | None = None,
     ) -> JsonObject:
-        payload = _image_build_payload(image, upload_context=upload_context)
+        payload, archive = _image_build_request(image)
+        await self._request_json(
+            "PUT",
+            f"/v1/image-contexts/{_quote_segment(str(payload['context_archive_digest']))}",
+            body=archive,
+            content_type="application/gzip",
+            timeout_seconds=timeout_seconds,
+        )
         payload["wait"] = False
         submitted = await self._request_json(
             "POST",
@@ -2302,10 +2020,7 @@ class AsyncSandboxClient:
             payload=payload,
             timeout_seconds=timeout_seconds,
         )
-        build = submitted.get("build")
-        if not isinstance(build, dict):
-            raise SandboxApiError("gateway returned an invalid image build payload", body=submitted)
-        return build
+        return _image_build_response(submitted)
 
     async def wait_for_image_build(
         self,
@@ -2351,7 +2066,6 @@ class AsyncSandboxClient:
         self,
         image: Image,
         *,
-        upload_context: bool = True,
         timeout_seconds: float | None = None,
         poll_interval_seconds: float = 5.0,
         on_status: Callable[[JsonObject], object] | None = None,
@@ -2359,11 +2073,10 @@ class AsyncSandboxClient:
         deadline = _deadline(timeout_seconds)
         submitted = await self.submit_image_build(
             image,
-            upload_context=upload_context,
             timeout_seconds=timeout_seconds,
         )
         build = await self.wait_for_image_build(
-            str(submitted.get("build_id") or submitted.get("image_id") or ""),
+            submitted["build_id"],
             timeout_seconds=_remaining_seconds(deadline),
             poll_interval_seconds=poll_interval_seconds,
             on_status=on_status,
@@ -2384,7 +2097,6 @@ class AsyncSandboxClient:
         cpus: float | None = None,
         memory_mb: int | None = None,
         disk_mb: int | None = None,
-        resources: Mapping[str, Any] | None = None,
         sandbox_nodes_only: bool = True,
     ) -> JsonObject:
         payload = _image_pull_payload(
@@ -2394,7 +2106,6 @@ class AsyncSandboxClient:
             cpus=cpus,
             memory_mb=memory_mb,
             disk_mb=disk_mb,
-            resources=resources,
             sandbox_nodes_only=sandbox_nodes_only,
         )
         return await self._request_json("POST", "/v1/images/pull", payload=payload)
@@ -2547,15 +2258,9 @@ def _sandbox_payload(
             payload["image"] = _image_reference(payload["image"])
     else:
         raise TypeError("sandbox image is required and must be an Image")
-    if payload.get("fork_protocol") is not None:
-        payload["fork_protocol"] = _nested_payload(payload["fork_protocol"])
     for nested_field in ("security", "filesystem", "ssh"):
         if payload.get(nested_field) is not None:
             payload[nested_field] = _nested_payload(payload[nested_field])
-    if bool(payload.get("forkable")) and not payload.get("fork_protocol"):
-        raise ValueError("forkable sandboxes require fork_protocol")
-    if payload.get("fork_protocol") and not bool(payload.get("forkable")):
-        raise ValueError("fork_protocol requires forkable=True")
     if bool(payload.get("managed_process")) and not bool(payload.get("parkable")):
         raise ValueError("managed_process requires parkable=True")
     if bool(payload.get("managed_process")) and payload.get("command"):
@@ -2563,153 +2268,38 @@ def _sandbox_payload(
     return payload
 
 
-def _fork_sandbox_payload(
-    spec: SandboxForkSpec | None,
-    *,
-    id: str | None,
-    env: Mapping[str, str] | None,
-    labels: Mapping[str, str] | None,
-    ttl_seconds: int | None,
-    memory_mb: int | None,
-    cpus: float | None,
-) -> JsonObject:
-    if spec is not None and not isinstance(spec, SandboxForkSpec):
-        raise TypeError("fork spec must be a SandboxForkSpec")
-    payload = spec.to_dict() if spec is not None else {}
-    if id is not None:
-        payload["id"] = id
-    if env is not None:
-        payload["env"] = {str(key): str(value) for key, value in env.items()}
-    if labels is not None:
-        payload["labels"] = {
-            str(key): str(value) for key, value in labels.items()
-        }
-    if ttl_seconds is not None:
-        payload["ttl_seconds"] = ttl_seconds
-    if memory_mb is not None:
-        payload["memory_mb"] = memory_mb
-    if cpus is not None:
-        payload["cpus"] = cpus
-    sandbox_id = str(payload.get("id") or "").strip()
-    if not sandbox_id:
-        raise ValueError("fork sandbox id is required")
-    payload["id"] = sandbox_id
-    if payload.get("ttl_seconds") is not None and int(payload["ttl_seconds"]) <= 0:
-        raise ValueError("fork ttl_seconds must be positive")
-    if payload.get("memory_mb") is not None and int(payload["memory_mb"]) <= 0:
-        raise ValueError("fork memory_mb must be positive")
-    if payload.get("cpus") is not None and float(payload["cpus"]) <= 0:
-        raise ValueError("fork cpus must be positive")
-    return payload
-
-
-def _fork_batch_payload(
-    sandboxes: Sequence[SandboxForkSpec],
-) -> list[JsonObject]:
-    if not 1 <= len(sandboxes) <= MAX_FORK_BATCH_SIZE:
-        raise ValueError(
-            f"fork batch size must be in [1, {MAX_FORK_BATCH_SIZE}]"
-        )
-    payloads = [
-        _fork_sandbox_payload(
-            spec,
-            id=None,
-            env=None,
-            labels=None,
-            ttl_seconds=None,
-            memory_mb=None,
-            cpus=None,
-        )
-        for spec in sandboxes
-    ]
-    ids = [str(payload["id"]) for payload in payloads]
-    if len(set(ids)) != len(ids):
-        raise ValueError("fork batch sandbox ids must be unique")
-    return payloads
-
-
-def _fork_response_items(
-    response: JsonObject,
-    expected_ids: Sequence[str],
-    *,
-    batch: bool,
-) -> tuple[tuple[JsonObject, JsonObject], ...]:
-    if response.get("intent_persisted") is not True:
-        raise SandboxApiError(
-            "gateway fork response did not confirm durable intents",
-            body=response,
-        )
-    raw_records = response.get("sandboxes") if batch else [response.get("sandbox")]
-    raw_forks = response.get("forks") if batch else [response.get("fork")]
-    if not isinstance(raw_records, list) or not isinstance(raw_forks, list):
-        raise SandboxApiError("gateway returned an invalid fork payload", body=response)
-    if len(raw_records) != len(expected_ids) or len(raw_forks) != len(expected_ids):
-        raise SandboxApiError(
-            "gateway fork response length does not match the request",
-            body=response,
-        )
-    items: list[tuple[JsonObject, JsonObject]] = []
-    checkpoint_id: str | None = None
-    for expected_id, raw_record, raw_fork in zip(
-        expected_ids,
-        raw_records,
-        raw_forks,
-    ):
-        if not isinstance(raw_record, dict) or not isinstance(raw_fork, dict):
-            raise SandboxApiError(
-                "gateway returned an invalid fork record",
-                body=response,
-            )
-        record = dict(raw_record)
-        metadata = dict(raw_fork)
-        record_id = _sandbox_record_id(record)
-        if record_id != expected_id or metadata.get("sandbox_id") != expected_id:
-            raise SandboxApiError(
-                "gateway fork response sandbox identity does not match the request",
-                body=response,
-            )
-        item_checkpoint = metadata.get("checkpoint_id")
-        if not isinstance(item_checkpoint, str) or not item_checkpoint:
-            raise SandboxApiError(
-                "gateway fork response is missing checkpoint identity",
-                body=response,
-            )
-        if checkpoint_id is None:
-            checkpoint_id = item_checkpoint
-        elif checkpoint_id != item_checkpoint:
-            raise SandboxApiError(
-                "gateway batch fork response used multiple checkpoints",
-                body=response,
-            )
-        if metadata.get("restored") is not True:
-            raise SandboxApiError(
-                "gateway fork response did not confirm restore",
-                body=response,
-            )
-        items.append((record, metadata))
-    return tuple(items)
-
-
-def _sandbox_record_id(record: JsonObject) -> str:
-    direct = record.get("id") or record.get("sandbox_id")
-    if isinstance(direct, str) and direct:
-        return direct
-    spec = record.get("spec")
-    nested = spec.get("id") if isinstance(spec, dict) else None
-    return nested if isinstance(nested, str) else ""
-
-
-def _image_build_payload(
-    image: Image,
-    *,
-    upload_context: bool = True,
-) -> JsonObject:
+def _image_build_request(image: Image) -> tuple[JsonObject, bytes]:
     if not isinstance(image, Image):
         raise TypeError("build_image() requires an Image from Image.from_dockerfile()")
     payload = image.to_build_spec().to_dict()
-    if upload_context:
-        _attach_build_context_archive(payload)
-    return payload
+    context_path = Path(str(payload["context_path"]))
+    if not context_path.is_dir():
+        raise ValueError(f"image build context is not a directory: {context_path}")
+    archive = _tar_gz_directory(context_path)
+    digest = f"sha256:{hashlib.sha256(archive).hexdigest()}"
+    payload.update(
+        {
+            "context_path": ".",
+            "context_archive_digest": digest,
+            "context_archive_size": len(archive),
+            "context_archive_format": "tar.gz",
+        }
+    )
+    return payload, archive
+
+
+def _image_build_response(payload: JsonObject) -> JsonObject:
+    build = payload.get("build")
+    if (
+        not isinstance(build, dict)
+        or not isinstance(build.get("build_id"), str)
+        or not build["build_id"]
+    ):
+        raise SandboxApiError(
+            "gateway returned an invalid image build payload",
+            body=payload,
+        )
+    return build
 
 
 def _completed_build_payload(build: JsonObject) -> JsonObject:
@@ -2717,11 +2307,11 @@ def _completed_build_payload(build: JsonObject) -> JsonObject:
         "build": dict(build),
         "image": build.get("image") if isinstance(build.get("image"), dict) else {},
         "command": list(build.get("command") or []),
-        "exitCode": build.get("exit_code"),
+        "exit_code": build.get("exit_code"),
     }
     if build.get("push_command"):
-        payload["pushCommand"] = list(build.get("push_command") or [])
-        payload["pushExitCode"] = build.get("push_exit_code")
+        payload["push_command"] = list(build.get("push_command") or [])
+        payload["push_exit_code"] = build.get("push_exit_code")
     return payload
 
 
@@ -2762,22 +2352,6 @@ def _nested_payload(value: object) -> object:
     if callable(to_dict):
         return to_dict()
     return value
-
-
-def _attach_build_context_archive(payload: JsonObject) -> None:
-    if payload.get("context_archive_base64"):
-        return
-    context_path = payload.get("context_path")
-    if not isinstance(context_path, str) or not context_path:
-        return
-    path = Path(context_path)
-    if not path.is_dir():
-        return
-    payload["context_archive_base64"] = base64.b64encode(
-        _tar_gz_directory(path)
-    ).decode("ascii")
-    payload["context_archive_format"] = "tar.gz"
-    payload["context_path"] = "."
 
 
 def _aiohttp_timeout(timeout_seconds: float | None) -> object:
@@ -2832,11 +2406,25 @@ def _image_build_timeout_message(
 
 
 def _tar_gz_directory(path: Path) -> bytes:
-    buffer = io.BytesIO()
-    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+    tar_buffer = io.BytesIO()
+
+    def normalize(info: tarfile.TarInfo) -> tarfile.TarInfo:
+        info.mtime = 0
+        info.uid = 0
+        info.gid = 0
+        info.uname = ""
+        info.gname = ""
+        return info
+
+    with tarfile.open(fileobj=tar_buffer, mode="w") as archive:
         for item in sorted(path.rglob("*")):
-            archive.add(item, arcname=item.relative_to(path).as_posix(), recursive=False)
-    return buffer.getvalue()
+            archive.add(
+                item,
+                arcname=item.relative_to(path).as_posix(),
+                recursive=False,
+                filter=normalize,
+            )
+    return gzip.compress(tar_buffer.getvalue(), mtime=0)
 
 
 def _exec_payload(
@@ -2897,7 +2485,6 @@ def _prepare_capacity_payload(
     cpus: float | None,
     memory_mb: int | None,
     disk_mb: int | None,
-    resources: Mapping[str, Any] | None,
     image: Image | None,
     parkable: bool,
     ttl_seconds: int,
@@ -2909,8 +2496,6 @@ def _prepare_capacity_payload(
     }
     if prepare_id is not None:
         payload["id"] = prepare_id
-    if resources is not None:
-        payload["resources"] = dict(resources)
     if cpus is not None:
         payload["cpus"] = cpus
     if memory_mb is not None:
@@ -2932,7 +2517,6 @@ def _image_pull_payload(
     cpus: float | None,
     memory_mb: int | None,
     disk_mb: int | None,
-    resources: Mapping[str, Any] | None,
     sandbox_nodes_only: bool,
 ) -> JsonObject:
     payload: JsonObject = {
@@ -2942,8 +2526,6 @@ def _image_pull_payload(
     }
     if image_id is not None:
         payload["id"] = image_id
-    if resources is not None:
-        payload["resources"] = dict(resources)
     if cpus is not None:
         payload["cpus"] = cpus
     if memory_mb is not None:

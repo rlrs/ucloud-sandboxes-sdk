@@ -14,7 +14,6 @@ from urllib.parse import parse_qs, urlparse
 from ucloud_sandboxes_sdk import (
     AsyncRelayWorkerClient,
     HttpTunnelConfig,
-    ModelRelayConfig,
     RelayApiError,
     RelayRequest,
     RelayWorkerClient,
@@ -41,15 +40,6 @@ class ModelRelayConfigTests(unittest.TestCase):
         )
         self.assertEqual(env["OPENAI_API_KEY"], "sandbox-token")
 
-    def test_can_build_plain_v1_environment_for_custom_header_transport(self) -> None:
-        config = ModelRelayConfig(
-            "https://relay.example.org",
-            "run-001",
-            path_scoped_base_url=False,
-        )
-
-        self.assertEqual(config.openai_base_url, "https://relay.example.org/v1")
-
     def test_builds_general_http_tunnel_url_and_auth_headers(self) -> None:
         config = HttpTunnelConfig(
             "https://relay.example.org/",
@@ -62,7 +52,7 @@ class ModelRelayConfigTests(unittest.TestCase):
             "https://relay.example.org/tunnels/run%3A001/",
         )
         self.assertEqual(
-            http_tunnel_url(config.relay_url, config.tunnel_id, "/api/items"),
+            http_tunnel_url(config.relay_url, config.rollout_id, "/api/items"),
             "https://relay.example.org/tunnels/run%3A001/api/items",
         )
         self.assertEqual(config.headers(), {"X-UCloud-Relay-Token": "sandbox-token"})
@@ -82,7 +72,7 @@ class ModelRelayConfigTests(unittest.TestCase):
         self.assertEqual(
             http_tunnel_url(
                 config.relay_url,
-                config.tunnel_id,
+                config.rollout_id,
                 registration_token=REGISTRATION_TOKEN,
             ),
             expected,
@@ -91,25 +81,6 @@ class ModelRelayConfigTests(unittest.TestCase):
 
 
 class RelayWorkerClientTests(unittest.TestCase):
-    def test_sync_worker_registers_generation_bound_sandbox_tunnel(self) -> None:
-        with running_relay() as relay:
-            client = RelayWorkerClient(relay.base_url, worker_token="worker-token")
-            response = client.register_sandbox_tunnel(
-                "sandbox-tunnel",
-                sandbox_id="sandbox-7",
-                sandbox_generation=3,
-                metadata={"suite": "verifiers"},
-            )
-
-        self.assertEqual(
-            response["rollout"]["metadata"],
-            {
-                "suite": "verifiers",
-                "sandbox_id": "sandbox-7",
-                "sandbox_generation": 3,
-            },
-        )
-
     def test_sync_worker_client_supports_full_lease_lifecycle(self) -> None:
         with running_relay() as relay:
             client = RelayWorkerClient(relay.base_url, worker_token="worker-token")
@@ -270,26 +241,6 @@ class RelayWorkerClientTests(unittest.TestCase):
         self.assertEqual(responded_id, "req-1")
         self.assertEqual(relay.state.last_renew_payload["lease_seconds"], 1200)
 
-    def test_async_worker_registers_generation_bound_sandbox_tunnel(self) -> None:
-        async def scenario(base_url: str) -> dict:
-            async with AsyncRelayWorkerClient(
-                base_url,
-                worker_token="worker-token",
-            ) as client:
-                return await client.register_sandbox_tunnel(
-                    "sandbox-tunnel-async",
-                    sandbox_id="sandbox-8",
-                    sandbox_generation=4,
-                )
-
-        with running_relay() as relay:
-            response = asyncio.run(scenario(relay.base_url))
-
-        self.assertEqual(
-            response["rollout"]["metadata"],
-            {"sandbox_id": "sandbox-8", "sandbox_generation": 4},
-        )
-
     def test_async_response_commit_retries_wake_pending_503(self) -> None:
         async def scenario(base_url: str) -> dict:
             async with AsyncRelayWorkerClient(
@@ -404,27 +355,16 @@ class FakeRelayHandler(BaseHTTPRequestHandler):
         if not self._check_authorized():
             return
         payload = self._read_json()
-        if parsed.path in {"/register_rollout", "/v1/tunnels/register"}:
-            rollout_id = str(
-                payload.get("rollout_id") or payload.get("tunnel_id") or ""
-            )
+        if parsed.path == "/v1/relay/rollouts":
+            rollout_id = str(payload.get("rollout_id") or "")
             record = {
                 "rollout_id": rollout_id,
-                "tunnel_id": rollout_id,
                 "registration_token": REGISTRATION_TOKEN,
                 "metadata": dict(payload.get("metadata") or {}),
             }
             with self.state.lock:
                 self.state.rollouts[rollout_id] = record
             self._write_json({"ok": True, "rollout": record}, status=HTTPStatus.CREATED)
-            return
-        if parsed.path in {"/unregister_rollout", "/v1/tunnels/unregister"}:
-            rollout_id = str(
-                payload.get("rollout_id") or payload.get("tunnel_id") or ""
-            )
-            with self.state.lock:
-                existed = self.state.rollouts.pop(rollout_id, None) is not None
-            self._write_json({"ok": True, "rollout_id": rollout_id, "existed": existed})
             return
         if parsed.path == "/worker/heartbeat":
             self._write_json(
@@ -484,6 +424,20 @@ class FakeRelayHandler(BaseHTTPRequestHandler):
             return
         self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
+    def do_DELETE(self) -> None:
+        parsed = urlparse(self.path)
+        if not self._check_authorized():
+            return
+        self._read_json()
+        prefix = "/v1/relay/rollouts/"
+        if parsed.path.startswith(prefix):
+            rollout_id = parsed.path.removeprefix(prefix)
+            with self.state.lock:
+                existed = self.state.rollouts.pop(rollout_id, None) is not None
+            self._write_json({"ok": True, "rollout_id": rollout_id, "existed": existed})
+            return
+        self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
+
     def _check_authorized(self) -> bool:
         if self.headers.get("Authorization") == "Bearer worker-token":
             return True
@@ -536,7 +490,6 @@ def _relay_request(
     return {
         "request_id": "req-1",
         "rollout_id": rollout_id,
-        "tunnel_id": rollout_id,
         "registration_token": REGISTRATION_TOKEN,
         "endpoint": endpoint,
         "method": "POST",

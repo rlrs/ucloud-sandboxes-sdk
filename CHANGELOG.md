@@ -1,147 +1,15 @@
 # Changelog
 
-This project uses semantic versioning.
+## Unreleased
 
-## 0.4.6 - 2026-08-02
-
-- Removed private registry host, port, and generated tag configuration from
-  managed SDK and Inspect build requests; the gateway now owns registry naming
-  and clients run completed builds by image id.
-- Kept optional explicit tags for external and advanced registry workflows.
-
-## 0.4.5 - 2026-07-30
-
-- Fixed JSON serialization of typed nested security, filesystem, and SSH
-  specifications supplied as keyword arguments to synchronous and asynchronous
-  sandbox creation.
-- Added registration-scoped HTTP tunnel capability URLs to
-  `HttpTunnelConfig` and `http_tunnel_url`, allowing arbitrary in-sandbox
-  harnesses to authenticate without injecting a shared relay header.
-
-## 0.4.4 - 2026-07-28
-
-- Added `parkable=True` to capacity preparation so the gateway can reserve the
-  full checkpoint disk shape and the matching parkable sandbox can consume the
-  prepared unit.
-
-## 0.4.3 - 2026-07-28
-
-- Added `SandboxSpec.parkable` and the `parkable=True` create option so clients
-  can opt into direct-runtime idle parking and transparent wake-on-tool-call.
-- Kept the field absent from ordinary create payloads for compatibility with
-  gateways that predate direct-runtime parking.
-
-## 0.4.2 - 2026-07-25
-
-- Treated `Retry-After` as the server's minimum delay for stable-id sandbox
-  creates, combining it with exponential backoff and jitter to prevent retry
-  storms while retaining an approximately five-minute cold-start window.
-- Parsed both delta-seconds and HTTP-date `Retry-After` values, exposed the
-  delay on `SandboxApiError`, and honored it in the Inspect integration's outer
-  scale-up retry loop.
-
-## 0.4.1 - 2026-07-11
-
-- Retried structured retryable capacity responses for safe reads and stable-id
-  sandbox creation, while leaving exec, fork, and relay side effects
-  single-shot.
-- Honored the gateway's `Retry-After` response header for transient retries,
-  with jitter to avoid synchronized retry waves.
-- Extended stable-id sandbox-create retries to cover a five-minute cold-image
-  preparation window without extending the retry budget for ordinary reads.
-- Raised the default sandbox-create request timeout to ten minutes so admitted
-  cold-image creates do not fail at the generic 30-second client timeout.
-
-## 0.4.0 - 2026-07-11
-
-- Added general buffered HTTP tunnel configuration and worker APIs, including
-  byte-safe request envelopes, binary responses, and forwarding to a
-  worker-local HTTP service.
-- Added tunnel registration/list/unregistration aliases while preserving the
-  OpenAI-compatible model relay helpers.
-- Persisted relay registration tokens in sync and async worker clients and sent
-  them on poll, heartbeat, lease renewal, response, error, and unregister calls.
-- Documented the 32 MiB buffered-body limit and the current exclusion of
-  WebSockets, streaming responses, and raw TCP.
-
-## 0.3.0 - 2026-07-11
-
-- Added typed `SandboxForkProtocolSpec` and `SandboxForkSpec` request models.
-- Added synchronous and asynchronous single and batch fork methods on clients
-  and sandbox handles.
-- Validated durable fork acknowledgments, restored child identities, response
-  ordering, shared batch checkpoint identity, and the 64-child batch limit.
-- Preserved fork metadata and the complete gateway response on returned child
-  handles, and exposed retryable/durable intent state on `SandboxApiError`.
-- Used a one-hour default fork request timeout to cover the gateway's bounded
-  64-child restore window.
-
-## 0.2.8 - 2026-07-06
-
-- Retried transient UCloud public-link `503` responses that return the
-  UCloud `Job is unavailable` HTML page during normal SDK API calls.
-- Kept ordinary structured gateway `503` responses non-retryable in the
-  generic request layer so scale-up and capacity errors still surface cleanly.
-
-## 0.2.7 - 2026-07-05
-
-- Mapped single-service Compose `network_mode` into sandbox networking.
-- Kept `UCLOUD_SANDBOX_NETWORK` as an explicit override over Compose
-  networking when it is set.
-
-## 0.2.6 - 2026-07-04
-
-- Added `api_token` to sync and async sandbox clients, sent as
-  `X-UCloud-Sandbox-Token` for UCloud public-link compatibility.
-- Switched the Inspect provider and SSH proxy helper to the public-link-safe
-  sandbox token header.
-- Let the Inspect provider read `UCLOUD_SANDBOX_API_URL` in addition to the
-  existing sandbox URL environment variables.
-
-## 0.2.5 - 2026-07-04
-
-- Generated Inspect Dockerfile and Compose build image ids from a deterministic
-  build-context fingerprint instead of the random sandbox id.
-- Reused pushed gateway image records for matching deterministic Inspect build
-  ids and tags instead of submitting duplicate builds.
-- Joined matching active Inspect image builds instead of submitting and
-  uploading duplicate contexts.
-- Kept generated Inspect registry tags stable across samples and runs when the
-  Dockerfile, build context, build args, and SDK build compatibility version do
-  not change.
-- Added optional image prewarm parameters to capacity prepare and multi-node
-  image pull calls.
-
-## 0.2.4 - 2026-07-04
-
-- Recovered Inspect image builds after transient disconnects during build
-  submission by looking up the deterministic image id before resubmitting.
-- Kept accepted image builds from being duplicated when the submit response is
-  lost before reaching the SDK.
-
-## 0.2.3 - 2026-07-04
-
-- Added Inspect AI environment configuration for sandbox security profiles.
-- Passed the configured Inspect security profile through to sandbox creation.
-
-## 0.2.2 - 2026-07-04
-
-- Treated SDK image build timeouts as total build deadlines during polling.
-- Bounded image build polling requests by the remaining timeout budget.
-- Added `request_timeout_seconds` for per-call sandbox creation request timeouts.
-- Passed remaining Inspect scale-up budget into sandbox and builder attempts.
-- Avoided re-submitting Inspect image builds after the builder has accepted them.
-- Added empty writable Harbor harness directories to images built by the Inspect
-  Dockerfile and Compose adapters.
-
-## 0.2.1 - 2026-07-04
-
-- Fixed generated Inspect build tags to default to the UCloud private registry.
-- Added `UCLOUD_SANDBOX_BUILD_IMAGE_PREFIX` for generated Inspect build tags.
-- Retried transient aiohttp client disconnects during sandbox and builder scale-up waits.
-
-## 0.2.0 - 2026-07-04
-
-- Added Inspect AI support for Harbor-style single-service Compose builds.
-- Mapped single-service Compose `cpus`, `mem_limit`, and `working_dir` into sandbox creation.
-- Added explicit rejection for multi-service Compose until node-agent Compose project support exists.
+- Defined one strict SDK contract for sandbox lifecycle, capacity, image builds,
+  relay registration, HTTP tunnels, and SSH access.
+- Made local image contexts deterministic and content-addressed.
+- Unified sync and async request construction, response decoding, and relay
+  token state.
+- Made rollout the sole relay-registration vocabulary while retaining arbitrary
+  HTTP tunnels as a separate transport.
+- Removed fork APIs, constructor and payload aliases, inline build contexts,
+  resource mapping alternatives, and response-key fallbacks.
+- Made interrupted Inspect cleanup close the original async client while
+  preserving the inspected sandbox.

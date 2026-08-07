@@ -8,7 +8,6 @@ with `src/ucloud_sandboxes_sdk/client.py` when endpoints are added.
 - `GET /healthz`
 - `GET /v1/sandboxes`
 - `POST /v1/sandboxes`
-- `POST /v1/sandboxes/<source-id>/forks`
 - `DELETE /v1/sandboxes/<sandbox-id>`
 - `PUT /v1/sandboxes/<sandbox-id>/files?path=<absolute-container-path>`
 - `GET /v1/sandboxes/<sandbox-id>/files?path=<absolute-container-path>`
@@ -20,6 +19,7 @@ with `src/ucloud_sandboxes_sdk/client.py` when endpoints are added.
 - `POST /v1/exec/<session-id>/close-stdin`
 - `GET /v1/images`
 - `POST /v1/images/build`
+- `PUT /v1/image-contexts/<sha256-digest>`
 - `POST /v1/images/pull`
 - `POST /v1/sandboxes/<sandbox-id>/snapshot`
 - `GET /v1/capacity/prepare`
@@ -53,64 +53,6 @@ sends a registry tag, `Image.from_name(...)` sends a gateway image id, and
 `Image.from_dockerfile(...)` carries build metadata for `build_image()`.
 The gateway owns placement and may return `503` while nodes are scaling up.
 
-## Live Sandbox Fork
-
-Fork support is opt-in on the source sandbox:
-
-```json
-{
-  "id": "agent-source",
-  "image": "registry.example.org/agent:latest",
-  "memory_mb": 2048,
-  "disk_mb": 10240,
-  "forkable": true,
-  "fork_protocol": {
-    "version": "agent-v1",
-    "prepare_command": ["/usr/local/bin/fork-agent", "prepare"],
-    "ready_command": ["/usr/local/bin/fork-agent", "ready"],
-    "timeout_seconds": 30
-  }
-}
-```
-
-Single-child fork requests use:
-
-```json
-{
-  "sandbox": {
-    "id": "agent-child",
-    "env": {"AGENT_BRANCH": "child"},
-    "ttl_seconds": 900
-  }
-}
-```
-
-Batch requests replace `sandbox` with `sandboxes` and accept 1-64 ordered child
-overlays. One immutable checkpoint is shared by the batch. Child overlays may
-change only id, environment, labels, TTL, memory, and CPU; image, command,
-working directory, user/security profile, mounts, network, and disk layout stay
-restore-compatible with the source.
-
-The node appends checkpoint id, nonce, and role to the configured hook command.
-The prepare command acknowledges with `UCLOUD_FORK_PREPARED=<nonce>`. Source
-and child ready commands acknowledge with
-`UCLOUD_FORK_READY=<nonce>:<resume|restore>` after their initial process tree
-has handled the transition. A cancel callback uses the `cancel` role. The
-application must use `/proc/gvisor/checkpoint` to distinguish resume from
-restore and `/proc/gvisor/spec_environ` to read the child's restore-time
-identity.
-
-Successful responses set `intent_persisted: true`, return restored sandbox
-records plus per-child fork metadata, and preserve request order. The SDK
-validates child identity, `restored: true`, and common checkpoint identity
-before returning handles. New operations return HTTP 201 and exact replays may
-return HTTP 200.
-
-Error responses can include top-level `intent_persisted`, `retryable`, and an
-ordered `intents` list. `SandboxApiError` exposes those fields as properties.
-Callers must replay the identical request for durable or ambiguous intents and
-keep the source alive until the fork response is acknowledged.
-
 The Inspect AI provider reads sandbox security settings from environment
 variables and passes them as `security` on `POST /v1/sandboxes`. Use
 `UCLOUD_SANDBOX_SECURITY` for a JSON object, or set individual fields with
@@ -132,7 +74,8 @@ images is required.
   "id": "python-base",
   "tag": "ucloud-sandbox-registry:5000/ucloud/python-base:latest",
   "context_path": ".",
-  "context_archive_base64": "<tar.gz bytes encoded as base64>",
+  "context_archive_digest": "sha256:<hex-digest>",
+  "context_archive_size": 12345,
   "context_archive_format": "tar.gz",
   "dockerfile": "Dockerfile",
   "push": true,
@@ -141,20 +84,19 @@ images is required.
 }
 ```
 
-The SDK attaches `context_archive_base64` by default when
-`Image.from_dockerfile(...).build_spec.context_path` points at a local
-directory. Pass `upload_context=False` to `build_image()` when `context_path`
-already exists on the gateway or builder VM.
+The SDK creates a tar.gz archive from the local context, hashes the archive,
+uploads it with `PUT /v1/image-contexts/<sha256-digest>`, and submits only the
+digest, size, and format in the build request.
 `build_image()` submits with `wait: false`, then polls
-`GET /v1/images/builds/{build_id_or_image_id}` until the tracked build reaches
+`GET /v1/images/builds/{build_id}` until the tracked build reaches
 `succeeded` or `failed`. SDK callers can use `on_status` to receive each status
 change and rolling `log_tail`. Large builds should pass `timeout_seconds` as
 the overall wait deadline and context-upload request timeout.
 
 The Inspect integration generates deterministic image ids for Dockerfile and
 single-service Compose builds. The id is derived from the Dockerfile, build
-context contents, build args, explicit Compose image tag if any, and the SDK's
-build compatibility version. Before uploading a local context, the provider
+context contents, build args, explicit Compose image tag if any, and the
+build-cache schema. Before uploading a local context, the provider
 checks `GET /v1/images` for a matching pushed image and `GET /v1/images/builds`
 for a matching active build. This keeps repeated Harbor/Inspect samples from
 rebuilding the same environment after a previous pushed build is available or

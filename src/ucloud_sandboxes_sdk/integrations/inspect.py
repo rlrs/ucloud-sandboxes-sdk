@@ -213,12 +213,13 @@ class UCloudSandboxEnvironment(SandboxEnvironment):
         interrupted: bool,
     ) -> None:
         del task_name, config
-        if not environments or interrupted:
+        if not environments:
             return
         for env in environments.values():
             sandbox = env.as_type(UCloudSandboxEnvironment)
             try:
-                await sandbox.handle.delete()
+                if not interrupted:
+                    await sandbox.handle.delete()
             finally:
                 await sandbox.client.close()
 
@@ -716,11 +717,7 @@ def _parse_memory_mb(value: object) -> int:
 
 
 def _settings_from_env() -> _InspectSettings:
-    base_url = (
-        os.environ.get("UCLOUD_SANDBOX_URL")
-        or os.environ.get("UCLOUD_SANDBOX_API_URL")
-        or os.environ.get("UCLOUD_SANDBOX_BASE_URL")
-    )
+    base_url = os.environ.get("UCLOUD_SANDBOX_URL")
     if not base_url:
         raise ValueError(
             "Set UCLOUD_SANDBOX_URL to the UCloud sandbox gateway or node-agent URL."
@@ -864,7 +861,12 @@ async def _build_image_with_wait(
                 deadline=deadline,
                 timeout_seconds=timeout_seconds,
             )
-    build_id = str(submitted.get("build_id") or submitted.get("image_id") or "")
+    build_id = submitted.get("build_id")
+    if not isinstance(build_id, str) or not build_id:
+        raise SandboxApiError(
+            "gateway returned an invalid image build payload",
+            body={"build": submitted},
+        )
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise TimeoutError(f"image build did not finish: {build_id}")
