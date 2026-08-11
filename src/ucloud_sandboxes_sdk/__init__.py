@@ -23,8 +23,6 @@ from .client import (
 )
 from .relay import (
     AsyncRelayWorkerClient,
-    HttpTunnelConfig,
-    ModelRelayConfig,
     RelayApiError,
     RelayPollResult,
     RelayRequest,
@@ -44,7 +42,6 @@ __all__ = [
     "ExecEventHistoryLostError",
     "Image",
     "JobHandle",
-    "HttpTunnelConfig",
     "SandboxApiError",
     "SandboxClient",
     "SandboxExecResult",
@@ -57,7 +54,6 @@ __all__ = [
     "SandboxSshSpec",
     "SandboxSshTarget",
     "sandbox_auth_headers",
-    "ModelRelayConfig",
     "RelayApiError",
     "RelayPollResult",
     "RelayRequest",

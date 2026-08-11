@@ -16,7 +16,6 @@ from urllib.parse import parse_qs, urlparse
 import ucloud_sandboxes_sdk.relay as relay_module
 from ucloud_sandboxes_sdk import (
     AsyncRelayWorkerClient,
-    HttpTunnelConfig,
     RelayApiError,
     RelayRequest,
     RelayWorkerClient,
@@ -28,7 +27,7 @@ from ucloud_sandboxes_sdk import (
 REGISTRATION_TOKEN = "0123456789abcdef0123456789abcdef"
 
 
-class ModelRelayConfigTests(unittest.TestCase):
+class RelayUrlConfigTests(unittest.TestCase):
     def test_builds_path_scoped_openai_environment(self) -> None:
         env = model_relay_env(
             "https://relay.example.org/",
@@ -43,44 +42,29 @@ class ModelRelayConfigTests(unittest.TestCase):
         )
         self.assertEqual(env["OPENAI_API_KEY"], "sandbox-token")
 
-    def test_builds_general_http_tunnel_url_and_auth_headers(self) -> None:
-        config = HttpTunnelConfig(
-            "https://relay.example.org/",
-            "run:001",
-            relay_token="sandbox-token",
-        )
-
+    def test_builds_general_http_tunnel_url(self) -> None:
         self.assertEqual(
-            config.base_url,
+            http_tunnel_url("https://relay.example.org/", "run:001"),
             "https://relay.example.org/tunnels/run%3A001/",
         )
         self.assertEqual(
-            http_tunnel_url(config.relay_url, config.rollout_id, "/api/items"),
+            http_tunnel_url("https://relay.example.org/", "run:001", "/api/items"),
             "https://relay.example.org/tunnels/run%3A001/api/items",
         )
-        self.assertEqual(config.headers(), {"X-UCloud-Relay-Token": "sandbox-token"})
 
     def test_builds_registration_scoped_tunnel_capability_url(self) -> None:
-        config = HttpTunnelConfig(
-            "https://relay.example.org/",
-            "run:001",
-            registration_token=REGISTRATION_TOKEN,
-        )
-
         expected = (
             "https://relay.example.org/tunnels/run%3A001/_relay/"
             f"{REGISTRATION_TOKEN}/"
         )
-        self.assertEqual(config.base_url, expected)
         self.assertEqual(
             http_tunnel_url(
-                config.relay_url,
-                config.rollout_id,
+                "https://relay.example.org/",
+                "run:001",
                 registration_token=REGISTRATION_TOKEN,
             ),
             expected,
         )
-        self.assertEqual(config.headers(), {})
 
     def test_rejects_invalid_tunnel_registration_capability(self) -> None:
         with self.assertRaisesRegex(RelayApiError, "registration_token"):
@@ -108,6 +92,19 @@ class RelayWorkerClientTests(unittest.TestCase):
                 payload["registration_token"] = token
                 with self.assertRaises(RelayApiError):
                     RelayRequest.from_payload(payload)
+
+    def test_relay_request_requires_exact_tagged_body(self) -> None:
+        valid = _relay_request(rollout_id="run-001", leased_by="worker-1")
+        for body in (
+            None,
+            {"encoding": "json"},
+            {"encoding": "json", "value": {}, "extra": True},
+            {"encoding": "text", "value": "payload"},
+            {"encoding": "base64", "value": "%%%"},
+        ):
+            with self.subTest(body=body):
+                with self.assertRaises(RelayApiError):
+                    RelayRequest.from_payload({**valid, "body": body})
 
     def test_registration_requires_matching_rollout_and_valid_token(self) -> None:
         with running_relay() as relay:
@@ -144,7 +141,7 @@ class RelayWorkerClientTests(unittest.TestCase):
             ) as client:
                 await client.register_rollout("run-async")
                 result = await client.poll("run-async", timeout_seconds=0.1)
-                self.assertIsNotNone(result.request)
+                self.assertEqual(len(result.requests), 1)
 
         with running_relay() as relay:
             relay.state.poll_delay_seconds = 0.05
@@ -154,8 +151,9 @@ class RelayWorkerClientTests(unittest.TestCase):
                 timeout_seconds=0.02,
             )
             sync_client.register_rollout("run-sync")
-            self.assertIsNotNone(
-                sync_client.poll("run-sync", timeout_seconds=0.1).request
+            self.assertEqual(
+                len(sync_client.poll("run-sync", timeout_seconds=0.1).requests),
+                1,
             )
             asyncio.run(poll_async(relay.base_url))
 
@@ -253,9 +251,8 @@ class RelayWorkerClientTests(unittest.TestCase):
                 limit=8,
                 lease_seconds=600,
             )
-            self.assertIsNotNone(poll.request)
-            request = poll.request
-            assert request is not None
+            self.assertEqual(len(poll.requests), 1)
+            request = poll.requests[0]
             renewed = client.renew_request(
                 request,
                 worker_id="worker-1",
@@ -302,6 +299,15 @@ class RelayWorkerClientTests(unittest.TestCase):
             relay.state.last_respond_payload["registration_token"],
             REGISTRATION_TOKEN,
         )
+        self.assertEqual(
+            relay.state.last_respond_payload["body"],
+            {
+                "encoding": "json",
+                "value": {"choices": [{"message": {"content": "ok"}}]},
+            },
+        )
+        self.assertNotIn("response", relay.state.last_respond_payload)
+        self.assertNotIn("body_base64", relay.state.last_respond_payload)
         self.assertEqual(relay.state.last_error_payload["status"], 503)
 
     def test_sync_worker_client_forwards_binary_http_request_and_response(self) -> None:
@@ -325,20 +331,23 @@ class RelayWorkerClientTests(unittest.TestCase):
         self.assertEqual(relay.state.upstream_body, b"\x00\xffrequest")
         self.assertEqual(relay.state.last_respond_payload["status"], 207)
         self.assertEqual(
-            base64.b64decode(relay.state.last_respond_payload["body_base64"]),
+            base64.b64decode(relay.state.last_respond_payload["body"]["value"]),
             b"\xffresponse",
+        )
+        self.assertEqual(
+            relay.state.last_respond_payload["body"]["encoding"],
+            "base64",
         )
 
     def test_binary_response_limit_is_checked_before_base64_encoding(self) -> None:
+        relay_request = RelayRequest.from_payload(
+            _relay_request(rollout_id="bounded", leased_by="worker")
+        )
+
         async def respond_async() -> None:
             client = AsyncRelayWorkerClient("https://relay.invalid")
             with self.assertRaisesRegex(RelayApiError, "4 byte limit"):
-                await client.respond_bytes(
-                    "req-1",
-                    "lease-1",
-                    b"12345",
-                    registration_token=REGISTRATION_TOKEN,
-                )
+                await client.respond_to(relay_request, b"12345")
 
         with (
             patch.object(relay_module, "MAX_RELAY_HTTP_BODY_BYTES", 4),
@@ -346,12 +355,7 @@ class RelayWorkerClientTests(unittest.TestCase):
         ):
             client = RelayWorkerClient("https://relay.invalid")
             with self.assertRaisesRegex(RelayApiError, "4 byte limit"):
-                client.respond_bytes(
-                    "req-1",
-                    "lease-1",
-                    b"12345",
-                    registration_token=REGISTRATION_TOKEN,
-                )
+                client.respond_to(relay_request, b"12345")
             asyncio.run(respond_async())
 
         encode.assert_not_called()
@@ -424,9 +428,9 @@ class RelayWorkerClientTests(unittest.TestCase):
                     timeout_seconds=0,
                     lease_seconds=600,
                 )
-                assert poll.request is not None
+                self.assertEqual(len(poll.requests), 1)
                 renewed = await client.renew_request(
-                    poll.request,
+                    poll.requests[0],
                     worker_id="worker-async",
                     lease_seconds=1200,
                 )
@@ -571,7 +575,7 @@ class FakeRelayHandler(BaseHTTPRequestHandler):
                     or query.get("registration_token", [""])[0]
                 ),
             )
-            self._write_json({"request": request, "requests": [request]})
+            self._write_json({"requests": [request]})
             return
         self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
@@ -732,9 +736,14 @@ def _relay_request(
         "endpoint": endpoint,
         "method": "POST",
         "headers": {"X-Relay": "yes", "Content-Type": content_type},
-        "body": json_body if body is None else None,
-        "body_base64": base64.b64encode(raw_body).decode("ascii"),
-        "body_size": len(raw_body),
+        "body": (
+            {"encoding": "json", "value": json_body}
+            if body is None
+            else {
+                "encoding": "base64",
+                "value": base64.b64encode(raw_body).decode("ascii"),
+            }
+        ),
         "created_at": 1.0,
         "delivered_at": 2.0,
         "first_delivered_at": 2.0,

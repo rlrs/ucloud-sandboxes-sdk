@@ -39,7 +39,7 @@ Raw HTTP callers should send the same token as
 ## Sandboxes
 
 ```python
-from ucloud_sandboxes_sdk import Image, SandboxClient
+from ucloud_sandboxes_sdk import Image, SandboxClient, SandboxSpec
 
 client = SandboxClient(
     "https://app-sandboxes.cloud.sdu.dk",
@@ -47,14 +47,16 @@ client = SandboxClient(
 )
 
 sandbox = client.create_sandbox(
-    id="example",
-    image=Image.from_registry("python:3.12-slim"),
-    command=["sleep", "300"],
-    cpus=1,
-    memory_mb=2048,
-    disk_mb=10240,
-    ttl_seconds=600,
-    parkable=True,
+    SandboxSpec(
+        id="example",
+        image=Image.from_registry("python:3.12-slim"),
+        command=["sleep", "300"],
+        cpus=1,
+        memory_mb=2048,
+        disk_mb=10240,
+        ttl_seconds=600,
+        parkable=True,
+    )
 )
 try:
     result = sandbox.exec(
@@ -85,7 +87,6 @@ sandbox.upload_file("/workspace/input.txt", b"hello\n")
 data = sandbox.download_file("/workspace/output.txt")
 
 sandbox.upload_file_from_path("local-input.txt", "/workspace/input.txt")
-sandbox.download_file_to_path("/workspace/output.txt", "local-output.txt")
 ```
 
 The same methods are available on `SandboxClient` and `AsyncSandboxClient` when
@@ -97,7 +98,7 @@ When the sandbox needs to call a model endpoint that is only reachable from a
 separate worker environment, point OpenAI-compatible clients at a public relay:
 
 ```python
-from ucloud_sandboxes_sdk import Image, SandboxClient, model_relay_env
+from ucloud_sandboxes_sdk import Image, SandboxClient, SandboxSpec, model_relay_env
 
 relay_env = model_relay_env(
     "https://relay.example.org",
@@ -106,13 +107,16 @@ relay_env = model_relay_env(
 )
 
 sandbox = client.create_sandbox(
-    image=Image.from_registry("registry.example.org/swebench/task:latest"),
-    cpus=1,
-    memory_mb=2048,
-    disk_mb=10240,
-    network="bridge",
-    env=relay_env,
-    labels={"rollout": "run-001"},
+    SandboxSpec(
+        id="run-001",
+        image=Image.from_registry("registry.example.org/swebench/task:latest"),
+        cpus=1,
+        memory_mb=2048,
+        disk_mb=10240,
+        network="bridge",
+        env=relay_env,
+        labels={"rollout": "run-001"},
+    )
 )
 ```
 
@@ -174,7 +178,7 @@ The same relay can expose any buffered HTTP service, not only OpenAI endpoints.
 Register a tunnel and forward each leased request to the worker-local service:
 
 ```python
-from ucloud_sandboxes_sdk import HttpTunnelConfig, RelayWorkerClient
+from ucloud_sandboxes_sdk import RelayWorkerClient, http_tunnel_url
 
 relay = RelayWorkerClient(
     "https://relay.example.org",
@@ -192,13 +196,13 @@ authentication separate means an upstream `Authorization` header can pass
 through unchanged:
 
 ```python
-tunnel = HttpTunnelConfig(
+tunnel_url = http_tunnel_url(
     "https://relay.example.org",
     "dev-api",
-    relay_token="<sandbox-relay-token>",
 )
+tunnel_headers = {"X-UCloud-Relay-Token": "<sandbox-relay-token>"}
 
-# requests.get(tunnel.base_url + "v1/data", headers=tunnel.headers())
+# requests.get(tunnel_url + "v1/data", headers=tunnel_headers)
 ```
 
 The tunnel preserves methods, percent-encoded paths, query strings, headers,
@@ -272,11 +276,14 @@ client.build_image(
 )
 
 sandbox = client.create_sandbox(
-    image=Image.from_name("python-base"),
-    command=["python", "--version"],
-    cpus=1,
-    memory_mb=2048,
-    disk_mb=10240,
+    SandboxSpec(
+        id="python-version",
+        image=Image.from_name("python-base"),
+        command=["python", "--version"],
+        cpus=1,
+        memory_mb=2048,
+        disk_mb=10240,
+    )
 )
 ```
 
@@ -301,10 +308,13 @@ After a managed build, create sandboxes with the recorded image id:
 
 ```python
 client.create_sandbox(
-    image=Image.from_name("python-base"),
-    cpus=1,
-    memory_mb=2048,
-    disk_mb=10240,
+    SandboxSpec(
+        id="python-base-example",
+        image=Image.from_name("python-base"),
+        cpus=1,
+        memory_mb=2048,
+        disk_mb=10240,
+    )
 )
 ```
 
@@ -333,18 +343,20 @@ are not portable after that node scales down.
 ## Async Client
 
 ```python
-from ucloud_sandboxes_sdk import AsyncSandboxClient, Image
+from ucloud_sandboxes_sdk import AsyncSandboxClient, Image, SandboxSpec
 
 async with AsyncSandboxClient(
     "https://app-sandboxes.cloud.sdu.dk",
     api_token="<token>",
 ) as client:
     sandbox = await client.create_sandbox(
-        id="async-example",
-        image=Image.from_registry("busybox:latest"),
-        cpus=0.5,
-        memory_mb=256,
-        disk_mb=1024,
+        SandboxSpec(
+            id="async-example",
+            image=Image.from_registry("busybox:latest"),
+            cpus=0.5,
+            memory_mb=256,
+            disk_mb=1024,
+        )
     )
     try:
         result = await sandbox.exec(["true"], timeout_seconds=30)
@@ -395,10 +407,7 @@ Inspect request. Reusing an unchanged context across samples or runs reuses a
 pushed gateway image record; if another client already has the same build
 running, the provider waits for that build instead of submitting another copy
 of the context.
-For Dockerfile and Compose builds, the provider adds empty
-writable Harbor harness directories (`/tests`, `/logs/agent`, `/logs/verifier`,
-`/task`, and `/oracle`) in the built image without copying test files into the
-image. Multi-service Compose is rejected until the UCloud node agent has
+Multi-service Compose is rejected until the UCloud node agent has
 project-level Compose support. Inspect `read_file()` and `write_file()` use the
 gateway file endpoints. When the gateway reports that a sandbox or builder node
 is scaling up, or the gateway connection briefly drops during scale-up, the
@@ -414,18 +423,6 @@ Set `UCLOUD_SANDBOX_SECURITY` to a JSON object to override the profile:
 
 ```bash
 export UCLOUD_SANDBOX_SECURITY='{"user":null,"cap_drop":[],"no_new_privileges":false,"pids_limit":null}'
-```
-
-The same fields can be set individually:
-
-```bash
-export UCLOUD_SANDBOX_SECURITY_USER=""                 # unset Docker --user
-export UCLOUD_SANDBOX_SECURITY_CAP_DROP=""             # comma-separated, empty means none
-export UCLOUD_SANDBOX_SECURITY_CAP_ADD="SYS_PTRACE"
-export UCLOUD_SANDBOX_SECURITY_NO_NEW_PRIVILEGES="0"
-export UCLOUD_SANDBOX_SECURITY_PIDS_LIMIT="none"
-export UCLOUD_SANDBOX_SECURITY_READ_ONLY_ROOTFS="false"
-export UCLOUD_SANDBOX_SECURITY_INIT="true"
 ```
 
 Set `UCLOUD_SANDBOX_SSH=1` only for debug sandboxes whose images explicitly

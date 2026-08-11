@@ -186,38 +186,6 @@ class InspectIntegrationTests(unittest.TestCase):
             ),
         )
 
-    def test_settings_from_env_applies_security_field_overrides(self) -> None:
-        from ucloud_sandboxes_sdk.integrations import inspect as inspect_integration
-
-        with patch.dict(
-            os.environ,
-            {
-                "UCLOUD_SANDBOX_URL": "http://gateway.invalid",
-                "UCLOUD_SANDBOX_SECURITY_USER": "",
-                "UCLOUD_SANDBOX_SECURITY_CAP_DROP": "",
-                "UCLOUD_SANDBOX_SECURITY_CAP_ADD": "SYS_PTRACE, NET_ADMIN",
-                "UCLOUD_SANDBOX_SECURITY_NO_NEW_PRIVILEGES": "0",
-                "UCLOUD_SANDBOX_SECURITY_PIDS_LIMIT": "none",
-                "UCLOUD_SANDBOX_SECURITY_READ_ONLY_ROOTFS": "true",
-                "UCLOUD_SANDBOX_SECURITY_INIT": "false",
-            },
-            clear=True,
-        ):
-            settings = inspect_integration._settings_from_env()
-
-        self.assertEqual(
-            settings.security,
-            SandboxSecuritySpec(
-                user=None,
-                cap_drop=(),
-                cap_add=("SYS_PTRACE", "NET_ADMIN"),
-                no_new_privileges=False,
-                pids_limit=None,
-                read_only_rootfs=True,
-                init=False,
-            ),
-        )
-
     def test_sample_init_passes_security_profile_to_create(self) -> None:
         from ucloud_sandboxes_sdk.integrations import inspect as inspect_integration
 
@@ -242,9 +210,9 @@ class InspectIntegrationTests(unittest.TestCase):
                 os.environ,
                 {
                     "UCLOUD_SANDBOX_URL": "http://gateway.invalid",
-                    "UCLOUD_SANDBOX_SECURITY_USER": "",
-                    "UCLOUD_SANDBOX_SECURITY_CAP_DROP": "",
-                    "UCLOUD_SANDBOX_SECURITY_NO_NEW_PRIVILEGES": "false",
+                    "UCLOUD_SANDBOX_SECURITY": (
+                        '{"user":null,"cap_drop":[],"no_new_privileges":false}'
+                    ),
                 },
                 clear=True,
             ),
@@ -908,64 +876,6 @@ class InspectIntegrationTests(unittest.TestCase):
         self.assertEqual(client.submit_attempts, 1)
         self.assertEqual(client.wait_attempts, 1)
 
-    def test_inspect_builds_add_writable_harbor_harness_dirs(self) -> None:
-        from ucloud_sandboxes_sdk.integrations import inspect as inspect_integration
-
-        with TemporaryDirectory() as tmp_dir:
-            context = Path(tmp_dir)
-            dockerfile = context / "Dockerfile"
-            dockerfile.write_text("FROM python:3.12-slim\nUSER app\n")
-            client = _BuildCaptureClient()
-
-            asyncio.run(
-                inspect_integration._build_image_with_wait(
-                    client,
-                    Image.from_dockerfile(
-                        name="harbor-build",
-                        tag="registry.invalid/harbor-build:latest",
-                        context_path=context,
-                    ),
-                    settings=_settings(inspect_integration),
-                )
-            )
-
-            original_dockerfile = dockerfile.read_text()
-
-        self.assertEqual(original_dockerfile, "FROM python:3.12-slim\nUSER app\n")
-        self.assertEqual(len(client.dockerfiles), 1)
-        self.assertNotEqual(client.context_paths[0], str(context))
-        self.assertIn("USER 0", client.dockerfiles[0])
-        self.assertIn(
-            "mkdir -p /tests /logs/agent /logs/verifier /task /oracle",
-            client.dockerfiles[0],
-        )
-        self.assertIn("chmod -R 0777 /tests /logs /task /oracle", client.dockerfiles[0])
-        self.assertTrue(client.dockerfiles[0].rstrip().endswith("USER app"))
-
-    def test_harbor_harness_dockerfile_adapter_ignores_previous_stage_user(
-        self,
-    ) -> None:
-        from ucloud_sandboxes_sdk.integrations import inspect as inspect_integration
-
-        adapted = inspect_integration._dockerfile_with_harbor_harness_dirs(
-            "\n".join(
-                [
-                    "FROM python:3.12-slim AS builder",
-                    "USER builder",
-                    "RUN true",
-                    "FROM python:3.12-slim",
-                    "RUN true",
-                    "",
-                ]
-            )
-        )
-
-        self.assertIn("USER 0", adapted)
-        self.assertIn(
-            "mkdir -p /tests /logs/agent /logs/verifier /task /oracle", adapted
-        )
-        self.assertFalse(adapted.rstrip().endswith("USER builder"))
-
     def test_sample_id_helpers_accept_numeric_metadata(self) -> None:
         from ucloud_sandboxes_sdk.integrations import inspect as inspect_integration
 
@@ -1020,13 +930,10 @@ class InspectIntegrationTests(unittest.TestCase):
         self.assertLessEqual(len(build.id), 64)
         self.assertEqual(build.id, expected_id)
         self.assertIsNone(build.tag)
-        self.assertNotEqual(build.context_path, str(context.resolve()))
+        self.assertEqual(build.context_path, str(context.resolve()))
         self.assertEqual(build.dockerfile, "Dockerfile")
         self.assertEqual(launch.image.name, client.images[0].name)
-        self.assertIn(
-            "mkdir -p /tests /logs/agent /logs/verifier /task /oracle",
-            client.dockerfiles[0],
-        )
+        self.assertEqual(client.dockerfiles, ["FROM python:3.12-slim\n"])
         self.assertEqual(launch.command, ["sh", "-lc", "tail -f /dev/null"])
         self.assertEqual(launch.env, {"HARBOR": "1"})
         self.assertEqual(launch.cpus, 2.0)
@@ -1116,17 +1023,14 @@ class InspectIntegrationTests(unittest.TestCase):
 
         self.assertEqual(len(client.images), 1)
         build = client.images[0].to_build_spec()
-        self.assertNotEqual(build.context_path, str(context.resolve()))
+        self.assertEqual(build.context_path, str(context.resolve()))
         self.assertEqual(build.dockerfile, "Dockerfile.custom")
         self.assertIsNone(build.tag)
         self.assertEqual(
             build.id,
             expected_id,
         )
-        self.assertIn(
-            "mkdir -p /tests /logs/agent /logs/verifier /task /oracle",
-            client.dockerfiles[0],
-        )
+        self.assertEqual(client.dockerfiles, ["FROM python:3.12-slim\n"])
         self.assertEqual(launch.command, ["sleep", "infinity"])
         self.assertEqual(launch.env, {"A": "B"})
         self.assertEqual(launch.cpus, 4.0)

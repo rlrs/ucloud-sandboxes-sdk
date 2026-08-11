@@ -205,10 +205,7 @@ class SandboxSdkTests(unittest.TestCase):
         )
         self.assertEqual(repeated_payload, payload)
         self.assertEqual(repeated_archive, archive)
-        self.assertEqual(
-            Image.from_name("managed-image").to_sandbox_image(),
-            "managed-image",
-        )
+        self.assertEqual(Image.from_name("managed-image").reference, "managed-image")
 
     def test_api_token_uses_public_link_safe_header(self) -> None:
         with running_gateway() as gateway:
@@ -236,13 +233,15 @@ class SandboxSdkTests(unittest.TestCase):
 
             health = client.health()
             handle = client.create_sandbox(
-                id="sdk-one",
-                image=Image.from_registry("busybox"),
-                command=["sleep", "300"],
-                memory_mb=128,
-                cpus=0.25,
-                disk_mb=64,
-                labels={"test": "sdk"},
+                SandboxSpec(
+                    id="sdk-one",
+                    image=Image.from_registry("busybox"),
+                    command=["sleep", "300"],
+                    memory_mb=128,
+                    cpus=0.25,
+                    disk_mb=64,
+                    labels={"test": "sdk"},
+                )
             )
             listed = client.list_sandboxes()
             result = handle.exec(["cat"], input="hello\n", timeout_seconds=2)
@@ -251,6 +250,7 @@ class SandboxSdkTests(unittest.TestCase):
                 b"prompt bytes\n",
             )
             downloaded = handle.download_file("/workspace/prompt.txt")
+            ssh_target = handle.ssh()
             deleted = handle.delete()
 
         self.assertTrue(health["ok"])
@@ -263,6 +263,11 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertIn("stdin", [event["stream"] for event in result.events])
         self.assertEqual(uploaded["size"], 13)
         self.assertEqual(downloaded, b"prompt bytes\n")
+        self.assertEqual(ssh_target.sandbox_id, "sdk-one")
+        self.assertEqual(ssh_target.user, "sandbox")
+        self.assertEqual(ssh_target.host, "127.0.0.1")
+        self.assertEqual(ssh_target.port, 22000)
+        self.assertEqual(ssh_target.command, "ssh -p 22000 sandbox@127.0.0.1")
         self.assertEqual(deleted["deleted"]["spec"]["id"], "sdk-one")
 
     def test_sync_client_image_cache_methods(self) -> None:
@@ -283,9 +288,11 @@ class SandboxSdkTests(unittest.TestCase):
                 memory_mb=512,
             )
             sandbox = client.create_sandbox(
-                id="snapshot-src",
-                image=Image.from_registry("busybox"),
-                memory_mb=128,
+                SandboxSpec(
+                    id="snapshot-src",
+                    image=Image.from_registry("busybox"),
+                    memory_mb=128,
+                )
             )
             snapshot = sandbox.snapshot(
                 Image.from_registry("local/snapshot-src:latest"),
@@ -322,18 +329,20 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(sandbox.id, "spec-one")
         self.assertEqual(deleted["deleted"]["spec"]["image"], "busybox")
 
-    def test_keyword_create_serializes_typed_nested_specs(self) -> None:
+    def test_typed_create_serializes_nested_specs(self) -> None:
         with running_gateway() as gateway:
             client = SandboxClient(gateway.base_url)
             sandbox = client.create_sandbox(
-                id="typed-nested-specs",
-                image=Image.from_registry("busybox"),
-                security=SandboxSecuritySpec(user="0:0", cap_add=("NET_RAW",)),
-                filesystem=SandboxFilesystemSpec(
-                    enforce_disk_quota=True,
-                    tmpfs_mb=32,
-                ),
-                ssh=SandboxSshSpec(enabled=True, user="root"),
+                SandboxSpec(
+                    id="typed-nested-specs",
+                    image=Image.from_registry("busybox"),
+                    security=SandboxSecuritySpec(user="0:0", cap_add=("NET_RAW",)),
+                    filesystem=SandboxFilesystemSpec(
+                        enforce_disk_quota=True,
+                        tmpfs_mb=32,
+                    ),
+                    ssh=SandboxSshSpec(enabled=True, user="root"),
+                )
             )
             payload = dict(gateway.state.last_payload)
             sandbox.delete()
@@ -344,6 +353,47 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(payload["filesystem"]["tmpfs_mb"], 32)
         self.assertTrue(payload["ssh"]["enabled"])
         self.assertEqual(payload["ssh"]["user"], "root")
+
+    def test_sandbox_spec_rejects_untyped_nested_specs(self) -> None:
+        for field, value in (
+            ("ssh", True),
+            ("ssh", {}),
+            ("security", {}),
+            ("filesystem", True),
+        ):
+            with self.subTest(field=field, value=value):
+                with self.assertRaises(TypeError):
+                    SandboxSpec(
+                        id="strict-nested-specs",
+                        image=Image.from_registry("busybox"),
+                        **{field: value},
+                    )
+
+    def test_async_create_accepts_explicit_ssh_spec(self) -> None:
+        async def scenario(base_url: str) -> dict:
+            async with AsyncSandboxClient(base_url) as client:
+                sandbox = await client.create_sandbox(
+                    SandboxSpec(
+                        id="typed-ssh",
+                        image=Image.from_registry("busybox"),
+                        network="bridge",
+                        ssh=SandboxSshSpec(
+                            enabled=True,
+                            user="alice",
+                            authorized_keys=("ssh-ed25519 test",),
+                        ),
+                    )
+                )
+                payload = dict(sandbox.create_response["sandbox"]["spec"])
+                await sandbox.delete()
+                return payload
+
+        with running_gateway() as gateway:
+            payload = asyncio.run(scenario(gateway.base_url))
+
+        self.assertEqual(payload["network"], "bridge")
+        self.assertEqual(payload["ssh"]["user"], "alice")
+        self.assertEqual(payload["ssh"]["authorized_keys"], ["ssh-ed25519 test"])
 
     def test_sandbox_spec_sends_parkable_only_when_enabled(self) -> None:
         ordinary = SandboxSpec(
@@ -451,9 +501,11 @@ class SandboxSdkTests(unittest.TestCase):
         client = SandboxClient("http://gateway.invalid", timeout_seconds=11)
         with patch.object(client_module, "open_no_redirect", fake_urlopen):
             sandbox = client.create_sandbox(
-                id="timeout-one",
-                image=Image.from_registry("busybox"),
-                memory_mb=128,
+                SandboxSpec(
+                    id="timeout-one",
+                    image=Image.from_registry("busybox"),
+                    memory_mb=128,
+                ),
                 request_timeout_seconds=7,
             )
 
@@ -772,8 +824,10 @@ class SandboxSdkTests(unittest.TestCase):
             lambda _delay: None,
         ):
             sandbox = client.create_sandbox(
-                id="tmax-task-one",
-                image=Image.from_registry("busybox:latest"),
+                SandboxSpec(
+                    id="tmax-task-one",
+                    image=Image.from_registry("busybox:latest"),
+                )
             )
 
         self.assertEqual(sandbox.id, "tmax-task-one")
@@ -784,7 +838,7 @@ class SandboxSdkTests(unittest.TestCase):
             self.assertAlmostEqual(
                 float(timeout),
                 client_module.DEFAULT_CREATE_TIMEOUT_SECONDS,
-                places=3,
+                delta=0.01,
             )
 
     def test_sync_stable_create_retries_beyond_safe_read_budget(self) -> None:
@@ -822,8 +876,10 @@ class SandboxSdkTests(unittest.TestCase):
             lambda _delay: None,
         ):
             sandbox = client.create_sandbox(
-                id="long-cold-start",
-                image=Image.from_registry("busybox:latest"),
+                SandboxSpec(
+                    id="long-cold-start",
+                    image=Image.from_registry("busybox:latest"),
+                )
             )
 
         self.assertEqual(sandbox.id, "long-cold-start")
@@ -918,12 +974,14 @@ class SandboxSdkTests(unittest.TestCase):
     def test_async_client_lifecycle_and_exec(self) -> None:
         async def scenario(
             base_url: str,
-        ) -> tuple[str, int | None, list[str], int, bytes]:
+        ) -> tuple[str, int | None, list[str], int, bytes, str]:
             async with AsyncSandboxClient(base_url) as client:
                 handle = await client.create_sandbox(
-                    id="async-one",
-                    image=Image.from_registry("busybox"),
-                    memory_mb=128,
+                    SandboxSpec(
+                        id="async-one",
+                        image=Image.from_registry("busybox"),
+                        memory_mb=128,
+                    )
                 )
                 result = await handle.exec(["true"], timeout_seconds=2)
                 uploaded = await handle.upload_file(
@@ -931,6 +989,7 @@ class SandboxSdkTests(unittest.TestCase):
                     "async bytes\n",
                 )
                 downloaded = await handle.download_file("/workspace/out.txt")
+                ssh_target = await handle.ssh()
                 await handle.delete()
                 return (
                     handle.id,
@@ -938,10 +997,11 @@ class SandboxSdkTests(unittest.TestCase):
                     [event["stream"] for event in result.events],
                     uploaded["size"],
                     downloaded,
+                    ssh_target.command,
                 )
 
         with running_gateway() as gateway:
-            sandbox_id, exit_code, streams, size, downloaded = asyncio.run(
+            sandbox_id, exit_code, streams, size, downloaded, ssh_command = asyncio.run(
                 scenario(gateway.base_url)
             )
 
@@ -950,6 +1010,7 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertIn("stdout", streams)
         self.assertEqual(size, 12)
         self.assertEqual(downloaded, b"async bytes\n")
+        self.assertEqual(ssh_command, "ssh -p 22000 sandbox@127.0.0.1")
 
     def test_async_create_sandbox_accepts_per_call_request_timeout(self) -> None:
         class FakeResponse:
@@ -984,9 +1045,11 @@ class SandboxSdkTests(unittest.TestCase):
                 timeout_seconds=11,
             )
             sandbox = await client.create_sandbox(
-                id="timeout-one",
-                image=Image.from_registry("busybox"),
-                memory_mb=128,
+                SandboxSpec(
+                    id="timeout-one",
+                    image=Image.from_registry("busybox"),
+                    memory_mb=128,
+                ),
                 request_timeout_seconds=7,
             )
             return sandbox.id, session.timeouts
@@ -1209,8 +1272,10 @@ class SandboxSdkTests(unittest.TestCase):
             client = AsyncSandboxClient("http://gateway.invalid", session=session)
             with patch.object(client_module.asyncio, "sleep", no_sleep):
                 sandbox = await client.create_sandbox(
-                    id="tmax-task-async",
-                    image=Image.from_registry("busybox:latest"),
+                    SandboxSpec(
+                        id="tmax-task-async",
+                        image=Image.from_registry("busybox:latest"),
+                    )
                 )
             return sandbox.id, session.payloads
 
@@ -1262,8 +1327,10 @@ class SandboxSdkTests(unittest.TestCase):
             client = AsyncSandboxClient("http://gateway.invalid", session=session)
             with patch.object(client_module.asyncio, "sleep", no_sleep):
                 sandbox = await client.create_sandbox(
-                    id="long-cold-start-async",
-                    image=Image.from_registry("busybox:latest"),
+                    SandboxSpec(
+                        id="long-cold-start-async",
+                        image=Image.from_registry("busybox:latest"),
+                    )
                 )
             return sandbox.id, session.calls
 

@@ -54,16 +54,8 @@ sends a registry tag, `Image.from_name(...)` sends a gateway image id, and
 `Image.from_dockerfile(...)` carries build metadata for `build_image()`.
 The gateway owns placement and may return `503` while nodes are scaling up.
 
-The Inspect AI provider reads sandbox security settings from environment
-variables and passes them as `security` on `POST /v1/sandboxes`. Use
-`UCLOUD_SANDBOX_SECURITY` for a JSON object, or set individual fields with
-`UCLOUD_SANDBOX_SECURITY_USER`, `UCLOUD_SANDBOX_SECURITY_CAP_DROP`,
-`UCLOUD_SANDBOX_SECURITY_CAP_ADD`,
-`UCLOUD_SANDBOX_SECURITY_NO_NEW_PRIVILEGES`,
-`UCLOUD_SANDBOX_SECURITY_PIDS_LIMIT`,
-`UCLOUD_SANDBOX_SECURITY_READ_ONLY_ROOTFS`, and
-`UCLOUD_SANDBOX_SECURITY_INIT`. Empty `USER`, empty `CAP_DROP`, and
-`PIDS_LIMIT=none` allow root-oriented benchmark images when explicitly chosen.
+The Inspect AI provider reads `UCLOUD_SANDBOX_SECURITY` as a JSON object and
+passes it as `security` on `POST /v1/sandboxes`.
 
 ## Images
 
@@ -167,7 +159,6 @@ The SDK exposes these as:
 - `upload_file(...)`
 - `upload_file_from_path(...)`
 - `download_file(...)`
-- `download_file_to_path(...)`
 
 The sandbox handle methods use the same operations with the handle's sandbox id.
 Inspect `read_file()` and `write_file()` call these endpoints.

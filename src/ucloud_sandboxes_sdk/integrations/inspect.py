@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 import errno
@@ -12,11 +11,9 @@ import math
 import os
 from pathlib import Path, PurePosixPath
 import re
-import shutil
 import sys
-from tempfile import TemporaryDirectory
 import time
-from typing import Any, Iterator, Literal, Mapping, overload
+from typing import Any, Literal, Mapping, overload
 from uuid import uuid4
 
 from aiohttp import ClientError
@@ -42,6 +39,7 @@ from ucloud_sandboxes_sdk import (
     SandboxApiError,
     SandboxSecuritySpec,
     SandboxSpec,
+    SandboxSshSpec,
     sandbox_auth_headers,
 )
 
@@ -56,7 +54,6 @@ DEFAULT_RETRY_INTERVAL_SECONDS = 10.0
 DEFAULT_SCALE_UP_REQUEST_TIMEOUT_SECONDS = 30.0
 DEFAULT_CLEANUP_TIMEOUT_SECONDS = 60.0
 BUILD_CACHE_VERSION = "ucloud-inspect-build-v1"
-HARBOR_HARNESS_DIRS = ("/tests", "/logs/agent", "/logs/verifier", "/task", "/oracle")
 INSPECT_CREATED_BY = "inspect-ai"
 logger = getLogger(__name__)
 _running_sandboxes: ContextVar[list[tuple[str, str, dict[str, str]]]] = ContextVar(
@@ -195,10 +192,10 @@ class UCloudSandboxEnvironment(SandboxEnvironment):
                     disk_mb=settings.disk_mb,
                     network=network,
                     ttl_seconds=settings.ttl_seconds,
-                    ssh={
-                        "enabled": settings.ssh_enabled,
-                        "user": settings.ssh_user,
-                    },
+                    ssh=SandboxSshSpec(
+                        enabled=settings.ssh_enabled,
+                        user=settings.ssh_user,
+                    ),
                     security=settings.security,
                     labels=labels,
                 ),
@@ -381,10 +378,7 @@ class UCloudSandboxEnvironment(SandboxEnvironment):
         del user
         command = ""
         try:
-            target = await self.handle.ssh()
-            ssh = target.get("ssh")
-            if isinstance(ssh, dict):
-                command = str(ssh.get("command") or "")
+            command = (await self.handle.ssh()).command
         except SandboxApiError:
             command = ""
         return SandboxConnection(
@@ -608,7 +602,6 @@ def _build_context_fingerprint(
                 str(key): str(value) for key, value in sorted(build_args.items())
             },
             "tag": tag,
-            "harbor_harness_dirs": HARBOR_HARNESS_DIRS,
         },
     )
     if not context_path.is_dir():
@@ -808,26 +801,6 @@ def _security_from_env() -> SandboxSecuritySpec:
         if not isinstance(parsed, dict):
             raise ValueError("UCLOUD_SANDBOX_SECURITY must be a JSON object.")
         data.update(parsed)
-    if "UCLOUD_SANDBOX_SECURITY_USER" in os.environ:
-        data["user"] = _optional_string_env("UCLOUD_SANDBOX_SECURITY_USER")
-    if "UCLOUD_SANDBOX_SECURITY_CAP_DROP" in os.environ:
-        data["cap_drop"] = _csv_env("UCLOUD_SANDBOX_SECURITY_CAP_DROP")
-    if "UCLOUD_SANDBOX_SECURITY_CAP_ADD" in os.environ:
-        data["cap_add"] = _csv_env("UCLOUD_SANDBOX_SECURITY_CAP_ADD")
-    if "UCLOUD_SANDBOX_SECURITY_NO_NEW_PRIVILEGES" in os.environ:
-        data["no_new_privileges"] = _bool_env(
-            "UCLOUD_SANDBOX_SECURITY_NO_NEW_PRIVILEGES",
-            True,
-        )
-    if "UCLOUD_SANDBOX_SECURITY_PIDS_LIMIT" in os.environ:
-        data["pids_limit"] = _optional_int_env("UCLOUD_SANDBOX_SECURITY_PIDS_LIMIT")
-    if "UCLOUD_SANDBOX_SECURITY_READ_ONLY_ROOTFS" in os.environ:
-        data["read_only_rootfs"] = _bool_env(
-            "UCLOUD_SANDBOX_SECURITY_READ_ONLY_ROOTFS",
-            False,
-        )
-    if "UCLOUD_SANDBOX_SECURITY_INIT" in os.environ:
-        data["init"] = _bool_env("UCLOUD_SANDBOX_SECURITY_INIT", True)
     return SandboxSecuritySpec(
         user=_optional_string(data.get("user")),
         cap_drop=_string_tuple(data.get("cap_drop")),
@@ -916,23 +889,22 @@ async def _build_image_with_wait(
 ) -> dict[str, Any]:
     timeout_seconds = max(0, int(settings.build_timeout_seconds))
     deadline = time.monotonic() + timeout_seconds
-    with _harbor_compatible_build_image(image) as build_image:
-        cached = await _available_built_image(client, build_image)
-        if cached is not None:
-            return {
-                "status": "succeeded",
-                "cached": True,
-                "image": cached,
-            }
-        submitted = await _active_image_build(client, build_image)
-        if submitted is None:
-            submitted = await _submit_image_build_with_recovery(
-                client,
-                build_image,
-                settings=settings,
-                deadline=deadline,
-                timeout_seconds=timeout_seconds,
-            )
+    cached = await _available_built_image(client, image)
+    if cached is not None:
+        return {
+            "status": "succeeded",
+            "cached": True,
+            "image": cached,
+        }
+    submitted = await _active_image_build(client, image)
+    if submitted is None:
+        submitted = await _submit_image_build_with_recovery(
+            client,
+            image,
+            settings=settings,
+            deadline=deadline,
+            timeout_seconds=timeout_seconds,
+        )
     build_id = submitted.get("build_id")
     if not isinstance(build_id, str) or not build_id:
         raise SandboxApiError(
@@ -1195,87 +1167,6 @@ async def _sleep_with_deadline(seconds: float, deadline: float) -> None:
     await asyncio.sleep(min(max(0.0, seconds), remaining))
 
 
-@contextmanager
-def _harbor_compatible_build_image(image: Image) -> Iterator[Image]:
-    spec = image.to_build_spec()
-    context_path = Path(spec.context_path)
-    dockerfile = Path(spec.dockerfile)
-    if dockerfile.is_absolute() or not context_path.is_dir():
-        yield image
-        return
-    source_dockerfile = context_path / dockerfile
-    if not source_dockerfile.is_file():
-        yield image
-        return
-    with TemporaryDirectory(prefix="ucloud-inspect-build-") as raw_dir:
-        adapted_context = Path(raw_dir) / "context"
-        shutil.copytree(context_path, adapted_context, symlinks=True)
-        adapted_dockerfile = adapted_context / dockerfile
-        original = adapted_dockerfile.read_text(encoding="utf-8")
-        adapted_dockerfile.write_text(
-            _dockerfile_with_harbor_harness_dirs(original),
-            encoding="utf-8",
-        )
-        yield Image.from_dockerfile(
-            name=spec.id,
-            tag=spec.tag,
-            context_path=adapted_context,
-            dockerfile=spec.dockerfile,
-            push=spec.push,
-            build_args=spec.build_args,
-            labels=spec.labels,
-        )
-
-
-def _dockerfile_with_harbor_harness_dirs(dockerfile: str) -> str:
-    final_user = _final_stage_user(dockerfile)
-    harness_dirs = " ".join(HARBOR_HARNESS_DIRS)
-    lines = [
-        dockerfile.rstrip(),
-        "",
-        "# UCloud Inspect/Harbor harness compatibility.",
-        "USER 0",
-        f"RUN mkdir -p {harness_dirs} \\",
-        " && chmod -R 0777 /tests /logs /task /oracle",
-    ]
-    if final_user:
-        lines.append(f"USER {final_user}")
-    return "\n".join(lines) + "\n"
-
-
-def _final_stage_user(dockerfile: str) -> str | None:
-    final_user: str | None = None
-    for line in _dockerfile_logical_lines(dockerfile):
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        instruction, _, argument = stripped.partition(" ")
-        instruction = instruction.upper()
-        if instruction == "FROM":
-            final_user = None
-        elif instruction == "USER":
-            user = argument.strip()
-            if user:
-                final_user = user
-    return final_user
-
-
-def _dockerfile_logical_lines(dockerfile: str) -> list[str]:
-    lines: list[str] = []
-    current = ""
-    for raw_line in dockerfile.splitlines():
-        line = raw_line.rstrip()
-        continued = line.endswith("\\")
-        part = line[:-1].rstrip() if continued else line
-        current = f"{current} {part.lstrip()}".strip() if current else part
-        if not continued:
-            lines.append(current)
-            current = ""
-    if current:
-        lines.append(current)
-    return lines
-
-
 def _registry_image(reference: str) -> Image:
     return Image.from_registry(reference)
 
@@ -1415,22 +1306,11 @@ def _bool_value(value: object) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _optional_string_env(name: str) -> str | None:
-    return _optional_string(os.environ.get(name))
-
-
 def _optional_string(value: object) -> str | None:
     if value is None:
         return None
     text = str(value).strip()
     return text or None
-
-
-def _csv_env(name: str) -> tuple[str, ...]:
-    value = os.environ.get(name)
-    if value is None:
-        return ()
-    return tuple(item.strip() for item in value.split(",") if item.strip())
 
 
 def _string_tuple(value: object) -> tuple[str, ...]:
@@ -1443,10 +1323,6 @@ def _string_tuple(value: object) -> tuple[str, ...]:
     if isinstance(value, tuple):
         return tuple(str(item) for item in value)
     return (str(value),)
-
-
-def _optional_int_env(name: str) -> int | None:
-    return _optional_int(os.environ.get(name))
 
 
 def _optional_int(value: object) -> int | None:

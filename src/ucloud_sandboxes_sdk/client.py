@@ -12,11 +12,18 @@ import json
 from pathlib import Path
 import random
 import re
-import shlex
 import tarfile
 import tempfile
 import time
-from typing import Any, AsyncIterator, BinaryIO, Callable, Iterator, Mapping, Sequence
+from typing import (
+    Any,
+    AsyncIterator,
+    BinaryIO,
+    Callable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from urllib import error, parse, request
 import uuid
 
@@ -75,23 +82,6 @@ class SandboxApiError(RuntimeError):
     def retry_after_seconds(self) -> float | None:
         return _retry_after_seconds(self.headers)
 
-    @property
-    def intent_persisted(self) -> bool | None:
-        if not isinstance(self.body, dict) or not isinstance(
-            self.body.get("intent_persisted"), bool
-        ):
-            return None
-        return self.body["intent_persisted"]
-
-    @property
-    def intents(self) -> tuple[JsonObject, ...]:
-        if not isinstance(self.body, dict):
-            return ()
-        raw = self.body.get("intents")
-        if not isinstance(raw, list):
-            return ()
-        return tuple(dict(item) for item in raw if isinstance(item, dict))
-
 
 class ExecEventHistoryLostError(SandboxApiError):
     def __init__(
@@ -120,8 +110,16 @@ def sandbox_auth_headers(api_token: str | None) -> dict[str, str]:
     return {SANDBOX_TOKEN_HEADER: token} if token else {}
 
 
+class _DataclassPayload:
+    def to_dict(self) -> JsonObject:
+        return {
+            key: list(value) if isinstance(value, tuple) else value
+            for key, value in asdict(self).items()
+        }
+
+
 @dataclass(frozen=True)
-class SandboxSecuritySpec:
+class SandboxSecuritySpec(_DataclassPayload):
     user: str | None = "1000:1000"
     cap_drop: tuple[str, ...] = ("ALL",)
     cap_add: tuple[str, ...] = ()
@@ -130,37 +128,23 @@ class SandboxSecuritySpec:
     read_only_rootfs: bool = False
     init: bool = True
 
-    def to_dict(self) -> JsonObject:
-        raw = asdict(self)
-        raw["cap_drop"] = list(self.cap_drop)
-        raw["cap_add"] = list(self.cap_add)
-        return raw
-
 
 @dataclass(frozen=True)
-class SandboxFilesystemSpec:
+class SandboxFilesystemSpec(_DataclassPayload):
     enforce_disk_quota: bool = False
     workspace_path: str = "/workspace"
     tmpfs_mb: int = 64
     run_tmpfs_mb: int = 16
 
-    def to_dict(self) -> JsonObject:
-        return asdict(self)
-
 
 @dataclass(frozen=True)
-class SandboxSshSpec:
+class SandboxSshSpec(_DataclassPayload):
     enabled: bool = False
     user: str = "root"
     host: str = "127.0.0.1"
     host_port: int | None = None
     container_port: int = 22
     authorized_keys: tuple[str, ...] = ()
-
-    def to_dict(self) -> JsonObject:
-        raw = asdict(self)
-        raw["authorized_keys"] = list(self.authorized_keys)
-        return raw
 
 
 @dataclass(frozen=True)
@@ -170,7 +154,6 @@ class SandboxSshTarget:
     host: str
     port: int
     command: str
-    raw: JsonObject = field(default_factory=dict)
 
     @classmethod
     def from_payload(cls, sandbox_id: str, payload: JsonObject) -> "SandboxSshTarget":
@@ -193,11 +176,7 @@ class SandboxSshTarget:
             host=host,
             port=port,
             command=str(ssh.get("command") or f"ssh -p {port} {user}@{host}"),
-            raw=dict(payload),
         )
-
-    def direct_argv(self) -> list[str]:
-        return ["ssh", "-p", str(self.port), f"{self.user}@{self.host}"]
 
 
 @dataclass(frozen=True)
@@ -212,40 +191,44 @@ class SandboxSpec:
     disk_mb: int | None = None
     network: str = "none"
     ttl_seconds: int | None = None
-    ssh: SandboxSshSpec | Mapping[str, Any] | bool = SandboxSshSpec()
-    security: SandboxSecuritySpec | Mapping[str, Any] | None = SandboxSecuritySpec()
-    filesystem: SandboxFilesystemSpec | Mapping[str, Any] | None = (
-        SandboxFilesystemSpec()
-    )
+    ssh: SandboxSshSpec = SandboxSshSpec()
+    security: SandboxSecuritySpec | None = SandboxSecuritySpec()
+    filesystem: SandboxFilesystemSpec | None = SandboxFilesystemSpec()
     labels: Mapping[str, str] = field(default_factory=dict)
     parkable: bool = False
     managed_process: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.ssh, SandboxSshSpec):
+            raise TypeError("ssh must be a SandboxSshSpec")
+        for name, value, expected in (
+            ("security", self.security, SandboxSecuritySpec),
+            ("filesystem", self.filesystem, SandboxFilesystemSpec),
+        ):
+            if value is not None and not isinstance(value, expected):
+                raise TypeError(f"{name} must be a {expected.__name__} or None")
 
     def to_dict(self) -> JsonObject:
         if self.managed_process and not self.parkable:
             raise ValueError("managed_process requires parkable=True")
         if self.managed_process and self.command:
             raise ValueError("managed_process sandboxes are started with start_job()")
-        payload: JsonObject = {
-            "id": self.id,
-            "image": _image_reference(self.image),
-            "command": [str(item) for item in self.command],
-            "env": dict(self.env),
-            "working_dir": self.working_dir,
-            "memory_mb": self.memory_mb,
-            "cpus": self.cpus,
-            "disk_mb": self.disk_mb,
-            "network": self.network,
-            "ttl_seconds": self.ttl_seconds,
-            "ssh": _nested_payload(self.ssh),
-            "security": _nested_payload(self.security),
-            "filesystem": _nested_payload(self.filesystem),
-            "labels": dict(self.labels),
-        }
-        if self.parkable:
-            payload["parkable"] = True
-        if self.managed_process:
-            payload["managed_process"] = True
+        payload = dict(vars(self))
+        payload.update(
+            image=_image_reference(self.image),
+            command=[str(item) for item in self.command],
+            env=dict(self.env),
+            ssh=self.ssh.to_dict(),
+            security=self.security.to_dict() if self.security is not None else None,
+            filesystem=(
+                self.filesystem.to_dict() if self.filesystem is not None else None
+            ),
+            labels=dict(self.labels),
+        )
+        if not self.parkable:
+            payload.pop("parkable")
+        if not self.managed_process:
+            payload.pop("managed_process")
         return payload
 
 
@@ -258,19 +241,6 @@ class _ImageBuildSpec:
     push: bool = False
     build_args: Mapping[str, str] = field(default_factory=dict)
     labels: Mapping[str, str] = field(default_factory=dict)
-
-    def to_dict(self) -> JsonObject:
-        payload: JsonObject = {
-            "id": self.id,
-            "context_path": self.context_path,
-            "dockerfile": self.dockerfile,
-            "push": self.push,
-            "build_args": dict(self.build_args),
-            "labels": dict(self.labels),
-        }
-        if self.tag is not None:
-            payload["tag"] = self.tag
-        return payload
 
 
 @dataclass(frozen=True)
@@ -323,19 +293,6 @@ class Image:
                 "before calling build_image()"
             )
         return self.build_spec
-
-    def to_sandbox_image(self) -> str:
-        return self.reference
-
-    def to_dict(self) -> JsonObject:
-        payload: JsonObject = {"reference": self.reference}
-        if self.name is not None:
-            payload["name"] = self.name
-        if self.tag is not None:
-            payload["tag"] = self.tag
-        if self.build_spec is not None:
-            payload["build"] = self.build_spec.to_dict()
-        return payload
 
 
 @dataclass(frozen=True)
@@ -467,307 +424,12 @@ class SandboxJobLogChunk:
         )
 
 
-@dataclass
-class SandboxHandle:
-    client: "SandboxClient"
-    id: str
-    record: JsonObject = field(default_factory=dict)
-    create_response: JsonObject = field(default_factory=dict)
-
-    def refresh(self) -> "SandboxHandle":
-        record = self.client.get_sandbox(self.id)
-        if record is not None:
-            self.record = record
-        return self
-
-    def delete(self) -> JsonObject:
-        return self.client.delete_sandbox(self.id)
-
-    def start_exec(
-        self,
-        command: str | Sequence[str],
-        *,
-        env: Mapping[str, str] | None = None,
-        working_dir: str | None = None,
-        stdin: bool = False,
-        tty: bool = False,
-    ) -> "ExecHandle":
-        return self.client.start_exec(
-            self.id,
-            command,
-            env=env,
-            working_dir=working_dir,
-            stdin=stdin,
-            tty=tty,
-        )
-
-    def start_job(
-        self,
-        command: str | Sequence[str],
-        *,
-        job_id: str | None = None,
-        env: Mapping[str, str] | None = None,
-        working_dir: str | None = None,
-        max_stdout_bytes: int | None = None,
-        max_stderr_bytes: int | None = None,
-    ) -> "JobHandle":
-        return self.client.start_job(
-            self.id,
-            command,
-            job_id=job_id,
-            env=env,
-            working_dir=working_dir,
-            max_stdout_bytes=max_stdout_bytes,
-            max_stderr_bytes=max_stderr_bytes,
-        )
-
-    def exec(
-        self,
-        command: str | Sequence[str],
-        *,
-        input: str | bytes | None = None,
-        env: Mapping[str, str] | None = None,
-        working_dir: str | None = None,
-        timeout_seconds: float | None = None,
-        tty: bool = False,
-    ) -> SandboxExecResult:
-        return self.client.exec(
-            self.id,
-            command,
-            input=input,
-            env=env,
-            working_dir=working_dir,
-            timeout_seconds=timeout_seconds,
-            tty=tty,
-        )
-
-    def ssh(self) -> JsonObject:
-        return self.client.get_ssh_target(self.id)
-
-    def ssh_target(self) -> SandboxSshTarget:
-        return self.client.get_ssh_connection(self.id)
-
-    def ssh_command(self) -> str:
-        return self.ssh_target().command
-
-    def ssh_proxy_command(
-        self,
-        *,
-        token_env: str = "UCLOUD_SANDBOX_API_TOKEN",
-        python: str = "python3",
-    ) -> str:
-        return self.client.ssh_proxy_command(
-            self.id,
-            token_env=token_env,
-            python=python,
-        )
-
-    def upload_file(self, container_path: str, content: bytes | str) -> JsonObject:
-        return self.client.upload_file(self.id, container_path, content)
-
-    def upload_file_from_path(
-        self,
-        local_path: str | Path,
-        container_path: str,
-    ) -> JsonObject:
-        return self.client.upload_file_from_path(self.id, local_path, container_path)
-
-    def download_file(self, container_path: str) -> bytes:
-        return self.client.download_file(self.id, container_path)
-
-    def download_file_to_path(
-        self,
-        container_path: str,
-        local_path: str | Path,
-    ) -> Path:
-        return self.client.download_file_to_path(self.id, container_path, local_path)
-
-    def snapshot(self, image: Image, *, image_id: str | None = None) -> JsonObject:
-        return self.client.snapshot_sandbox(self.id, image, image_id=image_id)
-
-
-@dataclass
-class ExecHandle:
-    client: "SandboxClient"
-    session_id: str
-    sandbox_id: str
-    session: JsonObject = field(default_factory=dict)
-    last_sequence: int = 0
-
-    def get(self) -> JsonObject:
-        payload = self.client.get_exec_session(self.session_id)
-        session = payload.get("session")
-        if isinstance(session, dict):
-            self.session = session
-        return payload
-
-    def write_stdin(self, data: str | bytes, *, eof: bool = False) -> JsonObject:
-        return self.client.write_exec_stdin(
-            self.session_id, _text_payload(data), eof=eof
-        )
-
-    def close_stdin(self) -> JsonObject:
-        return self.client.close_exec_stdin(self.session_id)
-
-    def events(
-        self,
-        *,
-        wait_seconds: float = 30.0,
-        limit: int = 100,
-    ) -> Iterator[JsonObject]:
-        while True:
-            payload = self.client.read_exec_events(
-                self.session_id,
-                after=self.last_sequence,
-                limit=limit,
-                wait_seconds=wait_seconds,
-            )
-            raw_events = payload.get("events")
-            events = _exec_event_payloads(self.session_id, raw_events)
-            for event in events:
-                self.last_sequence = _next_exec_sequence(
-                    self.session_id,
-                    self.last_sequence,
-                    event,
-                )
-                yield event
-            session = payload.get("session")
-            if isinstance(session, dict):
-                self.session = session
-                if session.get("status") in TERMINAL_EXEC_STATUSES and not events:
-                    return
-
-    def wait(
-        self,
-        *,
-        timeout_seconds: float | None = None,
-        poll_wait_seconds: float = 1.0,
-        settle_seconds: float = 0.2,
-    ) -> SandboxExecResult:
-        events: list[JsonObject] = []
-        deadline = (
-            None if timeout_seconds is None else time.monotonic() + timeout_seconds
-        )
-        terminal_seen = False
-        empty_terminal_drains = 0
-
-        while True:
-            if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError(f"exec session timed out: {self.session_id}")
-            wait_seconds = settle_seconds if terminal_seen else poll_wait_seconds
-            if deadline is not None:
-                wait_seconds = min(wait_seconds, max(0.0, deadline - time.monotonic()))
-            payload = self.client.read_exec_events(
-                self.session_id,
-                after=self.last_sequence,
-                limit=100,
-                wait_seconds=wait_seconds,
-            )
-            raw_events = payload.get("events")
-            new_events = _exec_event_payloads(self.session_id, raw_events)
-            for event in new_events:
-                self.last_sequence = _next_exec_sequence(
-                    self.session_id,
-                    self.last_sequence,
-                    event,
-                )
-                events.append(event)
-            session = payload.get("session")
-            if isinstance(session, dict):
-                self.session = session
-            if self.session.get("status") in TERMINAL_EXEC_STATUSES:
-                terminal_seen = True
-                if new_events:
-                    empty_terminal_drains = 0
-                else:
-                    empty_terminal_drains += 1
-                    if empty_terminal_drains >= 1:
-                        return _exec_result(self.session_id, self.session, events)
-
-
-@dataclass
-class JobHandle:
-    client: "SandboxClient"
-    sandbox_id: str
-    job_id: str
-    record: SandboxJobRecord
-
-    def refresh(self) -> SandboxJobRecord:
-        self.record = self.client.get_job(self.sandbox_id, self.job_id)
-        return self.record
-
-    def wait(
-        self,
-        *,
-        timeout_seconds: float | None = None,
-        poll_seconds: float = 1.0,
-    ) -> SandboxJobRecord:
-        deadline = (
-            None if timeout_seconds is None else time.monotonic() + timeout_seconds
-        )
-        while True:
-            record = self.refresh()
-            if record.terminal:
-                return record
-            if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError(f"sandbox job timed out: {self.job_id}")
-            delay = max(0.05, poll_seconds)
-            if deadline is not None:
-                delay = min(delay, max(0.0, deadline - time.monotonic()))
-            time.sleep(delay)
-
-    def logs(
-        self,
-        stream: str = "stdout",
-        *,
-        offset: int = 0,
-        limit: int = 1024 * 1024,
-    ) -> SandboxJobLogChunk:
-        return self.client.read_job_logs(
-            self.sandbox_id,
-            self.job_id,
-            stream=stream,
-            offset=offset,
-            limit=limit,
-        )
-
-    def signal(self, signal: int = 15) -> SandboxJobRecord:
-        self.record = self.client.signal_job(
-            self.sandbox_id,
-            self.job_id,
-            signal=signal,
-        )
-        return self.record
-
-
-class SandboxClient:
-    def __init__(
-        self,
-        base_url: str,
-        *,
-        timeout_seconds: float = 30.0,
-        api_token: str | None = None,
-        headers: Mapping[str, str] | None = None,
-    ) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.timeout_seconds = timeout_seconds
-        self.headers = sandbox_auth_headers(api_token)
-        self.headers.update(dict(headers or {}))
-
+class _DirectSandboxOperations:
     def health(self) -> JsonObject:
         return self._request_json("GET", "/healthz")
 
     def heartbeat(self) -> JsonObject:
         return self._request_json("GET", "/v1/heartbeat")
-
-    def list_sandboxes(self) -> list[JsonObject]:
-        payload = self._request_json("GET", "/v1/sandboxes")
-        sandboxes = payload.get("sandboxes")
-        return (
-            [item for item in sandboxes if isinstance(item, dict)]
-            if isinstance(sandboxes, list)
-            else []
-        )
 
     def list_prepared_capacity(self) -> JsonObject:
         return self._request_json("GET", "/v1/capacity/prepare")
@@ -831,59 +493,6 @@ class SandboxClient:
             f"/v1/builders/prepare/{_quote_segment(prepare_id)}",
         )
 
-    def get_sandbox(self, sandbox_id: str) -> JsonObject | None:
-        for record in self.list_sandboxes():
-            spec = record.get("spec")
-            if isinstance(spec, dict) and spec.get("id") == sandbox_id:
-                return record
-        return None
-
-    def create_sandbox(
-        self,
-        spec: SandboxSpec | None = None,
-        *,
-        request_timeout_seconds: float | None = None,
-        **kwargs: Any,
-    ) -> SandboxHandle:
-        payload = _sandbox_payload(spec, **kwargs)
-        response = self._request_json(
-            "POST",
-            "/v1/sandboxes",
-            payload=payload,
-            timeout_seconds=(
-                DEFAULT_CREATE_TIMEOUT_SECONDS
-                if request_timeout_seconds is None
-                else request_timeout_seconds
-            ),
-        )
-        record = response.get("sandbox")
-        if not isinstance(record, dict):
-            raise SandboxApiError(
-                "node-agent returned an invalid sandbox payload", body=response
-            )
-        sandbox_spec = record.get("spec")
-        sandbox_id = sandbox_spec.get("id") if isinstance(sandbox_spec, dict) else None
-        if not isinstance(sandbox_id, str) or not sandbox_id:
-            raise SandboxApiError(
-                "node-agent sandbox payload is missing spec.id", body=response
-            )
-        return SandboxHandle(self, sandbox_id, record=record, create_response=response)
-
-    def create_ssh_sandbox(
-        self,
-        *,
-        ssh_user: str = "sandbox",
-        authorized_keys: Sequence[str] = (),
-        **kwargs: Any,
-    ) -> SandboxHandle:
-        kwargs.setdefault("network", "bridge")
-        kwargs["ssh"] = {
-            "enabled": True,
-            "user": ssh_user,
-            "authorized_keys": list(authorized_keys),
-        }
-        return self.create_sandbox(**kwargs)
-
     def delete_sandbox(self, sandbox_id: str) -> JsonObject:
         return self._request_json(
             "DELETE", f"/v1/sandboxes/{_quote_segment(sandbox_id)}"
@@ -917,15 +526,404 @@ class SandboxClient:
     def download_file(self, sandbox_id: str, container_path: str) -> bytes:
         return self._request_bytes("GET", _file_path(sandbox_id, container_path))
 
-    def download_file_to_path(
+    def get_exec_session(self, session_id: str) -> JsonObject:
+        return self._request_json("GET", f"/v1/exec/{_quote_segment(session_id)}")
+
+    def read_exec_events(
+        self,
+        session_id: str,
+        *,
+        after: int = 0,
+        limit: int = 100,
+        wait_seconds: float = 0.0,
+    ) -> JsonObject:
+        return self._request_json(
+            "GET",
+            _exec_events_path(session_id, after, limit, wait_seconds),
+        )
+
+    def write_exec_stdin(
+        self,
+        session_id: str,
+        data: str,
+        *,
+        eof: bool = False,
+    ) -> JsonObject:
+        return self._request_json(
+            "POST",
+            f"/v1/exec/{_quote_segment(session_id)}/stdin",
+            payload={"data": data, "eof": eof},
+        )
+
+    def close_exec_stdin(self, session_id: str) -> JsonObject:
+        return self._request_json(
+            "POST", f"/v1/exec/{_quote_segment(session_id)}/close-stdin"
+        )
+
+    def pull_image(
+        self,
+        image: Image,
+        *,
+        image_id: str | None = None,
+        count: int = 1,
+        cpus: float | None = None,
+        memory_mb: int | None = None,
+        disk_mb: int | None = None,
+        sandbox_nodes_only: bool = True,
+    ) -> JsonObject:
+        payload = _image_pull_payload(
+            image,
+            image_id=image_id,
+            count=count,
+            cpus=cpus,
+            memory_mb=memory_mb,
+            disk_mb=disk_mb,
+            sandbox_nodes_only=sandbox_nodes_only,
+        )
+        return self._request_json("POST", "/v1/images/pull", payload=payload)
+
+    def snapshot_sandbox(
         self,
         sandbox_id: str,
-        container_path: str,
+        image: Image,
+        *,
+        image_id: str | None = None,
+    ) -> JsonObject:
+        payload: JsonObject = {"image": _image_pull_reference(image)}
+        if image_id is not None:
+            payload["id"] = image_id
+        return self._request_json(
+            "POST",
+            f"/v1/sandboxes/{_quote_segment(sandbox_id)}/snapshot",
+            payload=payload,
+        )
+
+
+@dataclass
+class SandboxHandle:
+    client: "SandboxClient"
+    id: str
+    record: JsonObject = field(default_factory=dict)
+    create_response: JsonObject = field(default_factory=dict)
+
+    def delete(self) -> JsonObject:
+        return self.client.delete_sandbox(self.id)
+
+    def start_exec(
+        self,
+        command: str | Sequence[str],
+        *,
+        env: Mapping[str, str] | None = None,
+        working_dir: str | None = None,
+        stdin: bool = False,
+        tty: bool = False,
+    ) -> "ExecHandle":
+        return self.client.start_exec(
+            self.id,
+            command,
+            env=env,
+            working_dir=working_dir,
+            stdin=stdin,
+            tty=tty,
+        )
+
+    def start_job(
+        self,
+        command: str | Sequence[str],
+        *,
+        job_id: str | None = None,
+        env: Mapping[str, str] | None = None,
+        working_dir: str | None = None,
+        max_stdout_bytes: int | None = None,
+        max_stderr_bytes: int | None = None,
+    ) -> "JobHandle":
+        return self.client.start_job(
+            self.id,
+            command,
+            job_id=job_id,
+            env=env,
+            working_dir=working_dir,
+            max_stdout_bytes=max_stdout_bytes,
+            max_stderr_bytes=max_stderr_bytes,
+        )
+
+    def exec(
+        self,
+        command: str | Sequence[str],
+        *,
+        input: str | bytes | None = None,
+        env: Mapping[str, str] | None = None,
+        working_dir: str | None = None,
+        timeout_seconds: float | None = None,
+        tty: bool = False,
+    ) -> SandboxExecResult:
+        return self.client.exec(
+            self.id,
+            command,
+            input=input,
+            env=env,
+            working_dir=working_dir,
+            timeout_seconds=timeout_seconds,
+            tty=tty,
+        )
+
+    def ssh(self) -> SandboxSshTarget:
+        return SandboxSshTarget.from_payload(
+            self.id,
+            self.client._request_json(
+                "GET", f"/v1/sandboxes/{_quote_segment(self.id)}/ssh"
+            ),
+        )
+
+    def upload_file(self, container_path: str, content: bytes | str) -> JsonObject:
+        return self.client.upload_file(self.id, container_path, content)
+
+    def upload_file_from_path(
+        self,
         local_path: str | Path,
-    ) -> Path:
-        path = Path(local_path)
-        path.write_bytes(self.download_file(sandbox_id, container_path))
-        return path
+        container_path: str,
+    ) -> JsonObject:
+        return self.client.upload_file_from_path(self.id, local_path, container_path)
+
+    def download_file(self, container_path: str) -> bytes:
+        return self.client.download_file(self.id, container_path)
+
+    def snapshot(self, image: Image, *, image_id: str | None = None) -> JsonObject:
+        return self.client.snapshot_sandbox(self.id, image, image_id=image_id)
+
+
+class _ExecState:
+    session_id: str
+    session: JsonObject
+    last_sequence: int
+
+    def _accept_session(self, payload: JsonObject) -> None:
+        session = payload.get("session")
+        if isinstance(session, dict):
+            self.session = session
+
+    def _accept_events(self, payload: JsonObject) -> list[JsonObject]:
+        events = _exec_event_payloads(self.session_id, payload.get("events"))
+        for event in events:
+            self.last_sequence = _next_exec_sequence(
+                self.session_id,
+                self.last_sequence,
+                event,
+            )
+        self._accept_session(payload)
+        return events
+
+    def _result(self, events: list[JsonObject]) -> SandboxExecResult:
+        return _exec_result(self.session_id, self.session, events)
+
+
+@dataclass
+class _ImageBuildWait:
+    build_id: str
+    deadline: float | None
+    build: JsonObject | None = None
+    last_seen: tuple[object, object, object] | None = None
+
+    def request_timeout(self, default_timeout: float) -> float:
+        remaining = self._remaining()
+        return _request_timeout_seconds(remaining, default_timeout)
+
+    def accept(
+        self,
+        build: JsonObject,
+        on_status: Callable[[JsonObject], object] | None,
+    ) -> bool:
+        self.build = build
+        seen = (
+            build.get("status"),
+            build.get("updated_at"),
+            len(str(build.get("log_tail") or "")),
+        )
+        if on_status is not None and seen != self.last_seen:
+            on_status(build)
+        self.last_seen = seen
+        return build.get("status") in {"succeeded", "failed"}
+
+    def delay(self, poll_interval: float) -> float:
+        remaining = self._remaining()
+        return (
+            max(0.1, poll_interval)
+            if remaining is None
+            else min(max(0.1, poll_interval), remaining)
+        )
+
+    def _remaining(self) -> float | None:
+        remaining = _remaining_seconds(self.deadline)
+        if remaining is not None and remaining <= 0:
+            raise TimeoutError(_image_build_timeout_message(self.build_id, self.build))
+        return remaining
+
+
+@dataclass
+class ExecHandle(_ExecState):
+    client: "SandboxClient"
+    session_id: str
+    sandbox_id: str
+    session: JsonObject = field(default_factory=dict)
+    last_sequence: int = 0
+
+    def get(self) -> JsonObject:
+        payload = self.client.get_exec_session(self.session_id)
+        self._accept_session(payload)
+        return payload
+
+    def write_stdin(self, data: str | bytes, *, eof: bool = False) -> JsonObject:
+        return self.client.write_exec_stdin(
+            self.session_id, _text_payload(data), eof=eof
+        )
+
+    def close_stdin(self) -> JsonObject:
+        return self.client.close_exec_stdin(self.session_id)
+
+    def events(
+        self,
+        *,
+        wait_seconds: float = 30.0,
+        limit: int = 100,
+    ) -> Iterator[JsonObject]:
+        while True:
+            payload = self.client.read_exec_events(
+                self.session_id,
+                after=self.last_sequence,
+                limit=limit,
+                wait_seconds=wait_seconds,
+            )
+            events = self._accept_events(payload)
+            for event in events:
+                yield event
+            if self.session.get("status") in TERMINAL_EXEC_STATUSES and not events:
+                return
+
+    def wait(
+        self,
+        *,
+        timeout_seconds: float | None = None,
+        poll_wait_seconds: float = 1.0,
+        settle_seconds: float = 0.2,
+    ) -> SandboxExecResult:
+        events: list[JsonObject] = []
+        deadline = _deadline(timeout_seconds)
+        terminal_seen = False
+        while True:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(f"exec session timed out: {self.session_id}")
+            wait_seconds = settle_seconds if terminal_seen else poll_wait_seconds
+            if deadline is not None:
+                wait_seconds = min(wait_seconds, max(0.0, deadline - time.monotonic()))
+            payload = self.client.read_exec_events(
+                self.session_id,
+                after=self.last_sequence,
+                limit=100,
+                wait_seconds=wait_seconds,
+            )
+            new_events = self._accept_events(payload)
+            events.extend(new_events)
+            if self.session.get("status") in TERMINAL_EXEC_STATUSES:
+                terminal_seen = True
+                if not new_events:
+                    return self._result(events)
+
+
+@dataclass
+class JobHandle:
+    client: "SandboxClient"
+    sandbox_id: str
+    job_id: str
+    record: SandboxJobRecord
+
+    def refresh(self) -> SandboxJobRecord:
+        self.record = self.client.get_job(self.sandbox_id, self.job_id)
+        return self.record
+
+    def wait(
+        self,
+        *,
+        timeout_seconds: float | None = None,
+        poll_seconds: float = 1.0,
+    ) -> SandboxJobRecord:
+        deadline = _deadline(timeout_seconds)
+        while True:
+            record = self.refresh()
+            if record.terminal:
+                return record
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(f"sandbox job timed out: {self.job_id}")
+            delay = max(0.05, poll_seconds)
+            if deadline is not None:
+                delay = min(delay, max(0.0, deadline - time.monotonic()))
+            time.sleep(delay)
+
+    def logs(
+        self,
+        stream: str = "stdout",
+        *,
+        offset: int = 0,
+        limit: int = 1024 * 1024,
+    ) -> SandboxJobLogChunk:
+        return self.client.read_job_logs(
+            self.sandbox_id,
+            self.job_id,
+            stream=stream,
+            offset=offset,
+            limit=limit,
+        )
+
+    def signal(self, signal: int = 15) -> SandboxJobRecord:
+        self.record = self.client.signal_job(
+            self.sandbox_id,
+            self.job_id,
+            signal=signal,
+        )
+        return self.record
+
+
+class SandboxClient(_DirectSandboxOperations):
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        timeout_seconds: float = 30.0,
+        api_token: str | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.timeout_seconds = timeout_seconds
+        self.headers = sandbox_auth_headers(api_token)
+        self.headers.update(dict(headers or {}))
+
+    def list_sandboxes(self) -> list[JsonObject]:
+        return _records(self._request_json("GET", "/v1/sandboxes"), "sandboxes")
+
+    def get_sandbox(self, sandbox_id: str) -> JsonObject | None:
+        for record in self.list_sandboxes():
+            spec = record.get("spec")
+            if isinstance(spec, dict) and spec.get("id") == sandbox_id:
+                return record
+        return None
+
+    def create_sandbox(
+        self,
+        spec: SandboxSpec,
+        *,
+        request_timeout_seconds: float | None = None,
+    ) -> SandboxHandle:
+        response = self._request_json(
+            "POST",
+            "/v1/sandboxes",
+            payload=spec.to_dict(),
+            timeout_seconds=(
+                DEFAULT_CREATE_TIMEOUT_SECONDS
+                if request_timeout_seconds is None
+                else request_timeout_seconds
+            ),
+        )
+        sandbox_id, record = _sandbox_record(response)
+        return SandboxHandle(self, sandbox_id, record=record, create_response=response)
 
     def start_exec(
         self,
@@ -949,11 +947,7 @@ class SandboxClient:
             f"/v1/sandboxes/{_quote_segment(sandbox_id)}/exec",
             payload=payload,
         )
-        session = response.get("session")
-        if not isinstance(session, dict) or not isinstance(session.get("id"), str):
-            raise SandboxApiError(
-                "node-agent returned an invalid exec session payload", body=response
-            )
+        session = _exec_session(response)
         return ExecHandle(self, session["id"], sandbox_id, session=session)
 
     def exec(
@@ -1003,9 +997,7 @@ class SandboxClient:
                 max_stderr_bytes=max_stderr_bytes,
             ),
         )
-        record = _job_record(response)
-        if record.sandbox_id != sandbox_id or record.job_id != resolved_job_id:
-            raise SandboxApiError("gateway returned another sandbox job", body=response)
+        record = _checked_job(response, sandbox_id, resolved_job_id)
         return JobHandle(self, sandbox_id, resolved_job_id, record)
 
     def get_job(self, sandbox_id: str, job_id: str) -> SandboxJobRecord:
@@ -1013,10 +1005,7 @@ class SandboxClient:
             "GET",
             f"/v1/sandboxes/{_quote_segment(sandbox_id)}/jobs/{_quote_segment(job_id)}",
         )
-        record = _job_record(response)
-        if record.sandbox_id != sandbox_id or record.job_id != job_id:
-            raise SandboxApiError("gateway returned another sandbox job", body=response)
-        return record
+        return _checked_job(response, sandbox_id, job_id)
 
     def read_job_logs(
         self,
@@ -1052,114 +1041,13 @@ class SandboxClient:
             f"{_quote_segment(job_id)}/signal",
             payload={"signal": int(signal)},
         )
-        record = _job_record(response)
-        if record.sandbox_id != sandbox_id or record.job_id != job_id:
-            raise SandboxApiError("gateway returned another sandbox job", body=response)
-        return record
-
-    def get_exec_session(self, session_id: str) -> JsonObject:
-        return self._request_json("GET", f"/v1/exec/{_quote_segment(session_id)}")
-
-    def read_exec_events(
-        self,
-        session_id: str,
-        *,
-        after: int = 0,
-        limit: int = 100,
-        wait_seconds: float = 0.0,
-    ) -> JsonObject:
-        query = parse.urlencode(
-            {
-                "after": max(0, after),
-                "limit": max(1, limit),
-                "wait_seconds": max(0.0, wait_seconds),
-            }
-        )
-        return self._request_json(
-            "GET", f"/v1/exec/{_quote_segment(session_id)}/events?{query}"
-        )
-
-    def write_exec_stdin(
-        self,
-        session_id: str,
-        data: str,
-        *,
-        eof: bool = False,
-    ) -> JsonObject:
-        return self._request_json(
-            "POST",
-            f"/v1/exec/{_quote_segment(session_id)}/stdin",
-            payload={"data": data, "eof": eof},
-        )
-
-    def close_exec_stdin(self, session_id: str) -> JsonObject:
-        return self._request_json(
-            "POST", f"/v1/exec/{_quote_segment(session_id)}/close-stdin"
-        )
-
-    def get_ssh_target(self, sandbox_id: str) -> JsonObject:
-        return self._request_json(
-            "GET", f"/v1/sandboxes/{_quote_segment(sandbox_id)}/ssh"
-        )
-
-    def get_ssh_connection(self, sandbox_id: str) -> SandboxSshTarget:
-        return SandboxSshTarget.from_payload(
-            sandbox_id, self.get_ssh_target(sandbox_id)
-        )
-
-    def ssh_proxy_argv(
-        self,
-        sandbox_id: str,
-        *,
-        token_env: str = "UCLOUD_SANDBOX_API_TOKEN",
-        python: str = "python3",
-    ) -> list[str]:
-        return [
-            python,
-            "-m",
-            "ucloud_sandboxes_sdk.ssh_proxy",
-            "--gateway-url",
-            self.base_url,
-            "--sandbox-id",
-            sandbox_id,
-            "--token-env",
-            token_env,
-        ]
-
-    def ssh_proxy_command(
-        self,
-        sandbox_id: str,
-        *,
-        token_env: str = "UCLOUD_SANDBOX_API_TOKEN",
-        python: str = "python3",
-    ) -> str:
-        proxy = " ".join(
-            shlex.quote(part)
-            for part in self.ssh_proxy_argv(
-                sandbox_id,
-                token_env=token_env,
-                python=python,
-            )
-        )
-        return f"ssh -o ProxyCommand={shlex.quote(proxy)} sandbox@{sandbox_id}"
+        return _checked_job(response, sandbox_id, job_id)
 
     def list_images(self) -> list[JsonObject]:
-        payload = self._request_json("GET", "/v1/images")
-        images = payload.get("images")
-        return (
-            [item for item in images if isinstance(item, dict)]
-            if isinstance(images, list)
-            else []
-        )
+        return _records(self._request_json("GET", "/v1/images"), "images")
 
     def list_image_builds(self) -> list[JsonObject]:
-        payload = self._request_json("GET", "/v1/images/builds")
-        builds = payload.get("builds")
-        return (
-            [item for item in builds if isinstance(item, dict)]
-            if isinstance(builds, list)
-            else []
-        )
+        return _records(self._request_json("GET", "/v1/images/builds"), "builds")
 
     def get_image_build(
         self,
@@ -1227,41 +1115,15 @@ class SandboxClient:
         poll_interval_seconds: float = 5.0,
         on_status: Callable[[JsonObject], object] | None = None,
     ) -> JsonObject:
-        deadline = _deadline(timeout_seconds)
-        last_seen: tuple[object, object, object] | None = None
-        build: JsonObject | None = None
+        state = _ImageBuildWait(build_id_or_image_id, _deadline(timeout_seconds))
         while True:
-            remaining = _remaining_seconds(deadline)
-            if remaining is not None and remaining <= 0:
-                raise TimeoutError(
-                    _image_build_timeout_message(build_id_or_image_id, build)
-                )
             build = self.get_image_build(
                 build_id_or_image_id,
-                timeout_seconds=_request_timeout_seconds(
-                    remaining,
-                    self.timeout_seconds,
-                ),
+                timeout_seconds=state.request_timeout(self.timeout_seconds),
             )
-            seen = (
-                build.get("status"),
-                build.get("updated_at"),
-                len(str(build.get("log_tail") or "")),
-            )
-            if on_status is not None and seen != last_seen:
-                on_status(build)
-            last_seen = seen
-            if build.get("status") in {"succeeded", "failed"}:
+            if state.accept(build, on_status):
                 return build
-            sleep_seconds = max(0.1, poll_interval_seconds)
-            remaining = _remaining_seconds(deadline)
-            if remaining is not None:
-                if remaining <= 0:
-                    raise TimeoutError(
-                        _image_build_timeout_message(build_id_or_image_id, build)
-                    )
-                sleep_seconds = min(sleep_seconds, remaining)
-            time.sleep(sleep_seconds)
+            time.sleep(state.delay(poll_interval_seconds))
 
     def build_image(
         self,
@@ -1282,50 +1144,7 @@ class SandboxClient:
             poll_interval_seconds=poll_interval_seconds,
             on_status=on_status,
         )
-        if build.get("status") != "succeeded":
-            raise SandboxApiError(
-                f"image build failed: {build.get('error') or build.get('status')}",
-                body={"build": build},
-            )
-        return _completed_build_payload(build)
-
-    def pull_image(
-        self,
-        image: Image,
-        *,
-        image_id: str | None = None,
-        count: int = 1,
-        cpus: float | None = None,
-        memory_mb: int | None = None,
-        disk_mb: int | None = None,
-        sandbox_nodes_only: bool = True,
-    ) -> JsonObject:
-        payload = _image_pull_payload(
-            image,
-            image_id=image_id,
-            count=count,
-            cpus=cpus,
-            memory_mb=memory_mb,
-            disk_mb=disk_mb,
-            sandbox_nodes_only=sandbox_nodes_only,
-        )
-        return self._request_json("POST", "/v1/images/pull", payload=payload)
-
-    def snapshot_sandbox(
-        self,
-        sandbox_id: str,
-        image: Image,
-        *,
-        image_id: str | None = None,
-    ) -> JsonObject:
-        payload: JsonObject = {"image": _image_pull_reference(image)}
-        if image_id is not None:
-            payload["id"] = image_id
-        return self._request_json(
-            "POST",
-            f"/v1/sandboxes/{_quote_segment(sandbox_id)}/snapshot",
-            payload=payload,
-        )
+        return _successful_image_build(build)
 
     def _request_json(
         self,
@@ -1338,21 +1157,13 @@ class SandboxClient:
         content_type: str | None = None,
         timeout_seconds: float | None = None,
     ) -> JsonObject:
-        raw_body = json.dumps(payload).encode("utf-8") if payload is not None else body
-        body_limit = MAX_JSON_BODY_BYTES if payload is not None else MAX_FILE_BODY_BYTES
-        known_body_size = len(raw_body) if isinstance(raw_body, bytes) else body_size
-        if raw_body is not None and known_body_size is None:
-            raise TypeError("body_size is required for streamed request bodies")
-        if known_body_size is not None and known_body_size > body_limit:
-            raise SandboxApiError(f"request body exceeds the {body_limit} byte limit")
-        headers = dict(self.headers)
-        if payload is not None:
-            headers["Content-Type"] = "application/json"
-        elif content_type is not None:
-            headers["Content-Type"] = content_type
-        streamed_body = raw_body is not None and not isinstance(raw_body, bytes)
-        if streamed_body:
-            headers["Content-Length"] = str(known_body_size)
+        raw_body, headers, streamed_body = _node_request_content(
+            self.headers,
+            payload,
+            body,
+            body_size,
+            content_type,
+        )
         timeout = self.timeout_seconds if timeout_seconds is None else timeout_seconds
         deadline = _deadline(timeout)
         retry_attempts = _ucloud_unavailable_retry_attempts(method, path)
@@ -1375,63 +1186,27 @@ class SandboxClient:
                         response,
                         limit=MAX_JSON_RESPONSE_BYTES,
                     ).decode("utf-8")
-                    try:
-                        decoded = json.loads(raw) if raw else {}
-                    except json.JSONDecodeError as exc:
-                        raise SandboxApiError(
-                            f"node-agent returned invalid JSON: {exc}",
-                            status_code=int(getattr(response, "status", 200)),
-                            body={"error": raw},
-                            headers=response_headers(response),
-                        ) from exc
+                    return _decode_node_json(
+                        raw,
+                        status=int(getattr(response, "status", 200)),
+                        headers=response_headers(response),
+                    )
             except error.HTTPError as exc:
-                headers_received = response_headers(exc)
-                try:
-                    raw = read_sync_response(
-                        exc,
-                        limit=MAX_JSON_RESPONSE_BYTES,
-                    ).decode("utf-8", errors="replace")
-                except ResponseTooLargeError as size_exc:
-                    exc.close()
-                    raise SandboxApiError(
-                        str(size_exc),
-                        status_code=exc.code,
-                        headers=headers_received,
-                    ) from size_exc
-                exc.close()
-                decoded = _decode_json_error(raw)
-                api_error = SandboxApiError(
-                    f"node-agent request failed ({exc.code}): {decoded}",
-                    status_code=exc.code,
-                    body=decoded,
-                    headers=headers_received,
-                )
-                if _should_retry_ucloud_unavailable(
-                    exc.code,
-                    decoded,
+                api_error = _sync_node_error(exc)
+                delay = _retry_error(
+                    api_error,
                     attempt,
                     method=method,
                     path=path,
                     max_attempts=retry_attempts,
-                ):
-                    delay = _ucloud_unavailable_retry_delay(
-                        attempt,
-                        headers_received,
-                        method=method,
-                        path=path,
-                    )
-                    if _sleep_for_retry(delay, deadline):
-                        continue
+                )
+                if delay is not None and _sleep_for_retry(delay, deadline):
+                    continue
                 raise api_error from exc
             except ResponseTooLargeError as exc:
                 raise SandboxApiError(str(exc)) from exc
             except OSError as exc:
                 raise SandboxApiError(f"node-agent request failed: {exc}") from exc
-            if not isinstance(decoded, dict):
-                raise SandboxApiError(
-                    "node-agent returned a non-object JSON payload", body=decoded
-                )
-            return decoded
         raise AssertionError("unreachable UCloud unavailable retry state")
 
     def _request_bytes(self, method: str, path: str) -> bytes:
@@ -1456,43 +1231,16 @@ class SandboxClient:
                         limit=MAX_FILE_RESPONSE_BYTES,
                     )
             except error.HTTPError as exc:
-                headers_received = response_headers(exc)
-                try:
-                    raw = read_sync_response(
-                        exc,
-                        limit=MAX_JSON_RESPONSE_BYTES,
-                    ).decode("utf-8", errors="replace")
-                except ResponseTooLargeError as size_exc:
-                    exc.close()
-                    raise SandboxApiError(
-                        str(size_exc),
-                        status_code=exc.code,
-                        headers=headers_received,
-                    ) from size_exc
-                exc.close()
-                decoded = _decode_json_error(raw)
-                api_error = SandboxApiError(
-                    f"node-agent request failed ({exc.code}): {decoded}",
-                    status_code=exc.code,
-                    body=decoded,
-                    headers=headers_received,
-                )
-                if _should_retry_ucloud_unavailable(
-                    exc.code,
-                    decoded,
+                api_error = _sync_node_error(exc)
+                delay = _retry_error(
+                    api_error,
                     attempt,
                     method=method,
                     path=path,
                     max_attempts=retry_attempts,
-                ):
-                    delay = _ucloud_unavailable_retry_delay(
-                        attempt,
-                        headers_received,
-                        method=method,
-                        path=path,
-                    )
-                    if _sleep_for_retry(delay, deadline):
-                        continue
+                )
+                if delay is not None and _sleep_for_retry(delay, deadline):
+                    continue
                 raise api_error from exc
             except ResponseTooLargeError as exc:
                 raise SandboxApiError(str(exc)) from exc
@@ -1507,12 +1255,6 @@ class AsyncSandboxHandle:
     id: str
     record: JsonObject = field(default_factory=dict)
     create_response: JsonObject = field(default_factory=dict)
-
-    async def refresh(self) -> "AsyncSandboxHandle":
-        record = await self.client.get_sandbox(self.id)
-        if record is not None:
-            self.record = record
-        return self
 
     async def delete(self) -> JsonObject:
         return await self.client.delete_sandbox(self.id)
@@ -1575,25 +1317,12 @@ class AsyncSandboxHandle:
             tty=tty,
         )
 
-    async def ssh(self) -> JsonObject:
-        return await self.client.get_ssh_target(self.id)
-
-    async def ssh_target(self) -> SandboxSshTarget:
-        return await self.client.get_ssh_connection(self.id)
-
-    async def ssh_command(self) -> str:
-        return (await self.ssh_target()).command
-
-    def ssh_proxy_command(
-        self,
-        *,
-        token_env: str = "UCLOUD_SANDBOX_API_TOKEN",
-        python: str = "python3",
-    ) -> str:
-        return self.client.ssh_proxy_command(
+    async def ssh(self) -> SandboxSshTarget:
+        return SandboxSshTarget.from_payload(
             self.id,
-            token_env=token_env,
-            python=python,
+            await self.client._request_json(
+                "GET", f"/v1/sandboxes/{_quote_segment(self.id)}/ssh"
+            ),
         )
 
     async def upload_file(
@@ -1613,15 +1342,6 @@ class AsyncSandboxHandle:
     async def download_file(self, container_path: str) -> bytes:
         return await self.client.download_file(self.id, container_path)
 
-    async def download_file_to_path(
-        self,
-        container_path: str,
-        local_path: str | Path,
-    ) -> Path:
-        return await self.client.download_file_to_path(
-            self.id, container_path, local_path
-        )
-
     async def snapshot(
         self, image: Image, *, image_id: str | None = None
     ) -> JsonObject:
@@ -1629,7 +1349,7 @@ class AsyncSandboxHandle:
 
 
 @dataclass
-class AsyncExecHandle:
+class AsyncExecHandle(_ExecState):
     client: "AsyncSandboxClient"
     session_id: str
     sandbox_id: str
@@ -1638,9 +1358,7 @@ class AsyncExecHandle:
 
     async def get(self) -> JsonObject:
         payload = await self.client.get_exec_session(self.session_id)
-        session = payload.get("session")
-        if isinstance(session, dict):
-            self.session = session
+        self._accept_session(payload)
         return payload
 
     async def write_stdin(self, data: str | bytes, *, eof: bool = False) -> JsonObject:
@@ -1664,20 +1382,11 @@ class AsyncExecHandle:
                 limit=limit,
                 wait_seconds=wait_seconds,
             )
-            raw_events = payload.get("events")
-            events = _exec_event_payloads(self.session_id, raw_events)
+            events = self._accept_events(payload)
             for event in events:
-                self.last_sequence = _next_exec_sequence(
-                    self.session_id,
-                    self.last_sequence,
-                    event,
-                )
                 yield event
-            session = payload.get("session")
-            if isinstance(session, dict):
-                self.session = session
-                if session.get("status") in TERMINAL_EXEC_STATUSES and not events:
-                    return
+            if self.session.get("status") in TERMINAL_EXEC_STATUSES and not events:
+                return
 
     async def wait(
         self,
@@ -1687,12 +1396,8 @@ class AsyncExecHandle:
         settle_seconds: float = 0.2,
     ) -> SandboxExecResult:
         events: list[JsonObject] = []
-        deadline = (
-            None if timeout_seconds is None else time.monotonic() + timeout_seconds
-        )
+        deadline = _deadline(timeout_seconds)
         terminal_seen = False
-        empty_terminal_drains = 0
-
         while True:
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(f"exec session timed out: {self.session_id}")
@@ -1705,26 +1410,12 @@ class AsyncExecHandle:
                 limit=100,
                 wait_seconds=wait_seconds,
             )
-            raw_events = payload.get("events")
-            new_events = _exec_event_payloads(self.session_id, raw_events)
-            for event in new_events:
-                self.last_sequence = _next_exec_sequence(
-                    self.session_id,
-                    self.last_sequence,
-                    event,
-                )
-                events.append(event)
-            session = payload.get("session")
-            if isinstance(session, dict):
-                self.session = session
+            new_events = self._accept_events(payload)
+            events.extend(new_events)
             if self.session.get("status") in TERMINAL_EXEC_STATUSES:
                 terminal_seen = True
-                if new_events:
-                    empty_terminal_drains = 0
-                else:
-                    empty_terminal_drains += 1
-                    if empty_terminal_drains >= 1:
-                        return _exec_result(self.session_id, self.session, events)
+                if not new_events:
+                    return self._result(events)
 
 
 @dataclass
@@ -1744,9 +1435,7 @@ class AsyncJobHandle:
         timeout_seconds: float | None = None,
         poll_seconds: float = 1.0,
     ) -> SandboxJobRecord:
-        deadline = (
-            None if timeout_seconds is None else time.monotonic() + timeout_seconds
-        )
+        deadline = _deadline(timeout_seconds)
         while True:
             record = await self.refresh()
             if record.terminal:
@@ -1782,7 +1471,7 @@ class AsyncJobHandle:
         return self.record
 
 
-class AsyncSandboxClient:
+class AsyncSandboxClient(_DirectSandboxOperations):
     def __init__(
         self,
         base_url: str,
@@ -1812,22 +1501,19 @@ class AsyncSandboxClient:
             self._owned_session = None
 
     async def health(self) -> JsonObject:
-        return await self._request_json("GET", "/healthz")
+        return await super().health()
 
     async def heartbeat(self) -> JsonObject:
-        return await self._request_json("GET", "/v1/heartbeat")
+        return await super().heartbeat()
 
     async def list_sandboxes(self) -> list[JsonObject]:
-        payload = await self._request_json("GET", "/v1/sandboxes")
-        sandboxes = payload.get("sandboxes")
-        return (
-            [item for item in sandboxes if isinstance(item, dict)]
-            if isinstance(sandboxes, list)
-            else []
+        return _records(
+            await self._request_json("GET", "/v1/sandboxes"),
+            "sandboxes",
         )
 
     async def list_prepared_capacity(self) -> JsonObject:
-        return await self._request_json("GET", "/v1/capacity/prepare")
+        return await super().list_prepared_capacity()
 
     async def prepare_capacity(
         self,
@@ -1841,29 +1527,22 @@ class AsyncSandboxClient:
         ttl_seconds: int = 900,
         prepare_id: str | None = None,
     ) -> JsonObject:
-        return await self._request_json(
-            "POST",
-            "/v1/capacity/prepare",
-            payload=_prepare_capacity_payload(
-                count=count,
-                cpus=cpus,
-                memory_mb=memory_mb,
-                disk_mb=disk_mb,
-                image=image,
-                parkable=parkable,
-                ttl_seconds=ttl_seconds,
-                prepare_id=prepare_id,
-            ),
+        return await super().prepare_capacity(
+            count=count,
+            cpus=cpus,
+            memory_mb=memory_mb,
+            disk_mb=disk_mb,
+            image=image,
+            parkable=parkable,
+            ttl_seconds=ttl_seconds,
+            prepare_id=prepare_id,
         )
 
     async def delete_prepared_capacity(self, prepare_id: str) -> JsonObject:
-        return await self._request_json(
-            "DELETE",
-            f"/v1/capacity/prepare/{_quote_segment(prepare_id)}",
-        )
+        return await super().delete_prepared_capacity(prepare_id)
 
     async def list_prepared_builders(self) -> JsonObject:
-        return await self._request_json("GET", "/v1/builders/prepare")
+        return await super().list_prepared_builders()
 
     async def prepare_builder(
         self,
@@ -1872,21 +1551,12 @@ class AsyncSandboxClient:
         ttl_seconds: int = 900,
         prepare_id: str | None = None,
     ) -> JsonObject:
-        return await self._request_json(
-            "POST",
-            "/v1/builders/prepare",
-            payload=_prepare_builder_payload(
-                count=count,
-                ttl_seconds=ttl_seconds,
-                prepare_id=prepare_id,
-            ),
+        return await super().prepare_builder(
+            count=count, ttl_seconds=ttl_seconds, prepare_id=prepare_id
         )
 
     async def delete_prepared_builder(self, prepare_id: str) -> JsonObject:
-        return await self._request_json(
-            "DELETE",
-            f"/v1/builders/prepare/{_quote_segment(prepare_id)}",
-        )
+        return await super().delete_prepared_builder(prepare_id)
 
     async def get_sandbox(self, sandbox_id: str) -> JsonObject | None:
         for record in await self.list_sandboxes():
@@ -1897,56 +1567,27 @@ class AsyncSandboxClient:
 
     async def create_sandbox(
         self,
-        spec: SandboxSpec | None = None,
+        spec: SandboxSpec,
         *,
         request_timeout_seconds: float | None = None,
-        **kwargs: Any,
     ) -> AsyncSandboxHandle:
-        payload = _sandbox_payload(spec, **kwargs)
         response = await self._request_json(
             "POST",
             "/v1/sandboxes",
-            payload=payload,
+            payload=spec.to_dict(),
             timeout_seconds=(
                 DEFAULT_CREATE_TIMEOUT_SECONDS
                 if request_timeout_seconds is None
                 else request_timeout_seconds
             ),
         )
-        record = response.get("sandbox")
-        if not isinstance(record, dict):
-            raise SandboxApiError(
-                "node-agent returned an invalid sandbox payload", body=response
-            )
-        sandbox_spec = record.get("spec")
-        sandbox_id = sandbox_spec.get("id") if isinstance(sandbox_spec, dict) else None
-        if not isinstance(sandbox_id, str) or not sandbox_id:
-            raise SandboxApiError(
-                "node-agent sandbox payload is missing spec.id", body=response
-            )
+        sandbox_id, record = _sandbox_record(response)
         return AsyncSandboxHandle(
             self, sandbox_id, record=record, create_response=response
         )
 
-    async def create_ssh_sandbox(
-        self,
-        *,
-        ssh_user: str = "sandbox",
-        authorized_keys: Sequence[str] = (),
-        **kwargs: Any,
-    ) -> AsyncSandboxHandle:
-        kwargs.setdefault("network", "bridge")
-        kwargs["ssh"] = {
-            "enabled": True,
-            "user": ssh_user,
-            "authorized_keys": list(authorized_keys),
-        }
-        return await self.create_sandbox(**kwargs)
-
     async def delete_sandbox(self, sandbox_id: str) -> JsonObject:
-        return await self._request_json(
-            "DELETE", f"/v1/sandboxes/{_quote_segment(sandbox_id)}"
-        )
+        return await super().delete_sandbox(sandbox_id)
 
     async def upload_file(
         self,
@@ -1954,12 +1595,7 @@ class AsyncSandboxClient:
         container_path: str,
         content: bytes | str,
     ) -> JsonObject:
-        return await self._request_json(
-            "PUT",
-            _file_path(sandbox_id, container_path),
-            body=_bytes_payload(content),
-            content_type="application/octet-stream",
-        )
+        return await super().upload_file(sandbox_id, container_path, content)
 
     async def upload_file_from_path(
         self,
@@ -1967,24 +1603,12 @@ class AsyncSandboxClient:
         local_path: str | Path,
         container_path: str,
     ) -> JsonObject:
-        return await self.upload_file(
-            sandbox_id,
-            container_path,
-            _read_file_bytes(Path(local_path), limit=MAX_FILE_BODY_BYTES),
+        return await super().upload_file_from_path(
+            sandbox_id, local_path, container_path
         )
 
     async def download_file(self, sandbox_id: str, container_path: str) -> bytes:
-        return await self._request_bytes("GET", _file_path(sandbox_id, container_path))
-
-    async def download_file_to_path(
-        self,
-        sandbox_id: str,
-        container_path: str,
-        local_path: str | Path,
-    ) -> Path:
-        path = Path(local_path)
-        path.write_bytes(await self.download_file(sandbox_id, container_path))
-        return path
+        return await super().download_file(sandbox_id, container_path)
 
     async def start_exec(
         self,
@@ -2008,11 +1632,7 @@ class AsyncSandboxClient:
             f"/v1/sandboxes/{_quote_segment(sandbox_id)}/exec",
             payload=payload,
         )
-        session = response.get("session")
-        if not isinstance(session, dict) or not isinstance(session.get("id"), str):
-            raise SandboxApiError(
-                "node-agent returned an invalid exec session payload", body=response
-            )
+        session = _exec_session(response)
         return AsyncExecHandle(self, session["id"], sandbox_id, session=session)
 
     async def exec(
@@ -2062,9 +1682,7 @@ class AsyncSandboxClient:
                 max_stderr_bytes=max_stderr_bytes,
             ),
         )
-        record = _job_record(response)
-        if record.sandbox_id != sandbox_id or record.job_id != resolved_job_id:
-            raise SandboxApiError("gateway returned another sandbox job", body=response)
+        record = _checked_job(response, sandbox_id, resolved_job_id)
         return AsyncJobHandle(self, sandbox_id, resolved_job_id, record)
 
     async def get_job(self, sandbox_id: str, job_id: str) -> SandboxJobRecord:
@@ -2072,10 +1690,7 @@ class AsyncSandboxClient:
             "GET",
             f"/v1/sandboxes/{_quote_segment(sandbox_id)}/jobs/{_quote_segment(job_id)}",
         )
-        record = _job_record(response)
-        if record.sandbox_id != sandbox_id or record.job_id != job_id:
-            raise SandboxApiError("gateway returned another sandbox job", body=response)
-        return record
+        return _checked_job(response, sandbox_id, job_id)
 
     async def read_job_logs(
         self,
@@ -2111,13 +1726,10 @@ class AsyncSandboxClient:
             f"{_quote_segment(job_id)}/signal",
             payload={"signal": int(signal)},
         )
-        record = _job_record(response)
-        if record.sandbox_id != sandbox_id or record.job_id != job_id:
-            raise SandboxApiError("gateway returned another sandbox job", body=response)
-        return record
+        return _checked_job(response, sandbox_id, job_id)
 
     async def get_exec_session(self, session_id: str) -> JsonObject:
-        return await self._request_json("GET", f"/v1/exec/{_quote_segment(session_id)}")
+        return await super().get_exec_session(session_id)
 
     async def read_exec_events(
         self,
@@ -2127,15 +1739,8 @@ class AsyncSandboxClient:
         limit: int = 100,
         wait_seconds: float = 0.0,
     ) -> JsonObject:
-        query = parse.urlencode(
-            {
-                "after": max(0, after),
-                "limit": max(1, limit),
-                "wait_seconds": max(0.0, wait_seconds),
-            }
-        )
-        return await self._request_json(
-            "GET", f"/v1/exec/{_quote_segment(session_id)}/events?{query}"
+        return await super().read_exec_events(
+            session_id, after=after, limit=limit, wait_seconds=wait_seconds
         )
 
     async def write_exec_stdin(
@@ -2145,80 +1750,18 @@ class AsyncSandboxClient:
         *,
         eof: bool = False,
     ) -> JsonObject:
-        return await self._request_json(
-            "POST",
-            f"/v1/exec/{_quote_segment(session_id)}/stdin",
-            payload={"data": data, "eof": eof},
-        )
+        return await super().write_exec_stdin(session_id, data, eof=eof)
 
     async def close_exec_stdin(self, session_id: str) -> JsonObject:
-        return await self._request_json(
-            "POST", f"/v1/exec/{_quote_segment(session_id)}/close-stdin"
-        )
-
-    async def get_ssh_target(self, sandbox_id: str) -> JsonObject:
-        return await self._request_json(
-            "GET", f"/v1/sandboxes/{_quote_segment(sandbox_id)}/ssh"
-        )
-
-    async def get_ssh_connection(self, sandbox_id: str) -> SandboxSshTarget:
-        return SandboxSshTarget.from_payload(
-            sandbox_id,
-            await self.get_ssh_target(sandbox_id),
-        )
-
-    def ssh_proxy_argv(
-        self,
-        sandbox_id: str,
-        *,
-        token_env: str = "UCLOUD_SANDBOX_API_TOKEN",
-        python: str = "python3",
-    ) -> list[str]:
-        return [
-            python,
-            "-m",
-            "ucloud_sandboxes_sdk.ssh_proxy",
-            "--gateway-url",
-            self.base_url,
-            "--sandbox-id",
-            sandbox_id,
-            "--token-env",
-            token_env,
-        ]
-
-    def ssh_proxy_command(
-        self,
-        sandbox_id: str,
-        *,
-        token_env: str = "UCLOUD_SANDBOX_API_TOKEN",
-        python: str = "python3",
-    ) -> str:
-        proxy = " ".join(
-            shlex.quote(part)
-            for part in self.ssh_proxy_argv(
-                sandbox_id,
-                token_env=token_env,
-                python=python,
-            )
-        )
-        return f"ssh -o ProxyCommand={shlex.quote(proxy)} sandbox@{sandbox_id}"
+        return await super().close_exec_stdin(session_id)
 
     async def list_images(self) -> list[JsonObject]:
-        payload = await self._request_json("GET", "/v1/images")
-        images = payload.get("images")
-        return (
-            [item for item in images if isinstance(item, dict)]
-            if isinstance(images, list)
-            else []
-        )
+        return _records(await self._request_json("GET", "/v1/images"), "images")
 
     async def list_image_builds(self) -> list[JsonObject]:
-        payload = await self._request_json("GET", "/v1/images/builds")
-        builds = payload.get("builds")
-        return (
-            [item for item in builds if isinstance(item, dict)]
-            if isinstance(builds, list)
-            else []
+        return _records(
+            await self._request_json("GET", "/v1/images/builds"),
+            "builds",
         )
 
     async def get_image_build(
@@ -2287,41 +1830,15 @@ class AsyncSandboxClient:
         poll_interval_seconds: float = 5.0,
         on_status: Callable[[JsonObject], object] | None = None,
     ) -> JsonObject:
-        deadline = _deadline(timeout_seconds)
-        last_seen: tuple[object, object, object] | None = None
-        build: JsonObject | None = None
+        state = _ImageBuildWait(build_id_or_image_id, _deadline(timeout_seconds))
         while True:
-            remaining = _remaining_seconds(deadline)
-            if remaining is not None and remaining <= 0:
-                raise TimeoutError(
-                    _image_build_timeout_message(build_id_or_image_id, build)
-                )
             build = await self.get_image_build(
                 build_id_or_image_id,
-                timeout_seconds=_request_timeout_seconds(
-                    remaining,
-                    self.timeout_seconds,
-                ),
+                timeout_seconds=state.request_timeout(self.timeout_seconds),
             )
-            seen = (
-                build.get("status"),
-                build.get("updated_at"),
-                len(str(build.get("log_tail") or "")),
-            )
-            if on_status is not None and seen != last_seen:
-                on_status(build)
-            last_seen = seen
-            if build.get("status") in {"succeeded", "failed"}:
+            if state.accept(build, on_status):
                 return build
-            sleep_seconds = max(0.1, poll_interval_seconds)
-            remaining = _remaining_seconds(deadline)
-            if remaining is not None:
-                if remaining <= 0:
-                    raise TimeoutError(
-                        _image_build_timeout_message(build_id_or_image_id, build)
-                    )
-                sleep_seconds = min(sleep_seconds, remaining)
-            await asyncio.sleep(sleep_seconds)
+            await asyncio.sleep(state.delay(poll_interval_seconds))
 
     async def build_image(
         self,
@@ -2342,12 +1859,7 @@ class AsyncSandboxClient:
             poll_interval_seconds=poll_interval_seconds,
             on_status=on_status,
         )
-        if build.get("status") != "succeeded":
-            raise SandboxApiError(
-                f"image build failed: {build.get('error') or build.get('status')}",
-                body={"build": build},
-            )
-        return _completed_build_payload(build)
+        return _successful_image_build(build)
 
     async def pull_image(
         self,
@@ -2360,7 +1872,7 @@ class AsyncSandboxClient:
         disk_mb: int | None = None,
         sandbox_nodes_only: bool = True,
     ) -> JsonObject:
-        payload = _image_pull_payload(
+        return await super().pull_image(
             image,
             image_id=image_id,
             count=count,
@@ -2369,7 +1881,6 @@ class AsyncSandboxClient:
             disk_mb=disk_mb,
             sandbox_nodes_only=sandbox_nodes_only,
         )
-        return await self._request_json("POST", "/v1/images/pull", payload=payload)
 
     async def snapshot_sandbox(
         self,
@@ -2378,14 +1889,7 @@ class AsyncSandboxClient:
         *,
         image_id: str | None = None,
     ) -> JsonObject:
-        payload: JsonObject = {"image": _image_pull_reference(image)}
-        if image_id is not None:
-            payload["id"] = image_id
-        return await self._request_json(
-            "POST",
-            f"/v1/sandboxes/{_quote_segment(sandbox_id)}/snapshot",
-            payload=payload,
-        )
+        return await super().snapshot_sandbox(sandbox_id, image, image_id=image_id)
 
     async def _client(self) -> Any:
         if self._session is not None:
@@ -2412,41 +1916,66 @@ class AsyncSandboxClient:
         content_type: str | None = None,
         timeout_seconds: float | None = None,
     ) -> JsonObject:
-        serialized_payload = (
-            json.dumps(payload).encode("utf-8") if payload is not None else None
+        _, headers, streamed_body = _node_request_content(
+            self.headers,
+            payload,
+            body,
+            body_size,
+            content_type,
         )
-        body_limit = MAX_JSON_BODY_BYTES if payload is not None else MAX_FILE_BODY_BYTES
-        known_body_size = (
-            len(serialized_payload)
-            if serialized_payload is not None
-            else len(body)
-            if isinstance(body, bytes)
-            else body_size
-        )
-        if body is not None and known_body_size is None:
-            raise TypeError("body_size is required for streamed request bodies")
-        if known_body_size is not None and known_body_size > body_limit:
-            raise SandboxApiError(f"request body exceeds the {body_limit} byte limit")
-        headers = dict(self.headers)
-        if payload is not None:
-            headers["Content-Type"] = "application/json"
-        if content_type is not None and payload is None:
-            headers["Content-Type"] = content_type
-        streamed_body = body is not None and not isinstance(body, bytes)
-        if streamed_body:
-            headers["Content-Length"] = str(known_body_size)
-        client = await self._client()
         timeout = self.timeout_seconds if timeout_seconds is None else timeout_seconds
+        raw, status, received_headers = await self._send(
+            method,
+            path,
+            payload=payload,
+            body=body,
+            headers=headers,
+            timeout=timeout,
+            streamed=streamed_body,
+            success_limit=MAX_JSON_RESPONSE_BYTES,
+        )
+        return _decode_node_json(
+            raw.decode("utf-8", errors="replace"),
+            status=status,
+            headers=received_headers,
+        )
+
+    async def _request_bytes(self, method: str, path: str) -> bytes:
+        raw, _, _ = await self._send(
+            method,
+            path,
+            payload=None,
+            body=None,
+            headers=dict(self.headers),
+            timeout=self.timeout_seconds,
+            streamed=False,
+            success_limit=MAX_FILE_RESPONSE_BYTES,
+        )
+        return raw
+
+    async def _send(
+        self,
+        method: str,
+        path: str,
+        *,
+        payload: JsonObject | None,
+        body: bytes | BinaryIO | None,
+        headers: Mapping[str, str],
+        timeout: float,
+        streamed: bool,
+        success_limit: int,
+    ) -> tuple[bytes, int, dict[str, str]]:
+        client = await self._client()
         deadline = _deadline(timeout)
         retry_attempts = _ucloud_unavailable_retry_attempts(method, path)
         for attempt in range(retry_attempts):
-            if streamed_body:
+            if streamed:
                 body.seek(0)
             async with client.request(
                 method,
                 self.base_url + path,
                 json=payload,
-                data=_async_file_chunks(body) if streamed_body else body,
+                data=_async_file_chunks(body) if streamed else body,
                 headers=headers,
                 timeout=_aiohttp_timeout(
                     _request_timeout_seconds(
@@ -2457,84 +1986,12 @@ class AsyncSandboxClient:
                 allow_redirects=False,
             ) as response:
                 try:
-                    raw_bytes = await read_async_response(
-                        response,
-                        limit=MAX_JSON_RESPONSE_BYTES,
-                    )
-                except ResponseTooLargeError as exc:
-                    raise SandboxApiError(
-                        str(exc),
-                        status_code=response.status,
-                        headers=response_headers(response),
-                    ) from exc
-                raw = raw_bytes.decode("utf-8", errors="replace")
-                if 200 <= response.status < 300:
-                    try:
-                        decoded = json.loads(raw) if raw else {}
-                    except json.JSONDecodeError as exc:
-                        raise SandboxApiError(
-                            f"node-agent returned invalid JSON: {exc}",
-                            status_code=response.status,
-                            body={"error": raw},
-                            headers=response_headers(response),
-                        ) from exc
-                else:
-                    decoded = _decode_json_error(raw)
-                if not 200 <= response.status < 300:
-                    api_error = SandboxApiError(
-                        f"node-agent request failed ({response.status}): {decoded}",
-                        status_code=response.status,
-                        body=decoded,
-                        headers=response_headers(response),
-                    )
-                    if _should_retry_ucloud_unavailable(
-                        response.status,
-                        decoded,
-                        attempt,
-                        method=method,
-                        path=path,
-                        max_attempts=retry_attempts,
-                    ):
-                        delay = _ucloud_unavailable_retry_delay(
-                            attempt,
-                            response_headers(response),
-                            method=method,
-                            path=path,
-                        )
-                        if await _async_sleep_for_retry(delay, deadline):
-                            continue
-                    raise api_error
-            if not isinstance(decoded, dict):
-                raise SandboxApiError(
-                    "node-agent returned a non-object JSON payload", body=decoded
-                )
-            return decoded
-        raise AssertionError("unreachable UCloud unavailable retry state")
-
-    async def _request_bytes(self, method: str, path: str) -> bytes:
-        client = await self._client()
-        deadline = _deadline(self.timeout_seconds)
-        retry_attempts = _ucloud_unavailable_retry_attempts(method, path)
-        for attempt in range(retry_attempts):
-            async with client.request(
-                method,
-                self.base_url + path,
-                headers=dict(self.headers),
-                timeout=_aiohttp_timeout(
-                    _request_timeout_seconds(
-                        _required_remaining_seconds(deadline),
-                        self.timeout_seconds,
-                    )
-                ),
-                allow_redirects=False,
-            ) as response:
-                try:
                     raw = await read_async_response(
                         response,
                         limit=(
                             MAX_JSON_RESPONSE_BYTES
                             if not 200 <= response.status < 300
-                            else MAX_FILE_RESPONSE_BYTES
+                            else success_limit
                         ),
                     )
                 except ResponseTooLargeError as exc:
@@ -2544,59 +2001,73 @@ class AsyncSandboxClient:
                         headers=response_headers(response),
                     ) from exc
                 if not 200 <= response.status < 300:
-                    text = raw.decode("utf-8", errors="replace")
-                    decoded = _decode_json_error(text)
-                    api_error = SandboxApiError(
-                        f"node-agent request failed ({response.status}): {decoded}",
-                        status_code=response.status,
-                        body=decoded,
+                    api_error = _node_error(
+                        raw.decode("utf-8", errors="replace"),
+                        status=response.status,
                         headers=response_headers(response),
                     )
-                    if _should_retry_ucloud_unavailable(
-                        response.status,
-                        decoded,
+                    delay = _retry_error(
+                        api_error,
                         attempt,
                         method=method,
                         path=path,
                         max_attempts=retry_attempts,
+                    )
+                    if delay is not None and await _async_sleep_for_retry(
+                        delay,
+                        deadline,
                     ):
-                        delay = _ucloud_unavailable_retry_delay(
-                            attempt,
-                            response_headers(response),
-                            method=method,
-                            path=path,
-                        )
-                        if await _async_sleep_for_retry(delay, deadline):
-                            continue
+                        continue
                     raise api_error
-                return raw
+                return raw, response.status, response_headers(response)
         raise AssertionError("unreachable UCloud unavailable retry state")
 
 
-def _sandbox_payload(
-    spec: SandboxSpec | None,
-    **kwargs: Any,
-) -> JsonObject:
-    payload = _object_payload(spec)
-    overrides = {key: value for key, value in kwargs.items() if value is not None}
-    payload.update(overrides)
-    if "image" in payload:
-        if not (
-            isinstance(spec, SandboxSpec)
-            and "image" not in overrides
-            and isinstance(payload["image"], str)
-        ):
-            payload["image"] = _image_reference(payload["image"])
-    else:
-        raise TypeError("sandbox image is required and must be an Image")
-    for nested_field in ("security", "filesystem", "ssh"):
-        if payload.get(nested_field) is not None:
-            payload[nested_field] = _nested_payload(payload[nested_field])
-    if bool(payload.get("managed_process")) and not bool(payload.get("parkable")):
-        raise ValueError("managed_process requires parkable=True")
-    if bool(payload.get("managed_process")) and payload.get("command"):
-        raise ValueError("managed_process sandboxes are started with start_job()")
-    return payload
+def _records(payload: JsonObject, field: str) -> list[JsonObject]:
+    value = payload.get(field)
+    return (
+        [item for item in value if isinstance(item, dict)]
+        if isinstance(value, list)
+        else []
+    )
+
+
+def _sandbox_record(response: JsonObject) -> tuple[str, JsonObject]:
+    record = response.get("sandbox")
+    spec = record.get("spec") if isinstance(record, dict) else None
+    sandbox_id = spec.get("id") if isinstance(spec, dict) else None
+    if not isinstance(record, dict):
+        raise SandboxApiError(
+            "node-agent returned an invalid sandbox payload",
+            body=response,
+        )
+    if not isinstance(sandbox_id, str) or not sandbox_id:
+        raise SandboxApiError(
+            "node-agent sandbox payload is missing spec.id",
+            body=response,
+        )
+    return sandbox_id, record
+
+
+def _exec_session(response: JsonObject) -> JsonObject:
+    session = response.get("session")
+    if not isinstance(session, dict) or not isinstance(session.get("id"), str):
+        raise SandboxApiError(
+            "node-agent returned an invalid exec session payload",
+            body=response,
+        )
+    return session
+
+
+def _checked_job(
+    response: JsonObject,
+    sandbox_id: str,
+    job_id: str,
+) -> SandboxJobRecord:
+    record = _job_record(response)
+    if record.sandbox_id != sandbox_id or record.job_id != job_id:
+        raise SandboxApiError("gateway returned another sandbox job", body=response)
+    return record
 
 
 @contextmanager
@@ -2605,7 +2076,12 @@ def _image_build_request(
 ) -> Iterator[tuple[JsonObject, BinaryIO]]:
     if not isinstance(image, Image):
         raise TypeError("build_image() requires an Image from Image.from_dockerfile()")
-    payload = image.to_build_spec().to_dict()
+    spec = image.to_build_spec()
+    payload = dict(vars(spec))
+    payload["build_args"] = dict(spec.build_args)
+    payload["labels"] = dict(spec.labels)
+    if payload["tag"] is None:
+        payload.pop("tag")
     context_path = Path(str(payload["context_path"]))
     if not context_path.is_dir():
         raise ValueError(f"image build context is not a directory: {context_path}")
@@ -2640,23 +2116,19 @@ def _image_build_response(payload: JsonObject) -> JsonObject:
     return build
 
 
-def _completed_build_payload(build: JsonObject) -> JsonObject:
-    payload: JsonObject = {
-        "build": dict(build),
-        "image": build.get("image") if isinstance(build.get("image"), dict) else {},
-        "command": list(build.get("command") or []),
-        "exit_code": build.get("exit_code"),
-    }
-    if build.get("push_command"):
-        payload["push_command"] = list(build.get("push_command") or [])
-        payload["push_exit_code"] = build.get("push_exit_code")
-    return payload
+def _successful_image_build(build: JsonObject) -> JsonObject:
+    if build.get("status") != "succeeded":
+        raise SandboxApiError(
+            f"image build failed: {build.get('error') or build.get('status')}",
+            body={"build": build},
+        )
+    return build
 
 
 def _image_reference(image: object) -> str:
     if not isinstance(image, Image):
         raise TypeError("sandbox image must be an Image")
-    return image.to_sandbox_image()
+    return image.reference
 
 
 def _image_pull_reference(image: Image) -> str:
@@ -2670,26 +2142,6 @@ def _non_empty_string(name: str, value: object) -> str:
     if not text:
         raise ValueError(f"{name} cannot be empty")
     return text
-
-
-def _object_payload(spec: object | None) -> JsonObject:
-    if spec is None:
-        return {}
-    to_dict = getattr(spec, "to_dict", None)
-    if callable(to_dict):
-        raw = to_dict()
-        if isinstance(raw, Mapping):
-            return dict(raw)
-    raise TypeError("spec must expose to_dict().")
-
-
-def _nested_payload(value: object) -> object:
-    if isinstance(value, Mapping):
-        return dict(value)
-    to_dict = getattr(value, "to_dict", None)
-    if callable(to_dict):
-        return to_dict()
-    return value
 
 
 def _aiohttp_timeout(timeout_seconds: float | None) -> object:
@@ -2863,17 +2315,20 @@ def _job_payload(
     max_stdout_bytes: int | None,
     max_stderr_bytes: int | None,
 ) -> JsonObject:
-    payload: JsonObject = {
-        "job_id": job_id,
-        "argv": _command_list(command),
-        "env": dict(env or {}),
-        "cwd": working_dir or "/workspace",
-    }
-    if max_stdout_bytes is not None:
-        payload["max_stdout_bytes"] = int(max_stdout_bytes)
-    if max_stderr_bytes is not None:
-        payload["max_stderr_bytes"] = int(max_stderr_bytes)
-    return payload
+    return _present(
+        {
+            "job_id": job_id,
+            "argv": _command_list(command),
+            "env": dict(env or {}),
+            "cwd": working_dir or "/workspace",
+            "max_stdout_bytes": (
+                int(max_stdout_bytes) if max_stdout_bytes is not None else None
+            ),
+            "max_stderr_bytes": (
+                int(max_stderr_bytes) if max_stderr_bytes is not None else None
+            ),
+        }
+    )
 
 
 def _job_record(response: object) -> SandboxJobRecord:
@@ -2893,23 +2348,18 @@ def _prepare_capacity_payload(
     ttl_seconds: int,
     prepare_id: str | None,
 ) -> JsonObject:
-    payload: JsonObject = {
-        "count": count,
-        "ttl_seconds": ttl_seconds,
-    }
-    if prepare_id is not None:
-        payload["id"] = prepare_id
-    if cpus is not None:
-        payload["cpus"] = cpus
-    if memory_mb is not None:
-        payload["memory_mb"] = memory_mb
-    if disk_mb is not None:
-        payload["disk_mb"] = disk_mb
-    if image is not None:
-        payload["image"] = _image_pull_reference(image)
-    if parkable:
-        payload["parkable"] = True
-    return payload
+    return _present(
+        {
+            "count": count,
+            "ttl_seconds": ttl_seconds,
+            "id": prepare_id,
+            "cpus": cpus,
+            "memory_mb": memory_mb,
+            "disk_mb": disk_mb,
+            "image": _image_pull_reference(image) if image is not None else None,
+            "parkable": True if parkable else None,
+        }
+    )
 
 
 def _image_pull_payload(
@@ -2922,20 +2372,17 @@ def _image_pull_payload(
     disk_mb: int | None,
     sandbox_nodes_only: bool,
 ) -> JsonObject:
-    payload: JsonObject = {
-        "image": _image_pull_reference(image),
-        "count": count,
-        "sandbox_nodes_only": sandbox_nodes_only,
-    }
-    if image_id is not None:
-        payload["id"] = image_id
-    if cpus is not None:
-        payload["cpus"] = cpus
-    if memory_mb is not None:
-        payload["memory_mb"] = memory_mb
-    if disk_mb is not None:
-        payload["disk_mb"] = disk_mb
-    return payload
+    return _present(
+        {
+            "image": _image_pull_reference(image),
+            "count": count,
+            "sandbox_nodes_only": sandbox_nodes_only,
+            "id": image_id,
+            "cpus": cpus,
+            "memory_mb": memory_mb,
+            "disk_mb": disk_mb,
+        }
+    )
 
 
 def _prepare_builder_payload(
@@ -2944,13 +2391,11 @@ def _prepare_builder_payload(
     ttl_seconds: int,
     prepare_id: str | None,
 ) -> JsonObject:
-    payload: JsonObject = {
-        "count": count,
-        "ttl_seconds": ttl_seconds,
-    }
-    if prepare_id is not None:
-        payload["id"] = prepare_id
-    return payload
+    return _present({"count": count, "ttl_seconds": ttl_seconds, "id": prepare_id})
+
+
+def _present(values: JsonObject) -> JsonObject:
+    return {key: value for key, value in values.items() if value is not None}
 
 
 def _command_list(command: str | Sequence[str]) -> list[str]:
@@ -2968,6 +2413,22 @@ def _file_path(sandbox_id: str, container_path: str) -> str:
         f"/v1/sandboxes/{_quote_segment(sandbox_id)}/files?"
         f"{parse.urlencode({'path': container_path})}"
     )
+
+
+def _exec_events_path(
+    session_id: str,
+    after: int,
+    limit: int,
+    wait_seconds: float,
+) -> str:
+    query = parse.urlencode(
+        {
+            "after": max(0, after),
+            "limit": max(1, limit),
+            "wait_seconds": max(0.0, wait_seconds),
+        }
+    )
+    return f"/v1/exec/{_quote_segment(session_id)}/events?{query}"
 
 
 def _text_payload(data: str | bytes) -> str:
@@ -2992,11 +2453,119 @@ def _read_file_bytes(path: Path, *, limit: int) -> bytes:
     return data
 
 
-def _decode_json_error(raw: str) -> object:
+def _node_request_content(
+    default_headers: Mapping[str, str],
+    payload: JsonObject | None,
+    body: bytes | BinaryIO | None,
+    body_size: int | None,
+    content_type: str | None,
+) -> tuple[bytes | BinaryIO | None, dict[str, str], bool]:
+    serialized = json.dumps(payload).encode("utf-8") if payload is not None else None
+    request_body = serialized if serialized is not None else body
+    known_size = len(request_body) if isinstance(request_body, bytes) else body_size
+    if request_body is not None and known_size is None:
+        raise TypeError("body_size is required for streamed request bodies")
+    body_limit = MAX_JSON_BODY_BYTES if payload is not None else MAX_FILE_BODY_BYTES
+    if known_size is not None and known_size > body_limit:
+        raise SandboxApiError(f"request body exceeds the {body_limit} byte limit")
+    headers = dict(default_headers)
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+    elif content_type is not None:
+        headers["Content-Type"] = content_type
+    streamed = request_body is not None and not isinstance(request_body, bytes)
+    if streamed:
+        headers["Content-Length"] = str(known_size)
+    return request_body, headers, streamed
+
+
+def _decode_node_json(
+    raw: str,
+    *,
+    status: int,
+    headers: Mapping[str, str],
+) -> JsonObject:
     try:
-        return json.loads(raw) if raw else {}
-    except json.JSONDecodeError:
-        return {"error": raw}
+        decoded = json.loads(raw) if raw else {}
+    except json.JSONDecodeError as exc:
+        if 200 <= status < 300:
+            raise SandboxApiError(
+                f"node-agent returned invalid JSON: {exc}",
+                status_code=status,
+                body={"error": raw},
+                headers=headers,
+            ) from exc
+        decoded = {"error": raw}
+    if not 200 <= status < 300:
+        raise SandboxApiError(
+            f"node-agent request failed ({status}): {decoded}",
+            status_code=status,
+            body=decoded,
+            headers=headers,
+        )
+    if not isinstance(decoded, dict):
+        raise SandboxApiError(
+            "node-agent returned a non-object JSON payload",
+            body=decoded,
+        )
+    return decoded
+
+
+def _sync_node_error(exc: error.HTTPError) -> SandboxApiError:
+    headers = response_headers(exc)
+    try:
+        raw = read_sync_response(exc, limit=MAX_JSON_RESPONSE_BYTES).decode(
+            "utf-8",
+            errors="replace",
+        )
+    except ResponseTooLargeError as size_exc:
+        raise SandboxApiError(
+            str(size_exc),
+            status_code=exc.code,
+            headers=headers,
+        ) from size_exc
+    finally:
+        exc.close()
+    return _node_error(raw, status=exc.code, headers=headers)
+
+
+def _node_error(
+    raw: str,
+    *,
+    status: int,
+    headers: Mapping[str, str],
+) -> SandboxApiError:
+    try:
+        _decode_node_json(raw, status=status, headers=headers)
+    except SandboxApiError as api_error:
+        return api_error
+    raise AssertionError("HTTP error decoded as success")
+
+
+def _retry_error(
+    api_error: SandboxApiError,
+    attempt: int,
+    *,
+    method: str,
+    path: str,
+    max_attempts: int,
+) -> float | None:
+    status = api_error.status_code
+    if status is None or not _should_retry_ucloud_unavailable(
+        status,
+        api_error.body,
+        attempt,
+        method=method,
+        path=path,
+        max_attempts=max_attempts,
+    ):
+        return None
+    return _ucloud_unavailable_retry_delay(
+        attempt,
+        api_error.headers,
+        method=method,
+        path=path,
+    )
 
 
 def _should_retry_ucloud_unavailable(
