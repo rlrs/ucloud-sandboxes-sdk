@@ -409,6 +409,7 @@ class SandboxSdkTests(unittest.TestCase):
         ).to_dict()
 
         self.assertNotIn("parkable", ordinary)
+        self.assertEqual(ordinary["network"], "bridge")
         self.assertTrue(parkable["parkable"])
 
     def test_sync_managed_job_handle_uses_durable_job_api(self) -> None:

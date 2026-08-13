@@ -52,9 +52,14 @@ Sandbox create requests are individually resource-shaped:
   "image": "python:3.12-slim",
   "cpus": 1,
   "memory_mb": 2048,
-  "disk_mb": 10240
+  "disk_mb": 10240,
+  "network": "bridge"
 }
 ```
+
+The SDK defaults `network` to `bridge`, matching production sandbox workers.
+Use `none` explicitly only with a deployment whose node-wide runtime is also
+configured without sandbox networking.
 
 The SDK requires `image` to be an `Image` helper. `Image.from_registry(...)`
 sends a registry tag, `Image.from_name(...)` sends a gateway image id, and

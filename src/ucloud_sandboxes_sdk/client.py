@@ -189,7 +189,10 @@ class SandboxSpec:
     memory_mb: int | None = None
     cpus: float | None = None
     disk_mb: int | None = None
-    network: str = "none"
+    # Production sandbox nodes use the isolated bridge/NAT runtime. Default
+    # SDK-created sandboxes to that usable path; callers that intentionally
+    # target a no-network node can still request "none" explicitly.
+    network: str = "bridge"
     ttl_seconds: int | None = None
     ssh: SandboxSshSpec = SandboxSshSpec()
     security: SandboxSecuritySpec | None = SandboxSecuritySpec()

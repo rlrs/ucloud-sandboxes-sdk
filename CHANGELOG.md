@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Defaulted SDK-created sandboxes to the production isolated bridge network;
+  no-network execution remains available as an explicit opt-in.
 - Defined one strict SDK contract for sandbox lifecycle, capacity, image builds,
   relay registration, HTTP tunnels, and SSH access.
 - Made local image contexts deterministic and content-addressed.
