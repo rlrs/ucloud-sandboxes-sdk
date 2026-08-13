@@ -30,10 +30,17 @@ with `src/ucloud_sandboxes_sdk/client.py` when endpoints are added.
 - `POST /v1/builders/prepare`
 - `DELETE /v1/builders/prepare/<prepare-id>`
 
-Protected sandbox gateways expect the token in `X-UCloud-Sandbox-Token`.
-The Python clients set this when constructed with `api_token=...`. Avoid
-standard `Authorization` for UCloud public-link sandbox gateway calls because
-that header can be consumed before the request reaches the gateway service.
+Protected sandbox gateways expect the sandbox API key in
+`X-UCloud-Sandbox-Token`. The Python clients set this when constructed with
+`api_token=...`. Avoid standard `Authorization` for UCloud public-link sandbox
+gateway calls because that header can be consumed before the request reaches
+the gateway service. The same client and header work with a Hetzner gateway's
+public HTTPS IPv4 URL; no domain is required.
+
+The public key is route-scoped by the gateway. It covers the SDK endpoints in
+this document but not node inventory, metrics, registry state, or explicit
+park, wake, detach, and migration operations. Those use a separate operator
+credential that SDK users must not receive.
 
 ## Sandbox Resources
 

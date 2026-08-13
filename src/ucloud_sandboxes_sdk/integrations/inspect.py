@@ -750,7 +750,7 @@ def _settings_from_env() -> _InspectSettings:
     base_url = os.environ.get("UCLOUD_SANDBOX_URL")
     if not base_url:
         raise ValueError(
-            "Set UCLOUD_SANDBOX_URL to the UCloud sandbox gateway or node-agent URL."
+            "Set UCLOUD_SANDBOX_URL to the sandbox gateway or node-agent URL."
         )
     headers = sandbox_auth_headers(os.environ.get("UCLOUD_SANDBOX_API_TOKEN"))
     ssh_enabled = _bool_env("UCLOUD_SANDBOX_SSH", False)

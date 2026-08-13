@@ -1,6 +1,7 @@
 # ucloud-sandboxes-sdk
 
-Python SDK and Inspect AI sandbox provider for UCloud sandbox gateways.
+Python SDK and Inspect AI sandbox provider for UCloud-compatible sandbox
+gateways, including UCloud and Hetzner deployments.
 
 Use this package from benchmark runners, evaluations, and user code that needs
 to create sandboxes, execute commands, stream results, manage images, and signal
@@ -20,7 +21,7 @@ ucloud`.
 
 ## Authentication
 
-Pass the gateway token with `api_token`. The SDK sends it as
+Pass the deployment's sandbox API key with `api_token`. The SDK sends it as
 `X-UCloud-Sandbox-Token`, which avoids UCloud public-link handling of standard
 `Authorization` headers:
 
@@ -35,6 +36,17 @@ client = SandboxClient(
 
 Raw HTTP callers should send the same token as
 `X-UCloud-Sandbox-Token: <token>`.
+
+For Hetzner, use the gateway's public HTTPS IPv4 URL in exactly the same
+constructor; no domain is required. SDK users need neither the Hetzner API
+token nor the separate gateway operator token:
+
+```python
+client = SandboxClient(
+    "https://203.0.113.10",
+    api_token="<sandbox-api-key>",
+)
+```
 
 ## Sandboxes
 
@@ -387,6 +399,9 @@ export UCLOUD_SANDBOX_START_TIMEOUT_SECONDS="1800"
 export UCLOUD_SANDBOX_BUILD_TIMEOUT_SECONDS="1800"
 export UCLOUD_SANDBOX_RETRY_INTERVAL_SECONDS="10"
 ```
+
+For a Hetzner deployment, replace `UCLOUD_SANDBOX_URL` with its public HTTPS
+IPv4 URL. `UCLOUD_SANDBOX_API_TOKEN` remains the sandbox API key.
 
 Run:
 
