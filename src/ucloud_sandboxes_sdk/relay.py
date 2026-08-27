@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import time
 from typing import Any, Mapping
@@ -88,6 +88,11 @@ class RelayRequest:
     delivery_count: int = 0
     sandbox_id: str | None = None
     sandbox_generation: int | None = None
+    expires_at: float | None = None
+    idempotency_key: str | None = None
+    reattachable: bool = False
+    accepted_notified_at: float | None = None
+    parked_transport_epoch: str | None = None
 
     @classmethod
     def from_payload(cls, payload: object) -> "RelayRequest":
@@ -119,6 +124,13 @@ class RelayRequest:
             delivery_count=_int(payload.get("delivery_count"), default=0),
             sandbox_id=_optional_string(payload.get("sandbox_id")),
             sandbox_generation=_optional_int(payload.get("sandbox_generation")),
+            expires_at=_optional_float(payload.get("expires_at")),
+            idempotency_key=_optional_string(payload.get("idempotency_key")),
+            reattachable=_optional_bool(payload.get("reattachable"), default=False),
+            accepted_notified_at=_optional_float(payload.get("accepted_notified_at")),
+            parked_transport_epoch=_optional_string(
+                payload.get("parked_transport_epoch")
+            ),
         )
 
 
@@ -212,6 +224,20 @@ class RelayWorkerClient(_RelayWorkerState):
         )
         self._remember_registration(rollout_id, response)
         return response
+
+    def register_agent_rollout(
+        self,
+        rollout_id: str,
+        sandbox: object,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> JsonObject:
+        """Register a rollout with a generation-fenced managed sandbox."""
+
+        return self.register_rollout(
+            rollout_id,
+            metadata=_agent_rollout_metadata(sandbox, metadata),
+        )
 
     def unregister_rollout(
         self,
@@ -513,6 +539,20 @@ class AsyncRelayWorkerClient(_RelayWorkerState):
         self._remember_registration(rollout_id, response)
         return response
 
+    async def register_agent_rollout(
+        self,
+        rollout_id: str,
+        sandbox: object,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> JsonObject:
+        """Register a rollout with a generation-fenced managed sandbox."""
+
+        return await self.register_rollout(
+            rollout_id,
+            metadata=_agent_rollout_metadata(sandbox, metadata),
+        )
+
     async def unregister_rollout(
         self,
         rollout_id: str,
@@ -763,6 +803,41 @@ def _registration_payload(
     return payload
 
 
+def _agent_rollout_metadata(
+    sandbox: object,
+    metadata: Mapping[str, Any] | None,
+) -> JsonObject:
+    sandbox_id = getattr(sandbox, "id", None)
+    record = getattr(sandbox, "record", None)
+    if not isinstance(sandbox_id, str) or not sandbox_id:
+        raise RelayApiError("agent sandbox handle has no sandbox id")
+    if not isinstance(record, Mapping):
+        raise RelayApiError("agent sandbox handle has no sandbox record")
+    generation = record.get("generation")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation <= 0:
+        raise RelayApiError("agent sandbox record has no positive generation")
+    spec = record.get("spec")
+    if not isinstance(spec, Mapping):
+        raise RelayApiError("agent sandbox record has no sandbox spec")
+    if spec.get("parkable") is not True or spec.get("managed_process") is not True:
+        raise RelayApiError(
+            "agent rollout requires a sandbox created with parkable=True and "
+            "managed_process=True"
+        )
+    result = dict(metadata or {})
+    for field, value in (
+        ("sandbox_id", sandbox_id),
+        ("sandbox_generation", generation),
+    ):
+        existing = result.get(field)
+        if existing is not None and existing != value:
+            raise RelayApiError(
+                f"agent rollout metadata {field} conflicts with the sandbox handle"
+            )
+        result[field] = value
+    return result
+
+
 def _unregistration_path(rollout_id: str) -> str:
     return f"/v1/relay/rollouts/{quote(rollout_id, safe='')}"
 
@@ -814,14 +889,43 @@ def _renewed_request(
     if not isinstance(request_payload, dict):
         raise RelayApiError("relay returned an invalid renew payload", body=response)
     renewed = RelayRequest.from_payload(request_payload)
-    if (
-        renewed.request_id != relay_request.request_id
-        or renewed.registration_token != relay_request.registration_token
-    ):
+    if not _valid_transport_state_transition(relay_request, renewed):
+        raise RelayApiError(
+            "relay returned an inconsistent renewed request", body=response
+        )
+    expected = replace(
+        relay_request,
+        lease_expires_at=renewed.lease_expires_at,
+        reattachable=renewed.reattachable,
+        accepted_notified_at=renewed.accepted_notified_at,
+        parked_transport_epoch=renewed.parked_transport_epoch,
+    )
+    if renewed != expected:
         raise RelayApiError(
             "relay returned an inconsistent renewed request", body=response
         )
     return renewed
+
+
+def _valid_transport_state_transition(
+    previous: RelayRequest, renewed: RelayRequest
+) -> bool:
+    if previous.reattachable and not renewed.reattachable:
+        return False
+    if (
+        previous.accepted_notified_at is not None
+        and renewed.accepted_notified_at != previous.accepted_notified_at
+    ):
+        return False
+    if (
+        previous.parked_transport_epoch is not None
+        and renewed.parked_transport_epoch != previous.parked_transport_epoch
+    ):
+        return False
+    return not (
+        renewed.parked_transport_epoch is not None
+        and renewed.accepted_notified_at is None
+    )
 
 
 def _response_payload(
@@ -1041,6 +1145,14 @@ def _optional_string(value: object) -> str | None:
 
 def _optional_int(value: object) -> int | None:
     return None if value is None else _int(value, default=0)
+
+
+def _optional_bool(value: object, *, default: bool) -> bool:
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise RelayApiError("relay payload contained an invalid boolean")
+    return value
 
 
 def _int(value: object, *, default: int) -> int:

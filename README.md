@@ -9,10 +9,13 @@ near-term capacity needs through a deployed UCloud sandbox gateway.
 
 ## Install
 
+Install the versioned wheel from the GitHub release (the SDK is not currently
+published on PyPI):
+
 ```bash
-uv add ucloud-sandboxes-sdk
-uv add "ucloud-sandboxes-sdk[async]"
-uv add "ucloud-sandboxes-sdk[inspect]"
+uv add "ucloud-sandboxes-sdk @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.9/ucloud_sandboxes_sdk-0.4.9-py3-none-any.whl"
+uv add "ucloud-sandboxes-sdk[async] @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.9/ucloud_sandboxes_sdk-0.4.9-py3-none-any.whl"
+uv add "ucloud-sandboxes-sdk[inspect] @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.9/ucloud_sandboxes_sdk-0.4.9-py3-none-any.whl"
 ```
 
 Use the base package for the synchronous client, the `async` extra for
@@ -90,6 +93,39 @@ its filesystem and process state remain intact. Parking is opt-in because its
 disk admission includes the complete memory backing required by the sandbox's
 hard limit.
 
+For a long-lived agent that must survive relay-driven park/wake and migration,
+create a managed-process sandbox without an initial command and use
+`start_agent()`:
+
+```python
+agent_sandbox = client.create_sandbox(
+    SandboxSpec(
+        id="agent-run-001",
+        image=Image.from_registry("python:3.12-slim"),
+        cpus=1,
+        memory_mb=2048,
+        disk_mb=10240,
+        ttl_seconds=3600,
+        parkable=True,
+        managed_process=True,
+    )
+)
+agent = agent_sandbox.start_agent(
+    ["python", "-m", "my_agent"],
+)
+result = agent.wait()
+```
+
+The sandbox must be created with both `parkable=True` and
+`managed_process=True`. The primary process and its bounded log ledger then
+live inside the checkpoint. Attached `start_exec()` sessions remain for tools
+and short commands; they deliberately block parking because gVisor cannot
+reattach their host-side transport after restore.
+
+`AsyncSandboxHandle.start_agent()` provides the same contract with `await`.
+Use the returned job handle to wait, inspect status, or read the bounded stdout
+and stderr ledger after a wake or migration.
+
 ## Files
 
 Upload and download files as raw bytes through the gateway:
@@ -126,6 +162,8 @@ sandbox = client.create_sandbox(
         memory_mb=2048,
         disk_mb=10240,
         network="bridge",
+        parkable=True,
+        managed_process=True,
         env=relay_env,
         labels={"rollout": "run-001"},
     )
@@ -135,6 +173,11 @@ sandbox = client.create_sandbox(
 The helper sets `OPENAI_BASE_URL` to
 `https://relay.example.org/rollouts/run-001/v1`, plus `OPENAI_API_KEY` and
 `VF_RELAY_ROLLOUT_ID`.
+
+Launch the sandbox-side agent with `start_agent()` as shown above. The managed
+process ledger, relay acceptance, gateway program transition, and checkpoint
+form one fenced protocol. Normal exec and file activity is never implicitly
+treated as safe to checkpoint.
 
 Run a worker near the model endpoint with `RelayWorkerClient`. Polling leases a
 request to one worker; renew the lease while a long local inference call is
@@ -149,7 +192,7 @@ relay = RelayWorkerClient(
     worker_token="<worker-relay-token>",
 )
 
-relay.register_rollout("run-001")
+relay.register_agent_rollout("run-001", sandbox)
 poll = relay.poll(
     "run-001",
     worker_id="lumi-worker-1",

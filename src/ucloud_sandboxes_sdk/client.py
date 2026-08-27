@@ -650,6 +650,27 @@ class SandboxHandle:
             max_stderr_bytes=max_stderr_bytes,
         )
 
+    def start_agent(
+        self,
+        command: str | Sequence[str],
+        *,
+        job_id: str | None = None,
+        env: Mapping[str, str] | None = None,
+        working_dir: str | None = None,
+        max_stdout_bytes: int | None = None,
+        max_stderr_bytes: int | None = None,
+    ) -> "JobHandle":
+        _require_agent_sandbox(self.record)
+        return self.client.start_agent(
+            self.id,
+            command,
+            job_id=job_id,
+            env=env,
+            working_dir=working_dir,
+            max_stdout_bytes=max_stdout_bytes,
+            max_stderr_bytes=max_stderr_bytes,
+        )
+
     def exec(
         self,
         command: str | Sequence[str],
@@ -1003,6 +1024,29 @@ class SandboxClient(_DirectSandboxOperations):
         record = _checked_job(response, sandbox_id, resolved_job_id)
         return JobHandle(self, sandbox_id, resolved_job_id, record)
 
+    def start_agent(
+        self,
+        sandbox_id: str,
+        command: str | Sequence[str],
+        *,
+        job_id: str | None = None,
+        env: Mapping[str, str] | None = None,
+        working_dir: str | None = None,
+        max_stdout_bytes: int | None = None,
+        max_stderr_bytes: int | None = None,
+    ) -> JobHandle:
+        """Launch a checkpoint-owned primary agent process."""
+
+        return self.start_job(
+            sandbox_id,
+            command,
+            job_id=job_id,
+            env=env,
+            working_dir=working_dir,
+            max_stdout_bytes=max_stdout_bytes,
+            max_stderr_bytes=max_stderr_bytes,
+        )
+
     def get_job(self, sandbox_id: str, job_id: str) -> SandboxJobRecord:
         response = self._request_json(
             "GET",
@@ -1291,6 +1335,27 @@ class AsyncSandboxHandle:
         max_stderr_bytes: int | None = None,
     ) -> "AsyncJobHandle":
         return await self.client.start_job(
+            self.id,
+            command,
+            job_id=job_id,
+            env=env,
+            working_dir=working_dir,
+            max_stdout_bytes=max_stdout_bytes,
+            max_stderr_bytes=max_stderr_bytes,
+        )
+
+    async def start_agent(
+        self,
+        command: str | Sequence[str],
+        *,
+        job_id: str | None = None,
+        env: Mapping[str, str] | None = None,
+        working_dir: str | None = None,
+        max_stdout_bytes: int | None = None,
+        max_stderr_bytes: int | None = None,
+    ) -> "AsyncJobHandle":
+        _require_agent_sandbox(self.record)
+        return await self.client.start_agent(
             self.id,
             command,
             job_id=job_id,
@@ -1687,6 +1752,29 @@ class AsyncSandboxClient(_DirectSandboxOperations):
         )
         record = _checked_job(response, sandbox_id, resolved_job_id)
         return AsyncJobHandle(self, sandbox_id, resolved_job_id, record)
+
+    async def start_agent(
+        self,
+        sandbox_id: str,
+        command: str | Sequence[str],
+        *,
+        job_id: str | None = None,
+        env: Mapping[str, str] | None = None,
+        working_dir: str | None = None,
+        max_stdout_bytes: int | None = None,
+        max_stderr_bytes: int | None = None,
+    ) -> AsyncJobHandle:
+        """Launch a checkpoint-owned primary agent process."""
+
+        return await self.start_job(
+            sandbox_id,
+            command,
+            job_id=job_id,
+            env=env,
+            working_dir=working_dir,
+            max_stdout_bytes=max_stdout_bytes,
+            max_stderr_bytes=max_stderr_bytes,
+        )
 
     async def get_job(self, sandbox_id: str, job_id: str) -> SandboxJobRecord:
         response = await self._request_json(
@@ -2300,6 +2388,17 @@ def _exec_payload(
         "stdin": stdin,
         "tty": tty,
     }
+
+
+def _require_agent_sandbox(record: Mapping[str, Any]) -> None:
+    spec = record.get("spec")
+    if not isinstance(spec, Mapping):
+        return
+    if spec.get("parkable") is not True or spec.get("managed_process") is not True:
+        raise ValueError(
+            "start_agent() requires a sandbox created with parkable=True and "
+            "managed_process=True"
+        )
 
 
 def _job_id(value: str | None) -> str:

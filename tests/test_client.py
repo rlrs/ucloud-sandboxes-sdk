@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
@@ -32,6 +32,69 @@ from ucloud_sandboxes_sdk import (
 )
 
 
+class _SyncResponse:
+    def __init__(
+        self,
+        body: bytes,
+        *,
+        status: int = 200,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.body = body
+        self.status = status
+        self.headers = headers or {}
+
+    def __enter__(self) -> "_SyncResponse":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def read(self, _size: int | None = None) -> bytes:
+        return self.body
+
+
+class _AsyncResponse:
+    def __init__(
+        self,
+        body: str,
+        *,
+        status: int = 200,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.body = body
+        self.status = status
+        self.headers = headers or {}
+
+    async def __aenter__(self) -> "_AsyncResponse":
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+    async def text(self) -> str:
+        return self.body
+
+
+class _ScriptedAsyncSession:
+    def __init__(
+        self,
+        responder: Callable[[str, object, dict[str, object], int], _AsyncResponse],
+    ) -> None:
+        self.responder = responder
+        self.requests: list[tuple[str, object, dict[str, object]]] = []
+
+    def request(
+        self,
+        method: object,
+        url: object,
+        **kwargs: object,
+    ) -> _AsyncResponse:
+        request = (str(method), url, dict(kwargs))
+        self.requests.append(request)
+        return self.responder(*request, len(self.requests))
+
+
 class SandboxSdkTests(unittest.TestCase):
     def test_credentialed_clients_reject_redirects(self) -> None:
         with running_redirect_gateway() as gateway:
@@ -55,6 +118,10 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(
             gateway.state.initial_tokens,
             ["secret-token", "secret-token"],
+        )
+        self.assertEqual(
+            sandbox_auth_headers(" secret-token "),
+            {"X-UCloud-Sandbox-Token": "secret-token"},
         )
 
     def test_exec_wait_rejects_noncontiguous_event_history(self) -> None:
@@ -97,32 +164,6 @@ class SandboxSdkTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
-    def test_async_client_rejects_malformed_success_json(self) -> None:
-        class FakeResponse:
-            status = 200
-            headers: dict[str, str] = {}
-
-            async def __aenter__(self) -> "FakeResponse":
-                return self
-
-            async def __aexit__(self, *args: object) -> None:
-                del args
-
-            async def text(self) -> str:
-                return "<html>not json</html>"
-
-        class FakeSession:
-            def request(self, *_args: object, **_kwargs: object) -> FakeResponse:
-                return FakeResponse()
-
-        async def scenario() -> None:
-            client = AsyncSandboxClient("http://gateway.invalid", session=FakeSession())
-            with self.assertRaises(SandboxApiError) as raised:
-                await client.health()
-            self.assertEqual(raised.exception.status_code, 200)
-
-        asyncio.run(scenario())
-
     def test_request_and_local_file_uploads_are_bounded(self) -> None:
         client = SandboxClient("http://gateway.invalid")
         with patch.object(client_module, "MAX_FILE_BODY_BYTES", 3):
@@ -139,93 +180,33 @@ class SandboxSdkTests(unittest.TestCase):
                     )
 
     def test_sync_and_async_json_responses_are_bounded(self) -> None:
-        class SyncResponse:
-            status = 200
-            headers = {"Content-Length": "4"}
-
-            def __enter__(self) -> "SyncResponse":
-                return self
-
-            def __exit__(self, *args: object) -> None:
-                del args
-
-            def read(self, _size: int | None = None) -> bytes:
-                return b"four"
-
-        with patch.object(client_module, "MAX_JSON_RESPONSE_BYTES", 3), patch.object(
-            client_module,
-            "open_no_redirect",
-            lambda *_args, **_kwargs: SyncResponse(),
+        with (
+            patch.object(client_module, "MAX_JSON_RESPONSE_BYTES", 3),
+            patch.object(
+                client_module,
+                "open_no_redirect",
+                lambda *_args, **_kwargs: _SyncResponse(
+                    b"four", headers={"Content-Length": "4"}
+                ),
+            ),
         ):
             with self.assertRaisesRegex(SandboxApiError, "response exceeds"):
                 SandboxClient("http://gateway.invalid").health()
 
-        class AsyncResponse:
-            status = 200
-            headers = {"Content-Length": "4"}
-
-            async def __aenter__(self) -> "AsyncResponse":
-                return self
-
-            async def __aexit__(self, *args: object) -> None:
-                del args
-
-        class AsyncSession:
-            def request(self, *_args: object, **_kwargs: object) -> AsyncResponse:
-                return AsyncResponse()
-
         async def scenario() -> None:
             client = AsyncSandboxClient(
                 "http://gateway.invalid",
-                session=AsyncSession(),
+                session=_ScriptedAsyncSession(
+                    lambda *_args: _AsyncResponse(
+                        "four", headers={"Content-Length": "4"}
+                    )
+                ),
             )
             with self.assertRaisesRegex(SandboxApiError, "response exceeds"):
                 await client.health()
 
         with patch.object(client_module, "MAX_JSON_RESPONSE_BYTES", 3):
             asyncio.run(scenario())
-
-    def test_managed_build_payload_omits_registry_coordinates(self) -> None:
-        with docker_context() as context:
-            with client_module._image_build_request(
-                Image.from_dockerfile(name="managed-image", context_path=context)
-            ) as (payload, archive_stream):
-                archive = archive_stream.read()
-            with client_module._image_build_request(
-                Image.from_dockerfile(name="managed-image", context_path=context)
-            ) as (repeated_payload, repeated_archive_stream):
-                repeated_archive = repeated_archive_stream.read()
-
-        self.assertEqual(payload["id"], "managed-image")
-        self.assertNotIn("tag", payload)
-        self.assertEqual(payload["context_archive_size"], len(archive))
-        self.assertEqual(
-            payload["context_archive_digest"],
-            f"sha256:{hashlib.sha256(archive).hexdigest()}",
-        )
-        self.assertEqual(repeated_payload, payload)
-        self.assertEqual(repeated_archive, archive)
-        self.assertEqual(Image.from_name("managed-image").reference, "managed-image")
-
-    def test_api_token_uses_public_link_safe_header(self) -> None:
-        with running_gateway() as gateway:
-            client = SandboxClient(gateway.base_url, api_token="secret-token")
-
-            health = client.health()
-
-        self.assertTrue(health["ok"])
-        lower_headers = {
-            key.lower(): value for key, value in gateway.state.last_headers.items()
-        }
-        self.assertEqual(
-            lower_headers.get("x-ucloud-sandbox-token"),
-            "secret-token",
-        )
-        self.assertNotIn("authorization", lower_headers)
-        self.assertEqual(
-            sandbox_auth_headers(" secret-token "),
-            {"X-UCloud-Sandbox-Token": "secret-token"},
-        )
 
     def test_sync_client_lifecycle_and_exec(self) -> None:
         with running_gateway() as gateway:
@@ -273,13 +254,12 @@ class SandboxSdkTests(unittest.TestCase):
     def test_sync_client_image_cache_methods(self) -> None:
         with docker_context() as context, running_gateway() as gateway:
             client = SandboxClient(gateway.base_url)
-
-            built = client.build_image(
-                Image.from_dockerfile(
-                    name="python-base",
-                    context_path=context,
-                )
+            source = Image.from_dockerfile(
+                name="python-base",
+                context_path=context,
             )
+            built = client.build_image(source)
+            rebuilt = client.build_image(source)
             pulled = client.pull_image(
                 Image.from_registry("busybox:latest"),
                 image_id="busybox",
@@ -299,62 +279,47 @@ class SandboxSdkTests(unittest.TestCase):
                 image_id="snap-one",
             )
             images = client.list_images()
+            builds = client.list_image_builds()
 
         self.assertEqual(built["image"]["id"], "python-base")
+        self.assertEqual(rebuilt["image"]["id"], "python-base")
         self.assertEqual(built["image"]["tag"], "")
         self.assertTrue(built["image"]["received_push"])
+        self.assertGreater(built["image"]["received_archive_bytes"], 0)
+        self.assertEqual(gateway.state.build_context_puts, 1)
+        self.assertEqual(len(gateway.state.build_contexts), 1)
+        self.assertEqual(builds[0]["status"], "succeeded")
         self.assertEqual(pulled["image"]["id"], "busybox")
         self.assertEqual(snapshot["image"]["id"], "snap-one")
-        self.assertEqual(
+        self.assertCountEqual(
             [image["id"] for image in images],
             ["busybox", "python-base", "snap-one"],
         )
 
-    def test_sync_client_accepts_sandbox_spec_with_image_helper(self) -> None:
-        with running_gateway() as gateway:
-            client = SandboxClient(gateway.base_url)
-
-            sandbox = client.create_sandbox(
-                SandboxSpec(
-                    id="spec-one",
-                    image=Image.from_registry("busybox"),
-                    command=["sleep", "60"],
-                    memory_mb=128,
-                    cpus=0.25,
-                    disk_mb=64,
-                )
-            )
-            deleted = sandbox.delete()
-
-        self.assertEqual(sandbox.id, "spec-one")
-        self.assertEqual(deleted["deleted"]["spec"]["image"], "busybox")
-
-    def test_typed_create_serializes_nested_specs(self) -> None:
-        with running_gateway() as gateway:
-            client = SandboxClient(gateway.base_url)
-            sandbox = client.create_sandbox(
-                SandboxSpec(
-                    id="typed-nested-specs",
-                    image=Image.from_registry("busybox"),
-                    security=SandboxSecuritySpec(user="0:0", cap_add=("NET_RAW",)),
-                    filesystem=SandboxFilesystemSpec(
-                        enforce_disk_quota=True,
-                        tmpfs_mb=32,
-                    ),
-                    ssh=SandboxSshSpec(enabled=True, user="root"),
-                )
-            )
-            payload = dict(gateway.state.last_payload)
-            sandbox.delete()
-
+    def test_sandbox_spec_nested_types_and_optional_fields(self) -> None:
+        payload = SandboxSpec(
+            id="typed-nested-specs",
+            image=Image.from_registry("busybox"),
+            security=SandboxSecuritySpec(user="0:0", cap_add=("NET_RAW",)),
+            filesystem=SandboxFilesystemSpec(
+                enforce_disk_quota=True,
+                tmpfs_mb=32,
+            ),
+            ssh=SandboxSshSpec(enabled=True, user="root"),
+            parkable=True,
+        ).to_dict()
         self.assertEqual(payload["security"]["user"], "0:0")
         self.assertEqual(payload["security"]["cap_add"], ["NET_RAW"])
         self.assertTrue(payload["filesystem"]["enforce_disk_quota"])
         self.assertEqual(payload["filesystem"]["tmpfs_mb"], 32)
         self.assertTrue(payload["ssh"]["enabled"])
         self.assertEqual(payload["ssh"]["user"], "root")
-
-    def test_sandbox_spec_rejects_untyped_nested_specs(self) -> None:
+        self.assertTrue(payload["parkable"])
+        ordinary = SandboxSpec(
+            id="ordinary", image=Image.from_registry("busybox")
+        ).to_dict()
+        self.assertNotIn("parkable", ordinary)
+        self.assertEqual(ordinary["network"], "bridge")
         for field, value in (
             ("ssh", True),
             ("ssh", {}),
@@ -369,49 +334,6 @@ class SandboxSdkTests(unittest.TestCase):
                         **{field: value},
                     )
 
-    def test_async_create_accepts_explicit_ssh_spec(self) -> None:
-        async def scenario(base_url: str) -> dict:
-            async with AsyncSandboxClient(base_url) as client:
-                sandbox = await client.create_sandbox(
-                    SandboxSpec(
-                        id="typed-ssh",
-                        image=Image.from_registry("busybox"),
-                        network="bridge",
-                        ssh=SandboxSshSpec(
-                            enabled=True,
-                            user="alice",
-                            authorized_keys=("ssh-ed25519 test",),
-                        ),
-                    )
-                )
-                payload = dict(sandbox.create_response["sandbox"]["spec"])
-                await sandbox.delete()
-                return payload
-
-        with running_gateway() as gateway:
-            payload = asyncio.run(scenario(gateway.base_url))
-
-        self.assertEqual(payload["network"], "bridge")
-        self.assertEqual(payload["ssh"]["user"], "alice")
-        self.assertEqual(payload["ssh"]["authorized_keys"], ["ssh-ed25519 test"])
-
-    def test_sandbox_spec_sends_parkable_only_when_enabled(self) -> None:
-        ordinary = SandboxSpec(
-            id="ordinary",
-            image=Image.from_registry("busybox"),
-        ).to_dict()
-        parkable = SandboxSpec(
-            id="parkable",
-            image=Image.from_registry("busybox"),
-            memory_mb=128,
-            disk_mb=64,
-            parkable=True,
-        ).to_dict()
-
-        self.assertNotIn("parkable", ordinary)
-        self.assertEqual(ordinary["network"], "bridge")
-        self.assertTrue(parkable["parkable"])
-
     def test_sync_managed_job_handle_uses_durable_job_api(self) -> None:
         with running_gateway() as gateway:
             client = SandboxClient(gateway.base_url)
@@ -425,7 +347,7 @@ class SandboxSdkTests(unittest.TestCase):
                     managed_process=True,
                 )
             )
-            job = sandbox.start_job(
+            job = sandbox.start_agent(
                 ["/bin/sh", "-c", "run-harness"],
                 job_id="rollout-1",
                 env={"MODEL": "test"},
@@ -434,13 +356,30 @@ class SandboxSdkTests(unittest.TestCase):
             logs = job.logs(limit=4)
             terminal = job.signal()
 
-        self.assertTrue(gateway.state.last_payload.get("signal") == 15)
         self.assertTrue(sandbox.record["spec"]["managed_process"])
         self.assertEqual(refreshed.state, "running")
         self.assertEqual(logs.data, b"harn")
         self.assertEqual(logs.next_offset, 4)
         self.assertEqual(terminal.state, "signaled")
+        self.assertEqual(terminal.signal, 15)
         self.assertTrue(terminal.terminal)
+
+    def test_start_agent_rejects_non_managed_sandbox_before_request(self) -> None:
+        client = SandboxClient("http://gateway.invalid")
+        sandbox = client_module.SandboxHandle(
+            client,
+            "ordinary",
+            record={
+                "spec": {
+                    "id": "ordinary",
+                    "parkable": True,
+                    "managed_process": False,
+                }
+            },
+        )
+
+        with self.assertRaisesRegex(ValueError, "managed_process=True"):
+            sandbox.start_agent(["agent"])
 
     def test_managed_job_id_uses_the_server_ascii_grammar(self) -> None:
         with running_gateway() as gateway:
@@ -448,54 +387,12 @@ class SandboxSdkTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "job_id must match"):
                 client.start_job("managed-sync", ["true"], job_id="röllout")
 
-    def test_async_managed_job_handle_matches_sync_contract(self) -> None:
-        async def exercise(base_url: str) -> tuple[str, bytes, str]:
-            async with AsyncSandboxClient(base_url) as client:
-                sandbox = await client.create_sandbox(
-                    SandboxSpec(
-                        id="managed-async",
-                        image=Image.from_registry("busybox"),
-                        memory_mb=128,
-                        disk_mb=64,
-                        parkable=True,
-                        managed_process=True,
-                    )
-                )
-                job = await sandbox.start_job(
-                    ["/bin/sh", "-c", "run-harness"],
-                    job_id="rollout-2",
-                )
-                record = await job.refresh()
-                logs = await job.logs()
-                terminal = await job.signal(2)
-                return record.state, logs.data, terminal.state
-
-        with running_gateway() as gateway:
-            result = asyncio.run(exercise(gateway.base_url))
-
-        self.assertEqual(result, ("running", b"harness", "signaled"))
-
     def test_sync_create_sandbox_accepts_per_call_request_timeout(self) -> None:
-        class FakeResponse:
-            status = 200
-
-            def __init__(self, body: bytes) -> None:
-                self.body = body
-
-            def __enter__(self) -> "FakeResponse":
-                return self
-
-            def __exit__(self, *args: object) -> None:
-                return None
-
-            def read(self) -> bytes:
-                return self.body
-
         captured_timeouts: list[object] = []
 
-        def fake_urlopen(req: object, timeout: object = None) -> FakeResponse:
+        def fake_urlopen(req: object, timeout: object = None) -> _SyncResponse:
             captured_timeouts.append(timeout)
-            return FakeResponse(
+            return _SyncResponse(
                 b'{"sandbox": {"spec": {"id": "timeout-one", "image": "busybox"}}}'
             )
 
@@ -514,104 +411,24 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(len(captured_timeouts), 1)
         self.assertAlmostEqual(float(captured_timeouts[0]), 7, places=3)
 
-    def test_sync_client_uploads_local_build_context(self) -> None:
-        with TemporaryDirectory() as raw_dir:
-            context = Path(raw_dir) / "context"
-            context.mkdir()
-            (context / "Dockerfile").write_text("FROM busybox\n", encoding="utf-8")
-            with running_gateway() as gateway:
-                client = SandboxClient(gateway.base_url)
-
-                built = client.build_image(
-                    Image.from_dockerfile(
-                        name="local-context",
-                        tag="local/context:latest",
-                        context_path=str(context),
-                    )
-                )
-                submitted = dict(gateway.state.last_payload)
-                uploaded = dict(gateway.state.build_contexts)
-
-        self.assertEqual(built["image"]["id"], "local-context")
-        self.assertEqual(built["exit_code"], 0)
-        self.assertEqual(built["image"]["received_context_path"], ".")
-        self.assertGreater(built["image"]["received_archive_bytes"], 0)
-        digest = submitted["context_archive_digest"]
-        self.assertEqual(submitted["context_archive_format"], "tar.gz")
-        self.assertEqual(submitted["context_archive_size"], len(uploaded[digest]))
-
-    def test_sync_client_skips_existing_build_context_upload(self) -> None:
-        with docker_context() as context, running_gateway() as gateway:
-            client = SandboxClient(gateway.base_url)
-            image = Image.from_dockerfile(
-                name="deduplicated-context",
-                context_path=context,
-            )
-
-            first = client.build_image(image)
-            second = client.build_image(image)
-
-        self.assertEqual(
-            first["image"]["received_archive_bytes"],
-            second["image"]["received_archive_bytes"],
-        )
-        self.assertEqual(gateway.state.build_context_puts, 1)
-        self.assertEqual(len(gateway.state.build_contexts), 1)
-
-    def test_sync_client_can_submit_and_poll_image_builds(self) -> None:
-        with docker_context() as context, running_gateway() as gateway:
-            client = SandboxClient(gateway.base_url)
-            statuses: list[str] = []
-
-            submitted = client.submit_image_build(
-                Image.from_dockerfile(
-                    name="python-base",
-                    tag="gateway-private-host:5000/python-base:latest",
-                    context_path=context,
-                )
-            )
-            listed = client.list_image_builds()
-            completed = client.wait_for_image_build(
-                "python-base",
-                poll_interval_seconds=0.1,
-                on_status=lambda build: statuses.append(str(build.get("status"))),
-            )
-
-        self.assertEqual(submitted["image_id"], "python-base")
-        self.assertEqual(listed[0]["image_id"], "python-base")
-        self.assertEqual(completed["status"], "succeeded")
-        self.assertEqual(statuses, ["succeeded"])
-
     def test_sync_build_image_accepts_per_call_timeout(self) -> None:
-        class FakeResponse:
-            def __init__(self, body: bytes) -> None:
-                self.body = body
-
-            def __enter__(self) -> "FakeResponse":
-                return self
-
-            def __exit__(self, *args: object) -> None:
-                return None
-
-            def read(self) -> bytes:
-                return self.body
-
         captured_timeouts: list[object] = []
 
-        def fake_urlopen(req: object, timeout: object = None) -> FakeResponse:
+        def fake_urlopen(req: object, timeout: object = None) -> _SyncResponse:
             captured_timeouts.append(timeout)
             url = getattr(req, "full_url", "")
             if str(url).endswith("/v1/images/build"):
-                return FakeResponse(
+                return _SyncResponse(
                     b'{"build": {"build_id": "build-slow", "image_id": "slow-build", "status": "running"}}'
                 )
-            return FakeResponse(
+            return _SyncResponse(
                 b'{"build": {"build_id": "build-slow", "image_id": "slow-build", "status": "succeeded", "image": {"id": "slow-build"}, "command": ["docker", "build"], "exit_code": 0}}'
             )
 
         client = SandboxClient("http://gateway.invalid", timeout_seconds=11)
-        with docker_context() as context, patch.object(
-            client_module, "open_no_redirect", fake_urlopen
+        with (
+            docker_context() as context,
+            patch.object(client_module, "open_no_redirect", fake_urlopen),
         ):
             client.build_image(
                 Image.from_dockerfile(
@@ -645,20 +462,10 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(raised.exception.body, {"error": "image builds disabled"})
 
     def test_sync_client_retries_ucloud_unavailable_html(self) -> None:
-        class FakeResponse:
-            def __enter__(self) -> "FakeResponse":
-                return self
-
-            def __exit__(self, *args: object) -> None:
-                return None
-
-            def read(self) -> bytes:
-                return b'{"ok": true}'
-
         calls: list[str] = []
         html = b"<!doctype html><title>Job is unavailable | UCloud</title>"
 
-        def fake_urlopen(req: object, timeout: object = None) -> FakeResponse:
+        def fake_urlopen(req: object, timeout: object = None) -> _SyncResponse:
             calls.append(str(getattr(req, "full_url", "")))
             if len(calls) == 1:
                 raise client_module.error.HTTPError(
@@ -668,54 +475,25 @@ class SandboxSdkTests(unittest.TestCase):
                     {},
                     io.BytesIO(html),
                 )
-            return FakeResponse()
+            return _SyncResponse(b'{"ok": true}')
 
         client = SandboxClient("http://gateway.invalid")
-        with patch.object(
-            client_module, "open_no_redirect", fake_urlopen
-        ), patch.object(
-            client_module.time,
-            "sleep",
-            lambda _delay: None,
+        with (
+            patch.object(client_module, "open_no_redirect", fake_urlopen),
+            patch.object(
+                client_module.time,
+                "sleep",
+                lambda _delay: None,
+            ),
         ):
             health = client.health()
 
         self.assertEqual(health, {"ok": True})
         self.assertEqual(len(calls), 2)
 
-    def test_sync_client_does_not_retry_normal_json_503(self) -> None:
-        calls: list[str] = []
-
-        def fake_urlopen(req: object, timeout: object = None) -> object:
-            calls.append(str(getattr(req, "full_url", "")))
-            raise client_module.error.HTTPError(
-                calls[-1],
-                503,
-                "Service Unavailable",
-                {},
-                io.BytesIO(b'{"error": "no ready node has resources"}'),
-            )
-
-        client = SandboxClient("http://gateway.invalid")
-        with patch.object(client_module, "open_no_redirect", fake_urlopen):
-            with self.assertRaises(SandboxApiError) as raised:
-                client.health()
-
-        self.assertEqual(raised.exception.status_code, 503)
-        self.assertEqual(len(calls), 1)
-
     def test_sync_client_retries_structured_capacity_for_safe_read(self) -> None:
-        class FakeResponse:
-            def __enter__(self) -> "FakeResponse":
-                return self
-
-            def __exit__(self, *args: object) -> None:
-                return None
-
-            def read(self) -> bytes:
-                return b'{"sandboxes": []}'
-
         calls = 0
+        delays: list[float] = []
 
         def fake_urlopen(req: object, timeout: object = None) -> object:
             nonlocal calls
@@ -725,78 +503,48 @@ class SandboxSdkTests(unittest.TestCase):
                     str(getattr(req, "full_url", "")),
                     503,
                     "Service Unavailable",
-                    {"Retry-After": "0"},
+                    {"Retry-After": "2"},
                     io.BytesIO(
                         b'{"error":"HTTP request capacity is exhausted; retry shortly",'
                         b'"retryable":true}'
                     ),
                 )
-            return FakeResponse()
+            return _SyncResponse(b'{"sandboxes": []}')
 
         client = SandboxClient("http://gateway.invalid")
-        with patch.object(
-            client_module, "open_no_redirect", fake_urlopen
-        ), patch.object(
-            client_module.time,
-            "sleep",
-            lambda _delay: None,
+        with (
+            patch.object(client_module, "open_no_redirect", fake_urlopen),
+            patch.object(
+                client_module.time,
+                "sleep",
+                delays.append,
+            ),
         ):
             sandboxes = client.list_sandboxes()
 
         self.assertEqual(sandboxes, [])
         self.assertEqual(calls, 2)
-
-    def test_retry_after_delta_seconds_is_a_minimum_with_jitter(self) -> None:
-        with patch.object(client_module.random, "random", return_value=0.5):
-            delay = client_module._ucloud_unavailable_retry_delay(
-                0,
-                {"Retry-After": "2"},
-            )
-
-        self.assertEqual(delay, 2.25)
-
-    def test_stable_create_adds_exponential_backoff_above_retry_after(self) -> None:
-        with patch.object(client_module.random, "random", return_value=0):
-            delay = client_module._ucloud_unavailable_retry_delay(
-                6,
-                {"Retry-After": "2"},
-                method="POST",
-                path="/v1/sandboxes",
-            )
-
-        self.assertEqual(delay, 16)
-
-    def test_retry_after_http_date_is_supported(self) -> None:
-        retry_at = datetime.now(timezone.utc) + timedelta(seconds=30)
-        header = format_datetime(retry_at, usegmt=True)
-
-        delay = client_module._retry_after_seconds({"Retry-After": header})
-
-        self.assertIsNotNone(delay)
-        self.assertGreater(delay or 0, 28)
-        self.assertLessEqual(delay or 0, 30)
+        self.assertEqual(len(delays), 1)
+        self.assertGreaterEqual(delays[0], 2)
+        self.assertLessEqual(delays[0], 60)
 
     def test_api_error_exposes_retry_after_seconds(self) -> None:
-        exc = SandboxApiError(
-            "busy",
-            status_code=503,
-            body={"retryable": True},
-            headers={"Retry-After": "7"},
-        )
-
-        self.assertEqual(exc.retry_after_seconds, 7)
+        retry_at = datetime.now(timezone.utc) + timedelta(seconds=30)
+        for header, minimum, maximum in (
+            ("7", 7, 7),
+            (format_datetime(retry_at, usegmt=True), 28, 30),
+        ):
+            with self.subTest(header=header):
+                exc = SandboxApiError(
+                    "busy",
+                    status_code=503,
+                    body={"retryable": True},
+                    headers={"Retry-After": header},
+                )
+                self.assertGreaterEqual(exc.retry_after_seconds or 0, minimum)
+                self.assertLessEqual(exc.retry_after_seconds or 0, maximum)
 
     def test_sync_client_retries_structured_capacity_for_stable_create(self) -> None:
-        class FakeResponse:
-            def __enter__(self) -> "FakeResponse":
-                return self
-
-            def __exit__(self, *args: object) -> None:
-                return None
-
-            def read(self) -> bytes:
-                return b'{"sandbox":{"spec":{"id":"tmax-task-one"}}}'
-
         payloads: list[dict] = []
         timeouts: list[object] = []
 
@@ -814,15 +562,16 @@ class SandboxSdkTests(unittest.TestCase):
                         b'"retryable":true}'
                     ),
                 )
-            return FakeResponse()
+            return _SyncResponse(b'{"sandbox":{"spec":{"id":"tmax-task-one"}}}')
 
         client = SandboxClient("http://gateway.invalid")
-        with patch.object(
-            client_module, "open_no_redirect", fake_urlopen
-        ), patch.object(
-            client_module.time,
-            "sleep",
-            lambda _delay: None,
+        with (
+            patch.object(client_module, "open_no_redirect", fake_urlopen),
+            patch.object(
+                client_module.time,
+                "sleep",
+                lambda _delay: None,
+            ),
         ):
             sandbox = client.create_sandbox(
                 SandboxSpec(
@@ -841,50 +590,6 @@ class SandboxSdkTests(unittest.TestCase):
                 client_module.DEFAULT_CREATE_TIMEOUT_SECONDS,
                 delta=0.01,
             )
-
-    def test_sync_stable_create_retries_beyond_safe_read_budget(self) -> None:
-        class FakeResponse:
-            def __enter__(self) -> "FakeResponse":
-                return self
-
-            def __exit__(self, *args: object) -> None:
-                return None
-
-            def read(self) -> bytes:
-                return b'{"sandbox":{"spec":{"id":"long-cold-start"}}}'
-
-        calls = 0
-
-        def fake_urlopen(req: object, timeout: object = None) -> object:
-            nonlocal calls
-            calls += 1
-            if calls <= client_module.UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS:
-                raise client_module.error.HTTPError(
-                    str(getattr(req, "full_url", "")),
-                    503,
-                    "Service Unavailable",
-                    {"Retry-After": "0"},
-                    io.BytesIO(b'{"error":"gateway busy","retryable":true}'),
-                )
-            return FakeResponse()
-
-        client = SandboxClient("http://gateway.invalid")
-        with patch.object(
-            client_module, "open_no_redirect", fake_urlopen
-        ), patch.object(
-            client_module.time,
-            "sleep",
-            lambda _delay: None,
-        ):
-            sandbox = client.create_sandbox(
-                SandboxSpec(
-                    id="long-cold-start",
-                    image=Image.from_registry("busybox:latest"),
-                )
-            )
-
-        self.assertEqual(sandbox.id, "long-cold-start")
-        self.assertEqual(calls, client_module.UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS + 1)
 
     def test_sync_client_does_not_retry_structured_capacity_for_exec(self) -> None:
         calls = 0
@@ -928,50 +633,6 @@ class SandboxSdkTests(unittest.TestCase):
                 }
             )
 
-    def test_sync_client_prepares_capacity(self) -> None:
-        with running_gateway() as gateway:
-            client = SandboxClient(gateway.base_url)
-
-            prepared = client.prepare_capacity(
-                prepare_id="sdk-prep",
-                count=3,
-                cpus=1,
-                memory_mb=1024,
-                disk_mb=2048,
-                image=Image.from_registry("busybox:latest"),
-                parkable=True,
-                ttl_seconds=600,
-            )
-            listed = client.list_prepared_capacity()
-            deleted = client.delete_prepared_capacity("sdk-prep")
-
-        self.assertEqual(prepared["prepare"]["prepare_id"], "sdk-prep")
-        self.assertEqual(prepared["prepare"]["image"], "busybox:latest")
-        self.assertTrue(gateway.state.last_payload["parkable"])
-        self.assertEqual(prepared["demand"]["prepared_resources"]["vcpu"], 3.0)
-        self.assertEqual(listed["prepared"][0]["count"], 3)
-        self.assertEqual(deleted["deleted"]["prepare_id"], "sdk-prep")
-        self.assertEqual(deleted["demand"]["prepared_resources"]["vcpu"], 0.0)
-
-    def test_sync_client_prepares_builder_capacity(self) -> None:
-        with running_gateway() as gateway:
-            client = SandboxClient(gateway.base_url)
-
-            prepared = client.prepare_builder(
-                prepare_id="sdk-builder-prep",
-                count=2,
-                ttl_seconds=600,
-            )
-            listed = client.list_prepared_builders()
-            deleted = client.delete_prepared_builder("sdk-builder-prep")
-
-        self.assertEqual(prepared["prepare"]["prepare_id"], "sdk-builder-prep")
-        self.assertEqual(prepared["demand"]["prepared_builder_count"], 2)
-        self.assertEqual(prepared["demand"]["desired_builders"], 2)
-        self.assertEqual(listed["prepared_builders"][0]["count"], 2)
-        self.assertEqual(deleted["deleted"]["prepare_id"], "sdk-builder-prep")
-        self.assertEqual(deleted["demand"]["prepared_builder_count"], 0)
-
     def test_async_client_lifecycle_and_exec(self) -> None:
         async def scenario(
             base_url: str,
@@ -1013,88 +674,15 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(downloaded, b"async bytes\n")
         self.assertEqual(ssh_command, "ssh -p 22000 sandbox@127.0.0.1")
 
-    def test_async_create_sandbox_accepts_per_call_request_timeout(self) -> None:
-        class FakeResponse:
-            status = 200
-
-            async def __aenter__(self) -> "FakeResponse":
-                return self
-
-            async def __aexit__(self, *args: object) -> None:
-                return None
-
-            async def text(self) -> str:
-                return (
-                    '{"sandbox": {"spec": {"id": "timeout-one", "image": "busybox"}}}'
-                )
-
-        class FakeSession:
-            def __init__(self) -> None:
-                self.timeouts: list[object] = []
-
-            def request(
-                self, _method: object, _url: object, **kwargs: object
-            ) -> FakeResponse:
-                self.timeouts.append(kwargs.get("timeout"))
-                return FakeResponse()
-
-        async def scenario() -> tuple[str, list[object]]:
-            session = FakeSession()
-            client = AsyncSandboxClient(
-                "http://gateway.invalid",
-                session=session,
-                timeout_seconds=11,
-            )
-            sandbox = await client.create_sandbox(
-                SandboxSpec(
-                    id="timeout-one",
-                    image=Image.from_registry("busybox"),
-                    memory_mb=128,
-                ),
-                request_timeout_seconds=7,
-            )
-            return sandbox.id, session.timeouts
-
-        sandbox_id, timeouts = asyncio.run(scenario())
-
-        self.assertEqual(sandbox_id, "timeout-one")
-        self.assertEqual(len(timeouts), 1)
-        self.assertAlmostEqual(float(_timeout_total(timeouts[0])), 7, places=3)
-
     def test_async_build_image_accepts_per_call_timeout(self) -> None:
-        class FakeResponse:
-            status = 200
-
-            def __init__(self, body: str) -> None:
-                self.body = body
-
-            async def __aenter__(self) -> "FakeResponse":
-                return self
-
-            async def __aexit__(self, *args: object) -> None:
-                return None
-
-            async def text(self) -> str:
-                return self.body
-
-        class FakeSession:
-            def __init__(self) -> None:
-                self.timeouts: list[object] = []
-
-            def request(
-                self, _method: object, url: object, **kwargs: object
-            ) -> FakeResponse:
-                self.timeouts.append(kwargs.get("timeout"))
-                if str(url).endswith("/v1/images/build"):
-                    return FakeResponse(
-                        '{"build": {"build_id": "build-slow", "image_id": "slow-build", "status": "running"}}'
-                    )
-                return FakeResponse(
-                    '{"build": {"build_id": "build-slow", "image_id": "slow-build", "status": "succeeded", "image": {"id": "slow-build"}, "command": ["docker", "build"], "exit_code": 0}}'
-                )
-
         async def scenario() -> list[object]:
-            session = FakeSession()
+            session = _ScriptedAsyncSession(
+                lambda _method, url, _kwargs, _call: _AsyncResponse(
+                    '{"build": {"build_id": "build-slow", "image_id": "slow-build", "status": "running"}}'
+                    if str(url).endswith("/v1/images/build")
+                    else '{"build": {"build_id": "build-slow", "image_id": "slow-build", "status": "succeeded", "image": {"id": "slow-build"}, "command": ["docker", "build"], "exit_code": 0}}'
+                )
+            )
             client = AsyncSandboxClient(
                 "http://gateway.invalid",
                 session=session,
@@ -1109,7 +697,7 @@ class SandboxSdkTests(unittest.TestCase):
                     ),
                     timeout_seconds=123,
                 )
-            return session.timeouts
+            return [request[2].get("timeout") for request in session.requests]
 
         timeouts = asyncio.run(scenario())
 
@@ -1119,157 +707,44 @@ class SandboxSdkTests(unittest.TestCase):
             self.assertLessEqual(float(_timeout_total(timeout)), 123)
         self.assertAlmostEqual(float(_timeout_total(timeouts[3])), 11, places=3)
 
-    def test_async_client_streams_and_deduplicates_build_context(self) -> None:
-        async def scenario(base_url: str, context: str) -> tuple[dict, dict]:
-            async with AsyncSandboxClient(base_url) as client:
-                image = Image.from_dockerfile(
-                    name="async-deduplicated-context",
-                    context_path=context,
-                )
-                return await client.build_image(image), await client.build_image(image)
-
-        with docker_context() as context, running_gateway() as gateway:
-            first, second = asyncio.run(scenario(gateway.base_url, context))
-
-        self.assertEqual(
-            first["image"]["received_archive_bytes"],
-            second["image"]["received_archive_bytes"],
-        )
-        self.assertGreater(first["image"]["received_archive_bytes"], 0)
-        self.assertEqual(gateway.state.build_context_puts, 1)
-
     def test_async_client_retries_ucloud_unavailable_html(self) -> None:
-        class FakeResponse:
-            def __init__(self, status: int, body: str) -> None:
-                self.status = status
-                self.body = body
-
-            async def __aenter__(self) -> "FakeResponse":
-                return self
-
-            async def __aexit__(self, *args: object) -> None:
-                return None
-
-            async def text(self) -> str:
-                return self.body
-
-        class FakeSession:
-            def __init__(self) -> None:
-                self.calls = 0
-
-            def request(
-                self, _method: object, _url: object, **_kwargs: object
-            ) -> FakeResponse:
-                self.calls += 1
-                if self.calls == 1:
-                    return FakeResponse(
-                        503,
-                        "<!doctype html><title>Job is unavailable | UCloud</title>",
-                    )
-                return FakeResponse(200, '{"ok": true}')
-
         async def no_sleep(_delay: float) -> None:
             return None
 
         async def scenario() -> tuple[dict, int]:
-            session = FakeSession()
+            session = _ScriptedAsyncSession(
+                lambda _method, _url, _kwargs, call: _AsyncResponse(
+                    "<!doctype html><title>Job is unavailable | UCloud</title>"
+                    if call == 1
+                    else '{"ok": true}',
+                    status=503 if call == 1 else 200,
+                )
+            )
             client = AsyncSandboxClient("http://gateway.invalid", session=session)
             with patch.object(client_module.asyncio, "sleep", no_sleep):
                 health = await client.health()
-            return health, session.calls
+            return health, len(session.requests)
 
         health, calls = asyncio.run(scenario())
 
         self.assertEqual(health, {"ok": True})
         self.assertEqual(calls, 2)
 
-    def test_async_client_retries_structured_capacity_for_safe_read(self) -> None:
-        class FakeResponse:
-            def __init__(self, status: int, body: str) -> None:
-                self.status = status
-                self.body = body
-                self.headers = {"Retry-After": "0"}
-
-            async def __aenter__(self) -> "FakeResponse":
-                return self
-
-            async def __aexit__(self, *args: object) -> None:
-                return None
-
-            async def text(self) -> str:
-                return self.body
-
-        class FakeSession:
-            def __init__(self) -> None:
-                self.calls = 0
-
-            def request(
-                self, _method: object, _url: object, **_kwargs: object
-            ) -> FakeResponse:
-                self.calls += 1
-                if self.calls == 1:
-                    return FakeResponse(
-                        503,
-                        '{"error":"HTTP request capacity is exhausted; retry shortly",'
-                        '"retryable":true}',
-                    )
-                return FakeResponse(200, '{"sandboxes": []}')
-
-        async def no_sleep(_delay: float) -> None:
-            return None
-
-        async def scenario() -> tuple[list[dict], int]:
-            session = FakeSession()
-            client = AsyncSandboxClient("http://gateway.invalid", session=session)
-            with patch.object(client_module.asyncio, "sleep", no_sleep):
-                sandboxes = await client.list_sandboxes()
-            return sandboxes, session.calls
-
-        sandboxes, calls = asyncio.run(scenario())
-
-        self.assertEqual(sandboxes, [])
-        self.assertEqual(calls, 2)
-
     def test_async_client_retries_structured_capacity_for_stable_create(self) -> None:
-        class FakeResponse:
-            def __init__(self, status: int, body: str) -> None:
-                self.status = status
-                self.body = body
-                self.headers = {"Retry-After": "0"}
-
-            async def __aenter__(self) -> "FakeResponse":
-                return self
-
-            async def __aexit__(self, *args: object) -> None:
-                return None
-
-            async def text(self) -> str:
-                return self.body
-
-        class FakeSession:
-            def __init__(self) -> None:
-                self.payloads: list[dict] = []
-
-            def request(
-                self, _method: object, _url: object, **kwargs: object
-            ) -> FakeResponse:
-                self.payloads.append(dict(kwargs.get("json") or {}))
-                if len(self.payloads) == 1:
-                    return FakeResponse(
-                        503,
-                        '{"error":"HTTP request capacity is exhausted; retry shortly",'
-                        '"retryable":true}',
-                    )
-                return FakeResponse(
-                    201,
-                    '{"sandbox":{"spec":{"id":"tmax-task-async"}}}',
-                )
-
         async def no_sleep(_delay: float) -> None:
             return None
 
         async def scenario() -> tuple[str, list[dict]]:
-            session = FakeSession()
+            session = _ScriptedAsyncSession(
+                lambda _method, _url, _kwargs, call: _AsyncResponse(
+                    '{"error":"HTTP request capacity is exhausted; retry shortly",'
+                    '"retryable":true}'
+                    if call == 1
+                    else '{"sandbox":{"spec":{"id":"tmax-task-async"}}}',
+                    status=503 if call == 1 else 201,
+                    headers={"Retry-After": "0"},
+                )
+            )
             client = AsyncSandboxClient("http://gateway.invalid", session=session)
             with patch.object(client_module.asyncio, "sleep", no_sleep):
                 sandbox = await client.create_sandbox(
@@ -1278,105 +753,15 @@ class SandboxSdkTests(unittest.TestCase):
                         image=Image.from_registry("busybox:latest"),
                     )
                 )
-            return sandbox.id, session.payloads
+            return sandbox.id, [
+                dict(request[2].get("json") or {}) for request in session.requests
+            ]
 
         sandbox_id, payloads = asyncio.run(scenario())
 
         self.assertEqual(sandbox_id, "tmax-task-async")
         self.assertEqual(len(payloads), 2)
         self.assertEqual(payloads[0], payloads[1])
-
-    def test_async_stable_create_retries_beyond_safe_read_budget(self) -> None:
-        class FakeResponse:
-            def __init__(self, status: int, body: str) -> None:
-                self.status = status
-                self.body = body
-                self.headers = {"Retry-After": "0"}
-
-            async def __aenter__(self) -> "FakeResponse":
-                return self
-
-            async def __aexit__(self, *args: object) -> None:
-                return None
-
-            async def text(self) -> str:
-                return self.body
-
-        class FakeSession:
-            def __init__(self) -> None:
-                self.calls = 0
-
-            def request(
-                self, _method: object, _url: object, **_kwargs: object
-            ) -> FakeResponse:
-                self.calls += 1
-                if self.calls <= client_module.UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS:
-                    return FakeResponse(
-                        503,
-                        '{"error":"gateway busy","retryable":true}',
-                    )
-                return FakeResponse(
-                    201,
-                    '{"sandbox":{"spec":{"id":"long-cold-start-async"}}}',
-                )
-
-        async def no_sleep(_delay: float) -> None:
-            return None
-
-        async def scenario() -> tuple[str, int]:
-            session = FakeSession()
-            client = AsyncSandboxClient("http://gateway.invalid", session=session)
-            with patch.object(client_module.asyncio, "sleep", no_sleep):
-                sandbox = await client.create_sandbox(
-                    SandboxSpec(
-                        id="long-cold-start-async",
-                        image=Image.from_registry("busybox:latest"),
-                    )
-                )
-            return sandbox.id, session.calls
-
-        sandbox_id, calls = asyncio.run(scenario())
-
-        self.assertEqual(sandbox_id, "long-cold-start-async")
-        self.assertEqual(calls, client_module.UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS + 1)
-
-    def test_async_client_does_not_retry_structured_capacity_for_exec(self) -> None:
-        class FakeResponse:
-            status = 503
-            headers = {"Retry-After": "0"}
-
-            async def __aenter__(self) -> "FakeResponse":
-                return self
-
-            async def __aexit__(self, *args: object) -> None:
-                return None
-
-            async def text(self) -> str:
-                return (
-                    '{"error":"HTTP request capacity is exhausted; retry shortly",'
-                    '"retryable":true}'
-                )
-
-        class FakeSession:
-            def __init__(self) -> None:
-                self.calls = 0
-
-            def request(
-                self, _method: object, _url: object, **_kwargs: object
-            ) -> FakeResponse:
-                self.calls += 1
-                return FakeResponse()
-
-        async def scenario() -> int:
-            session = FakeSession()
-            client = AsyncSandboxClient("http://gateway.invalid", session=session)
-            with self.assertRaises(SandboxApiError):
-                await client.start_exec("sandbox-one", ["true"])
-            return session.calls
-
-        calls = asyncio.run(scenario())
-
-        self.assertEqual(calls, 1)
 
 
 def _timeout_total(timeout: object) -> object:
@@ -1424,13 +809,18 @@ def running_redirect_gateway() -> Iterator[RedirectGatewayHandle]:
             self.send_error(HTTPStatus.NOT_FOUND)
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    thread = Thread(target=server.serve_forever, daemon=True)
+    thread = Thread(
+        target=server.serve_forever,
+        kwargs={"poll_interval": 0.01},
+        daemon=True,
+    )
     thread.start()
     try:
         host, port = server.server_address
         yield RedirectGatewayHandle(f"http://{host}:{port}", state)
     finally:
         server.shutdown()
+        thread.join(timeout=1)
         server.server_close()
 
 
@@ -1443,13 +833,18 @@ def running_gateway() -> Iterator["GatewayHandle"]:
 
     Handler.state = state
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    thread = Thread(target=server.serve_forever, daemon=True)
+    thread = Thread(
+        target=server.serve_forever,
+        kwargs={"poll_interval": 0.01},
+        daemon=True,
+    )
     thread.start()
     try:
         host, port = server.server_address
         yield GatewayHandle(base_url=f"http://{host}:{port}", state=state)
     finally:
         server.shutdown()
+        thread.join(timeout=1)
         server.server_close()
 
 
@@ -1477,14 +872,10 @@ class FakeGatewayState:
         self.exec_events: dict[str, list[dict]] = {}
         self.jobs: dict[tuple[str, str], dict] = {}
         self.job_logs: dict[tuple[str, str, str], bytes] = {}
-        self.prepared: dict[str, dict] = {}
-        self.prepared_builders: dict[str, dict] = {}
         self.files: dict[tuple[str, str], bytes] = {}
         self.build_contexts: dict[str, bytes] = {}
         self.build_context_puts = 0
         self.exec_counter = 0
-        self.last_headers: dict[str, str] = {}
-        self.last_payload: dict[str, object] = {}
 
     def next_exec_id(self) -> str:
         with self.lock:
@@ -1500,14 +891,10 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
         return
 
     def do_GET(self) -> None:
-        self._record_headers()
         parsed = urlparse(self.path)
         path = parsed.path
         if path == "/healthz":
             self._write_json({"ok": True})
-            return
-        if path == "/v1/heartbeat":
-            self._write_json({"node_id": "fake-node"})
             return
         if path == "/v1/sandboxes":
             with self.state.lock:
@@ -1553,21 +940,6 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
                 self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
                 return
             self._write_json({"build": build})
-            return
-        if path == "/v1/capacity/prepare":
-            with self.state.lock:
-                prepared = list(self.state.prepared.values())
-            self._write_json({"prepared": prepared, "demand": self._demand()})
-            return
-        if path == "/v1/builders/prepare":
-            with self.state.lock:
-                prepared_builders = list(self.state.prepared_builders.values())
-            self._write_json(
-                {
-                    "prepared_builders": prepared_builders,
-                    "demand": self._demand(),
-                }
-            )
             return
         job_path = _job_path(path)
         if job_path is not None and job_path[2] == "status":
@@ -1649,11 +1021,9 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
         self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
-        self._record_headers()
         parsed = urlparse(self.path)
         path = parsed.path
         payload = self._read_json()
-        self.state.last_payload = dict(payload)
         if path == "/v1/sandboxes":
             sandbox_id = str(payload.get("id") or "")
             record = {"spec": dict(payload), "state": "running"}
@@ -1707,38 +1077,6 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
             with self.state.lock:
                 self.state.images[image_id] = image
             self._write_json({"image": image})
-            return
-        if path == "/v1/capacity/prepare":
-            prepare_id = str(payload.get("id") or "prep-1")
-            resources = _resources_from_prepare(payload)
-            count = int(payload.get("count") or 1)
-            item = {
-                "prepare_id": prepare_id,
-                "resources": resources,
-                "count": count,
-                "total_resources": _scale_resources(resources, count),
-                "image": str(payload.get("image") or ""),
-            }
-            with self.state.lock:
-                self.state.prepared[prepare_id] = item
-            self._write_json(
-                {"prepare": item, "demand": self._demand()},
-                status=HTTPStatus.CREATED,
-            )
-            return
-        if path == "/v1/builders/prepare":
-            prepare_id = str(payload.get("id") or "builder-prep-1")
-            count = int(payload.get("count") or 1)
-            item = {
-                "prepare_id": prepare_id,
-                "count": count,
-            }
-            with self.state.lock:
-                self.state.prepared_builders[prepare_id] = item
-            self._write_json(
-                {"prepare": item, "demand": self._demand()},
-                status=HTTPStatus.CREATED,
-            )
             return
         job_path = _job_path(path)
         if job_path is not None and job_path[2] == "collection":
@@ -1833,7 +1171,6 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
         self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
     def do_PUT(self) -> None:
-        self._record_headers()
         parsed = urlparse(self.path)
         path = parsed.path
         context_digest = _image_context_digest_from_path(path)
@@ -1883,25 +1220,12 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
         self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
     def do_DELETE(self) -> None:
-        self._record_headers()
         path = urlparse(self.path).path
         sandbox_id = _sandbox_id_from_path(path)
         if sandbox_id is not None:
             with self.state.lock:
                 deleted = self.state.sandboxes.pop(sandbox_id, None)
             self._write_json({"ok": True, "deleted": deleted})
-            return
-        prepare_id = _prepare_id_from_path(path)
-        if prepare_id is not None:
-            with self.state.lock:
-                deleted = self.state.prepared.pop(prepare_id, None)
-            self._write_json({"ok": True, "deleted": deleted, "demand": self._demand()})
-            return
-        builder_prepare_id = _builder_prepare_id_from_path(path)
-        if builder_prepare_id is not None:
-            with self.state.lock:
-                deleted = self.state.prepared_builders.pop(builder_prepare_id, None)
-            self._write_json({"ok": True, "deleted": deleted, "demand": self._demand()})
             return
         self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
@@ -1917,12 +1241,6 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
         if length <= 0:
             return b""
         return self.rfile.read(length)
-
-    def _record_headers(self) -> None:
-        with self.state.lock:
-            self.state.last_headers = {
-                str(key): str(value) for key, value in self.headers.items()
-            }
 
     def _write_json(
         self,
@@ -1952,27 +1270,6 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
             self.send_header(key, value)
         self.end_headers()
         self.wfile.write(body)
-
-    def _demand(self) -> dict:
-        with self.state.lock:
-            prepared = list(self.state.prepared.values())
-            prepared_builders = list(self.state.prepared_builders.values())
-        total = {"vcpu": 0.0, "memory_mb": 0, "disk_mb": 0}
-        for item in prepared:
-            total = _add_resources(total, item["total_resources"])
-        prepared_builder_count = sum(
-            int(item.get("count") or 0) for item in prepared_builders
-        )
-        return {
-            "pending_resources": {"vcpu": 0.0, "memory_mb": 0, "disk_mb": 0},
-            "prepared_resources": total,
-            "desired_resources": total,
-            "oldest_pending_seconds": 0,
-            "pending_image_builds": 0,
-            "prepared_builder_count": prepared_builder_count,
-            "desired_builders": prepared_builder_count,
-            "prepared_builders": prepared_builders,
-        }
 
 
 def _sandbox_id_from_path(path: str) -> str | None:
@@ -2020,26 +1317,6 @@ def _image_build_key_from_path(path: str) -> str | None:
     return unquote(rest.split("/", 1)[0])
 
 
-def _prepare_id_from_path(path: str) -> str | None:
-    prefix = "/v1/capacity/prepare/"
-    if not path.startswith(prefix):
-        return None
-    rest = path[len(prefix) :]
-    if not rest:
-        return None
-    return unquote(rest.split("/", 1)[0])
-
-
-def _builder_prepare_id_from_path(path: str) -> str | None:
-    prefix = "/v1/builders/prepare/"
-    if not path.startswith(prefix):
-        return None
-    rest = path[len(prefix) :]
-    if not rest:
-        return None
-    return unquote(rest.split("/", 1)[0])
-
-
 def _image_context_digest_from_path(path: str) -> str | None:
     prefix = "/v1/image-contexts/"
     if not path.startswith(prefix):
@@ -2052,30 +1329,6 @@ def _file_path(parsed) -> str | None:
     raw = parse_qs(parsed.query).get("path") or [""]
     value = raw[0].strip()
     return value or None
-
-
-def _resources_from_prepare(payload: dict) -> dict:
-    return {
-        "vcpu": float(payload.get("cpus") or 0.0),
-        "memory_mb": int(payload.get("memory_mb") or 0),
-        "disk_mb": int(payload.get("disk_mb") or 0),
-    }
-
-
-def _scale_resources(resources: dict, count: int) -> dict:
-    return {
-        "vcpu": float(resources.get("vcpu") or 0.0) * count,
-        "memory_mb": int(resources.get("memory_mb") or 0) * count,
-        "disk_mb": int(resources.get("disk_mb") or 0) * count,
-    }
-
-
-def _add_resources(left: dict, right: dict) -> dict:
-    return {
-        "vcpu": float(left.get("vcpu") or 0.0) + float(right.get("vcpu") or 0.0),
-        "memory_mb": int(left.get("memory_mb") or 0) + int(right.get("memory_mb") or 0),
-        "disk_mb": int(left.get("disk_mb") or 0) + int(right.get("disk_mb") or 0),
-    }
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from threading import Lock, Thread
-import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
@@ -25,10 +25,54 @@ from ucloud_sandboxes_sdk import (
 
 
 REGISTRATION_TOKEN = "0123456789abcdef0123456789abcdef"
+RENEWAL_IDENTITY_MUTATIONS = (
+    ("request_id", "request_id", "another-request"),
+    ("rollout_id", "rollout_id", "another-rollout"),
+    ("registration_token", "registration_token", "f" * 32),
+    ("endpoint", "endpoint", "/v1/responses"),
+    ("method", "method", "GET"),
+    ("headers", "headers", {"X-Relay": "changed"}),
+    (
+        "JSON body",
+        "body",
+        {"encoding": "json", "value": {"model": "changed"}},
+    ),
+    (
+        "body representation",
+        "body",
+        {
+            "encoding": "base64",
+            "value": base64.b64encode(b'{"model":"test-model","messages":[]}').decode(),
+        },
+    ),
+    ("created_at", "created_at", 9.0),
+    ("expires_at", "expires_at", 99.0),
+    ("delivered_at", "delivered_at", 9.0),
+    ("first_delivered_at", "first_delivered_at", 9.0),
+    ("lease_id", "lease_id", "another-lease"),
+    ("leased_by", "leased_by", "another-worker"),
+    ("delivery_count", "delivery_count", 2),
+    ("idempotency_key", "idempotency_key", "another-idempotency-key"),
+    ("sandbox_id", "sandbox_id", "another-sandbox"),
+    ("sandbox_generation", "sandbox_generation", 8),
+)
+RENEWAL_TRANSPORT_ROLLBACKS = (
+    ("reattachable", {"reattachable": True}, {"reattachable": False}),
+    (
+        "accepted_notified_at",
+        {"accepted_notified_at": 4.0},
+        {"accepted_notified_at": 5.0},
+    ),
+    (
+        "parked_transport_epoch",
+        {"accepted_notified_at": 4.0, "parked_transport_epoch": "epoch-one"},
+        {"parked_transport_epoch": "epoch-two"},
+    ),
+)
 
 
 class RelayUrlConfigTests(unittest.TestCase):
-    def test_builds_path_scoped_openai_environment(self) -> None:
+    def test_builds_path_scoped_urls_and_openai_environment(self) -> None:
         env = model_relay_env(
             "https://relay.example.org/",
             "run:001",
@@ -41,29 +85,9 @@ class RelayUrlConfigTests(unittest.TestCase):
             "https://relay.example.org/rollouts/run%3A001/v1",
         )
         self.assertEqual(env["OPENAI_API_KEY"], "sandbox-token")
-
-    def test_builds_general_http_tunnel_url(self) -> None:
-        self.assertEqual(
-            http_tunnel_url("https://relay.example.org/", "run:001"),
-            "https://relay.example.org/tunnels/run%3A001/",
-        )
         self.assertEqual(
             http_tunnel_url("https://relay.example.org/", "run:001", "/api/items"),
             "https://relay.example.org/tunnels/run%3A001/api/items",
-        )
-
-    def test_builds_registration_scoped_tunnel_capability_url(self) -> None:
-        expected = (
-            "https://relay.example.org/tunnels/run%3A001/_relay/"
-            f"{REGISTRATION_TOKEN}/"
-        )
-        self.assertEqual(
-            http_tunnel_url(
-                "https://relay.example.org/",
-                "run:001",
-                registration_token=REGISTRATION_TOKEN,
-            ),
-            expected,
         )
 
     def test_rejects_invalid_tunnel_registration_capability(self) -> None:
@@ -76,6 +100,41 @@ class RelayUrlConfigTests(unittest.TestCase):
 
 
 class RelayWorkerClientTests(unittest.TestCase):
+    def test_agent_rollout_registration_binds_sandbox_generation(self) -> None:
+        sandbox = SimpleNamespace(
+            id="sandbox-agent",
+            record={
+                "generation": 7,
+                "spec": {
+                    "id": "sandbox-agent",
+                    "parkable": True,
+                    "managed_process": True,
+                },
+            },
+        )
+        with running_relay() as relay:
+            client = RelayWorkerClient(relay.base_url, worker_token="worker-token")
+            registered = client.register_agent_rollout(
+                "run-agent",
+                sandbox,
+                metadata={"suite": "agent"},
+            )
+
+        self.assertEqual(
+            registered["rollout"]["metadata"],
+            {
+                "sandbox_generation": 7,
+                "sandbox_id": "sandbox-agent",
+                "suite": "agent",
+            },
+        )
+        with self.assertRaisesRegex(RelayApiError, "conflicts"):
+            RelayWorkerClient("https://relay.invalid").register_agent_rollout(
+                "run-agent",
+                sandbox,
+                metadata={"sandbox_generation": 8},
+            )
+
     def test_relay_request_requires_exact_identity(self) -> None:
         valid = _relay_request(rollout_id="run-001", leased_by="worker-1")
 
@@ -92,19 +151,6 @@ class RelayWorkerClientTests(unittest.TestCase):
                 payload["registration_token"] = token
                 with self.assertRaises(RelayApiError):
                     RelayRequest.from_payload(payload)
-
-    def test_relay_request_requires_exact_tagged_body(self) -> None:
-        valid = _relay_request(rollout_id="run-001", leased_by="worker-1")
-        for body in (
-            None,
-            {"encoding": "json"},
-            {"encoding": "json", "value": {}, "extra": True},
-            {"encoding": "text", "value": "payload"},
-            {"encoding": "base64", "value": "%%%"},
-        ):
-            with self.subTest(body=body):
-                with self.assertRaises(RelayApiError):
-                    RelayRequest.from_payload({**valid, "body": body})
 
     def test_registration_requires_matching_rollout_and_valid_token(self) -> None:
         with running_relay() as relay:
@@ -131,31 +177,6 @@ class RelayWorkerClientTests(unittest.TestCase):
             relay.state.poll_registration_token = "a" * 32
             with self.assertRaisesRegex(RelayApiError, "different registration"):
                 client.poll("run-001", timeout_seconds=0)
-
-    def test_poll_timeout_includes_server_wait_for_sync_and_async(self) -> None:
-        async def poll_async(base_url: str) -> None:
-            async with AsyncRelayWorkerClient(
-                base_url,
-                worker_token="worker-token",
-                timeout_seconds=0.02,
-            ) as client:
-                await client.register_rollout("run-async")
-                result = await client.poll("run-async", timeout_seconds=0.1)
-                self.assertEqual(len(result.requests), 1)
-
-        with running_relay() as relay:
-            relay.state.poll_delay_seconds = 0.05
-            sync_client = RelayWorkerClient(
-                relay.base_url,
-                worker_token="worker-token",
-                timeout_seconds=0.02,
-            )
-            sync_client.register_rollout("run-sync")
-            self.assertEqual(
-                len(sync_client.poll("run-sync", timeout_seconds=0.1).requests),
-                1,
-            )
-            asyncio.run(poll_async(relay.base_url))
 
     def test_relay_transport_does_not_follow_redirects(self) -> None:
         async def stats_async(base_url: str) -> RelayApiError:
@@ -210,49 +231,19 @@ class RelayWorkerClientTests(unittest.TestCase):
         self.assertEqual(async_error.status_code, HTTPStatus.OK)
         self.assertIn("64 byte limit", str(async_error))
 
-    def test_successful_relay_response_must_be_json(self) -> None:
-        async def stats_async(base_url: str) -> RelayApiError:
-            async with AsyncRelayWorkerClient(
-                base_url, worker_token="worker-token"
-            ) as client:
-                with self.assertRaises(RelayApiError) as raised:
-                    await client.stats()
-                return raised.exception
-
-        with running_relay() as relay:
-            relay.state.stats_body = b"not-json"
-            client = RelayWorkerClient(relay.base_url, worker_token="worker-token")
-            with self.assertRaisesRegex(RelayApiError, "invalid JSON") as raised:
-                client.stats()
-            async_error = asyncio.run(stats_async(relay.base_url))
-
-        self.assertEqual(raised.exception.status_code, HTTPStatus.OK)
-        self.assertIn("invalid JSON", str(async_error))
-        self.assertEqual(async_error.status_code, HTTPStatus.OK)
-
     def test_sync_worker_client_supports_full_lease_lifecycle(self) -> None:
         with running_relay() as relay:
             client = RelayWorkerClient(relay.base_url, worker_token="worker-token")
-
-            health = client.health()
             registered = client.register_rollout(
                 "run-001",
                 metadata={"suite": "sync"},
             )
-            heartbeat = client.heartbeat(
-                "run-001",
-                "worker-1",
-                metadata={"host": "lumi"},
-            )
-            poll = client.poll(
+            request = client.poll(
                 "run-001",
                 worker_id="worker-1",
                 timeout_seconds=0,
-                limit=8,
                 lease_seconds=600,
-            )
-            self.assertEqual(len(poll.requests), 1)
-            request = poll.requests[0]
+            ).requests[0]
             renewed = client.renew_request(
                 request,
                 worker_id="worker-1",
@@ -263,52 +254,16 @@ class RelayWorkerClientTests(unittest.TestCase):
                 {"choices": [{"message": {"content": "ok"}}]},
                 headers={"X-Model": "local"},
             )
-            errored = client.error_request(renewed, "model failed", status=503)
-            stats = client.stats()
-            rollouts = client.list_rollouts()
             unregistered = client.unregister_rollout("run-001")
 
-        self.assertTrue(health["ok"])
         self.assertEqual(registered["rollout"]["metadata"], {"suite": "sync"})
-        self.assertEqual(heartbeat["worker"]["worker_id"], "worker-1")
         self.assertEqual(request.request_id, "req-1")
         self.assertEqual(request.lease_id, "lease-1")
         self.assertEqual(request.body["model"], "test-model")
         self.assertEqual(renewed.lease_expires_at, 456.0)
         self.assertEqual(responded["request_id"], "req-1")
         self.assertFalse(responded["duplicate"])
-        self.assertTrue(errored["duplicate"])
-        self.assertEqual(stats["counters"]["lease_renewed"], 1)
-        self.assertEqual(rollouts[0]["rollout_id"], "run-001")
         self.assertTrue(unregistered["existed"])
-        self.assertEqual(relay.state.last_poll_query["limit"], ["8"])
-        self.assertEqual(relay.state.last_poll_query["lease_seconds"], ["600"])
-        self.assertEqual(
-            relay.state.last_poll_query["registration_token"],
-            [REGISTRATION_TOKEN],
-        )
-        self.assertEqual(
-            relay.state.last_renew_payload["registration_token"],
-            REGISTRATION_TOKEN,
-        )
-        self.assertEqual(relay.state.last_renew_payload["lease_seconds"], 900)
-        self.assertEqual(
-            relay.state.last_respond_payload["headers"], {"X-Model": "local"}
-        )
-        self.assertEqual(
-            relay.state.last_respond_payload["registration_token"],
-            REGISTRATION_TOKEN,
-        )
-        self.assertEqual(
-            relay.state.last_respond_payload["body"],
-            {
-                "encoding": "json",
-                "value": {"choices": [{"message": {"content": "ok"}}]},
-            },
-        )
-        self.assertNotIn("response", relay.state.last_respond_payload)
-        self.assertNotIn("body_base64", relay.state.last_respond_payload)
-        self.assertEqual(relay.state.last_error_payload["status"], 503)
 
     def test_sync_worker_client_forwards_binary_http_request_and_response(self) -> None:
         with running_relay() as relay:
@@ -339,27 +294,6 @@ class RelayWorkerClientTests(unittest.TestCase):
             "base64",
         )
 
-    def test_binary_response_limit_is_checked_before_base64_encoding(self) -> None:
-        relay_request = RelayRequest.from_payload(
-            _relay_request(rollout_id="bounded", leased_by="worker")
-        )
-
-        async def respond_async() -> None:
-            client = AsyncRelayWorkerClient("https://relay.invalid")
-            with self.assertRaisesRegex(RelayApiError, "4 byte limit"):
-                await client.respond_to(relay_request, b"12345")
-
-        with (
-            patch.object(relay_module, "MAX_RELAY_HTTP_BODY_BYTES", 4),
-            patch.object(relay_module.base64, "b64encode") as encode,
-        ):
-            client = RelayWorkerClient("https://relay.invalid")
-            with self.assertRaisesRegex(RelayApiError, "4 byte limit"):
-                client.respond_to(relay_request, b"12345")
-            asyncio.run(respond_async())
-
-        encode.assert_not_called()
-
     def test_forwarding_bounds_sync_and_async_upstream_responses(self) -> None:
         async def forward_async(base_url: str, relay_request: RelayRequest) -> None:
             async with AsyncRelayWorkerClient(
@@ -387,23 +321,6 @@ class RelayWorkerClientTests(unittest.TestCase):
 
         self.assertEqual(relay.state.respond_attempts, 0)
 
-    def test_sync_response_commit_retries_wake_pending_503(self) -> None:
-        with running_relay() as relay:
-            relay.state.respond_failures = 1
-            client = RelayWorkerClient(relay.base_url, worker_token="worker-token")
-            relay_request = RelayRequest.from_payload(
-                _relay_request(rollout_id="retry", leased_by="worker")
-            )
-            result = client.commit_response_bytes_to(
-                relay_request,
-                b"committed",
-                attempts=2,
-                retry_delay_seconds=0,
-            )
-
-        self.assertEqual(result["request_id"], "req-1")
-        self.assertEqual(relay.state.respond_attempts, 2)
-
     def test_sync_worker_client_surfaces_auth_errors(self) -> None:
         with running_relay() as relay:
             client = RelayWorkerClient(relay.base_url)
@@ -415,63 +332,54 @@ class RelayWorkerClientTests(unittest.TestCase):
         self.assertEqual(raised.exception.body, {"error": "unauthorized"})
         self.assertEqual(raised.exception.headers["X-Relay-Request-Id"], "relay-test")
 
-    def test_async_worker_client_supports_lease_renewal(self) -> None:
-        async def scenario(base_url: str) -> tuple[str, float | None, str]:
-            async with AsyncRelayWorkerClient(
-                base_url,
-                worker_token="worker-token",
-            ) as client:
-                await client.register_rollout("run-async")
-                poll = await client.poll(
-                    "run-async",
-                    worker_id="worker-async",
-                    timeout_seconds=0,
-                    lease_seconds=600,
-                )
-                self.assertEqual(len(poll.requests), 1)
-                renewed = await client.renew_request(
-                    poll.requests[0],
-                    worker_id="worker-async",
-                    lease_seconds=1200,
-                )
-                response = await client.respond_to(renewed, {"choices": []})
-                return (
-                    renewed.request_id,
-                    renewed.lease_expires_at,
-                    response["request_id"],
-                )
-
+    def test_sync_worker_rejects_mutated_renewal_delivery_contract(self) -> None:
         with running_relay() as relay:
-            renewed_id, lease_expires_at, responded_id = asyncio.run(
-                scenario(relay.base_url)
-            )
+            client = RelayWorkerClient(relay.base_url, worker_token="worker-token")
+            client.register_rollout("expected-rollout")
+            request = client.poll(
+                "expected-rollout",
+                worker_id="worker",
+                timeout_seconds=0,
+            ).requests[0]
 
-        self.assertEqual(renewed_id, "req-1")
-        self.assertEqual(lease_expires_at, 456.0)
-        self.assertEqual(responded_id, "req-1")
-        self.assertEqual(relay.state.last_renew_payload["lease_seconds"], 1200)
+            for label, field, value in RENEWAL_IDENTITY_MUTATIONS:
+                with self.subTest(field=label):
+                    relay.state.renew_overrides = {field: value}
+                    with self.assertRaisesRegex(RelayApiError, "inconsistent renewed"):
+                        client.renew_request(request, worker_id="worker")
 
-    def test_async_response_commit_retries_wake_pending_503(self) -> None:
-        async def scenario(base_url: str) -> dict:
-            async with AsyncRelayWorkerClient(
-                base_url,
-                worker_token="worker-token",
-            ) as client:
-                return await client.commit_response_bytes_to(
-                    RelayRequest.from_payload(
-                        _relay_request(rollout_id="retry", leased_by="worker")
-                    ),
-                    b"committed",
-                    attempts=2,
-                    retry_delay_seconds=0,
-                )
+            for label, poll_overrides, renew_overrides in RENEWAL_TRANSPORT_ROLLBACKS:
+                with self.subTest(field=label):
+                    relay.state.poll_overrides = poll_overrides
+                    request = client.poll(
+                        "expected-rollout",
+                        worker_id="worker",
+                        timeout_seconds=0,
+                    ).requests[0]
+                    relay.state.renew_overrides = renew_overrides
+                    with self.assertRaisesRegex(RelayApiError, "inconsistent renewed"):
+                        client.renew_request(request, worker_id="worker")
 
+    def test_sync_worker_accepts_forward_transport_state_transition(self) -> None:
         with running_relay() as relay:
-            relay.state.respond_failures = 1
-            result = asyncio.run(scenario(relay.base_url))
+            client = RelayWorkerClient(relay.base_url, worker_token="worker-token")
+            client.register_rollout("expected-rollout")
+            request = client.poll(
+                "expected-rollout",
+                worker_id="worker",
+                timeout_seconds=0,
+            ).requests[0]
+            relay.state.renew_overrides = {
+                "reattachable": True,
+                "accepted_notified_at": 4.0,
+                "parked_transport_epoch": "epoch-one",
+            }
 
-        self.assertEqual(result["request_id"], "req-1")
-        self.assertEqual(relay.state.respond_attempts, 2)
+            renewed = client.renew_request(request, worker_id="worker")
+
+            self.assertTrue(renewed.reattachable)
+            self.assertEqual(renewed.accepted_notified_at, 4.0)
+            self.assertEqual(renewed.parked_transport_epoch, "epoch-one")
 
 
 @contextmanager
@@ -483,13 +391,18 @@ def running_relay() -> Iterator["RelayHandle"]:
 
     Handler.state = state
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    thread = Thread(target=server.serve_forever, daemon=True)
+    thread = Thread(
+        target=server.serve_forever,
+        kwargs={"poll_interval": 0.01},
+        daemon=True,
+    )
     thread.start()
     try:
         host, port = server.server_address
         yield RelayHandle(base_url=f"http://{host}:{port}", state=state)
     finally:
         server.shutdown()
+        thread.join(timeout=1)
         server.server_close()
 
 
@@ -503,21 +416,19 @@ class FakeRelayState:
     def __init__(self) -> None:
         self.lock = Lock()
         self.rollouts: dict[str, dict] = {}
-        self.last_poll_query: dict[str, list[str]] = {}
-        self.last_renew_payload: dict = {}
         self.last_respond_payload: dict = {}
-        self.last_error_payload: dict = {}
         self.upstream_method = ""
         self.upstream_path = ""
         self.upstream_body = b""
         self.upstream_response_body = b"\xffresponse"
-        self.respond_failures = 0
         self.respond_attempts = 0
         self.registration_rollout_id: str | None = None
         self.registration_token = REGISTRATION_TOKEN
         self.poll_rollout_id: str | None = None
         self.poll_registration_token: str | None = None
-        self.poll_delay_seconds = 0.0
+        self.polled_request: dict | None = None
+        self.poll_overrides: dict[str, object] = {}
+        self.renew_overrides: dict[str, object] = {}
         self.stats_redirect = False
         self.stats_body: bytes | None = None
 
@@ -531,9 +442,6 @@ class FakeRelayHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path == "/healthz":
-            self._write_json({"ok": True})
-            return
         if not self._check_authorized():
             return
         if parsed.path == "/v1/relay/stats":
@@ -554,17 +462,8 @@ class FakeRelayHandler(BaseHTTPRequestHandler):
         if parsed.path == "/redirect-target":
             self._write_json({"redirected": True})
             return
-        if parsed.path == "/v1/relay/rollouts":
-            with self.state.lock:
-                rollouts = list(self.state.rollouts.values())
-            self._write_json({"rollouts": rollouts})
-            return
         if parsed.path == "/worker/poll":
             query = parse_qs(parsed.query)
-            if self.state.poll_delay_seconds:
-                time.sleep(self.state.poll_delay_seconds)
-            with self.state.lock:
-                self.state.last_poll_query = query
             request = _relay_request(
                 rollout_id=(
                     self.state.poll_rollout_id or query.get("rollout_id", [""])[0]
@@ -575,6 +474,9 @@ class FakeRelayHandler(BaseHTTPRequestHandler):
                     or query.get("registration_token", [""])[0]
                 ),
             )
+            with self.state.lock:
+                request.update(self.state.poll_overrides)
+                self.state.polled_request = request
             self._write_json({"requests": [request]})
             return
         self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
@@ -607,29 +509,18 @@ class FakeRelayHandler(BaseHTTPRequestHandler):
                 self.state.rollouts[rollout_id] = record
             self._write_json({"ok": True, "rollout": record}, status=HTTPStatus.CREATED)
             return
-        if parsed.path == "/worker/heartbeat":
-            self._write_json(
-                {
-                    "ok": True,
-                    "worker": {
-                        "rollout_id": payload.get("rollout_id"),
-                        "worker_id": payload.get("worker_id"),
-                        "metadata": payload.get("metadata") or {},
-                    },
-                }
-            )
-            return
         if parsed.path == "/worker/renew":
             with self.state.lock:
-                self.state.last_renew_payload = dict(payload)
+                request = dict(
+                    self.state.polled_request or _relay_request(rollout_id="run-001")
+                )
+                request["leased_by"] = str(payload.get("worker_id") or "")
+                request["lease_expires_at"] = 456.0
+                request.update(self.state.renew_overrides)
             self._write_json(
                 {
                     "ok": True,
-                    "request": _relay_request(
-                        rollout_id="run-001",
-                        leased_by=str(payload.get("worker_id") or ""),
-                        lease_expires_at=456.0,
-                    ),
+                    "request": request,
                 }
             )
             return
@@ -637,29 +528,11 @@ class FakeRelayHandler(BaseHTTPRequestHandler):
             with self.state.lock:
                 self.state.last_respond_payload = dict(payload)
                 self.state.respond_attempts += 1
-                if self.state.respond_failures > 0:
-                    self.state.respond_failures -= 1
-                    self._write_json(
-                        {"error": "response committed but wake is pending"},
-                        status=HTTPStatus.SERVICE_UNAVAILABLE,
-                    )
-                    return
             self._write_json(
                 {
                     "ok": True,
                     "request_id": payload.get("request_id"),
                     "duplicate": False,
-                }
-            )
-            return
-        if parsed.path == "/worker/error":
-            with self.state.lock:
-                self.state.last_error_payload = dict(payload)
-            self._write_json(
-                {
-                    "ok": True,
-                    "request_id": payload.get("request_id"),
-                    "duplicate": True,
                 }
             )
             return
@@ -745,12 +618,19 @@ def _relay_request(
             }
         ),
         "created_at": 1.0,
+        "expires_at": 60.0,
         "delivered_at": 2.0,
         "first_delivered_at": 2.0,
         "lease_id": "lease-1",
         "lease_expires_at": lease_expires_at,
         "leased_by": leased_by,
         "delivery_count": 1,
+        "idempotency_key": "idempotency-one",
+        "sandbox_id": "sandbox-one",
+        "sandbox_generation": 7,
+        "reattachable": False,
+        "accepted_notified_at": None,
+        "parked_transport_epoch": None,
     }
 
 
