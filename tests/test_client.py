@@ -267,17 +267,6 @@ class SandboxSdkTests(unittest.TestCase):
                 cpus=1,
                 memory_mb=512,
             )
-            sandbox = client.create_sandbox(
-                SandboxSpec(
-                    id="snapshot-src",
-                    image=Image.from_registry("busybox"),
-                    memory_mb=128,
-                )
-            )
-            snapshot = sandbox.snapshot(
-                Image.from_registry("local/snapshot-src:latest"),
-                image_id="snap-one",
-            )
             images = client.list_images()
             builds = client.list_image_builds()
 
@@ -290,10 +279,9 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(len(gateway.state.build_contexts), 1)
         self.assertEqual(builds[0]["status"], "succeeded")
         self.assertEqual(pulled["image"]["id"], "busybox")
-        self.assertEqual(snapshot["image"]["id"], "snap-one")
         self.assertCountEqual(
             [image["id"] for image in images],
-            ["busybox", "python-base", "snap-one"],
+            ["busybox", "python-base"],
         )
 
     def test_sandbox_spec_nested_types_and_optional_fields(self) -> None:
@@ -1222,13 +1210,6 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
                 self.state.exec_sessions[exec_id] = session
                 self.state.exec_events[exec_id] = events
             self._write_json({"session": session}, status=HTTPStatus.CREATED)
-            return
-        if sandbox_id is not None and path.endswith("/snapshot"):
-            image_id = str(payload.get("id") or payload.get("image"))
-            image = {"id": image_id, "tag": str(payload.get("image") or "")}
-            with self.state.lock:
-                self.state.images[image_id] = image
-            self._write_json({"image": image})
             return
         exec_id = _exec_id_from_path(path)
         if exec_id is not None and path.endswith("/stdin"):

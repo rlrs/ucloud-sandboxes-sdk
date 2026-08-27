@@ -22,7 +22,6 @@ with `src/ucloud_sandboxes_sdk/client.py` when endpoints are added.
 - `GET /v1/image-contexts/<sha256-digest>`
 - `PUT /v1/image-contexts/<sha256-digest>`
 - `POST /v1/images/pull`
-- `POST /v1/sandboxes/<sandbox-id>/snapshot`
 - `GET /v1/capacity/prepare`
 - `POST /v1/capacity/prepare`
 - `DELETE /v1/capacity/prepare/<prepare-id>`
@@ -41,6 +40,10 @@ The public key is route-scoped by the gateway. It covers the SDK endpoints in
 this document but not node inventory, metrics, registry state, or explicit
 park, wake, detach, and migration operations. Those use a separate operator
 credential that SDK users must not receive.
+
+The endpoint list above is the public sandbox contract. There is no separate
+snapshot-to-image endpoint: persistent park/wake state belongs to the sandbox
+lifecycle, while image creation belongs to the image build/pull API.
 
 ## Sandbox Resources
 
@@ -129,18 +132,6 @@ builder/control-plane Docker daemon and should not be treated as portable.
   "id": "python-base"
 }
 ```
-
-`POST /v1/sandboxes/<sandbox-id>/snapshot` accepts:
-
-```json
-{
-  "image": "ucloud-sandbox-registry:5000/ucloud/snapshot:latest",
-  "id": "snapshot"
-}
-```
-
-Snapshots that must survive node scale-down should use a registry tag and be
-pushed by the gateway service.
 
 ## Exec Events
 

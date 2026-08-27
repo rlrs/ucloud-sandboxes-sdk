@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.11 - 2026-08-27
+
+- Unified synchronous and asynchronous managed-agent validation behind one
+  shared lifecycle contract used by both sandbox and relay clients.
+- Removed the unsupported public snapshot-publication method, whose server
+  endpoint never existed, so the SDK exposes only end-to-end capabilities.
+- Clarified that the SDK and relay coordinate managed-agent parking while
+  attached exec sessions deliberately remain non-parkable.
+
 ## 0.4.10 - 2026-08-27
 
 - Transparently retry the exact `snapshot_publication_pending` pre-dispatch

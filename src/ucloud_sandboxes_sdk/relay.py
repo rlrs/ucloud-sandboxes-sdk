@@ -17,6 +17,7 @@ from ._http import (
     read_sync_response,
     response_headers,
 )
+from ._agent_contract import require_agent_sandbox_record
 
 
 JsonObject = dict[str, Any]
@@ -813,17 +814,14 @@ def _agent_rollout_metadata(
         raise RelayApiError("agent sandbox handle has no sandbox id")
     if not isinstance(record, Mapping):
         raise RelayApiError("agent sandbox handle has no sandbox record")
-    generation = record.get("generation")
-    if isinstance(generation, bool) or not isinstance(generation, int) or generation <= 0:
-        raise RelayApiError("agent sandbox record has no positive generation")
-    spec = record.get("spec")
-    if not isinstance(spec, Mapping):
-        raise RelayApiError("agent sandbox record has no sandbox spec")
-    if spec.get("parkable") is not True or spec.get("managed_process") is not True:
-        raise RelayApiError(
-            "agent rollout requires a sandbox created with parkable=True and "
-            "managed_process=True"
+    try:
+        generation = require_agent_sandbox_record(
+            record,
+            require_generation=True,
         )
+    except ValueError as exc:
+        raise RelayApiError(str(exc)) from exc
+    assert generation is not None
     result = dict(metadata or {})
     for field, value in (
         ("sandbox_id", sandbox_id),

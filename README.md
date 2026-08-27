@@ -128,6 +128,11 @@ live inside the checkpoint. Attached `start_exec()` sessions remain for tools
 and short commands; they deliberately block parking because gVisor cannot
 reattach their host-side transport after restore.
 
+Managed agents are not parked merely because the node has seen no HTTP request
+for a while. The SDK/relay protocol chooses the safe point after model-request
+acceptance and coordinates that transition with the gateway. This distinction
+is why a primary agent must use `start_agent()` rather than an attached exec.
+
 `AsyncSandboxHandle.start_agent()` provides the same contract with `await`.
 Use the returned job handle to wait, inspect status, or read the bounded stdout
 and stderr ledger after a wake or migration.
@@ -391,15 +396,7 @@ client.pull_image(
     memory_mb=2048,
 )
 
-client.snapshot_sandbox(
-    "example",
-    Image.from_registry("registry.example.org/ucloud/example-snapshot:latest"),
-)
 ```
-
-Snapshots should also target a registry tag if another node will need to run the
-image later. Snapshots that are not pushed are local to their source node and
-are not portable after that node scales down.
 
 ## Async Client
 

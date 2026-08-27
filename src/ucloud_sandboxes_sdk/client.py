@@ -34,6 +34,7 @@ from ._http import (
     read_sync_response,
     response_headers,
 )
+from ._agent_contract import require_agent_sandbox_record
 
 
 JsonObject = dict[str, Any]
@@ -585,22 +586,6 @@ class _DirectSandboxOperations:
         )
         return self._request_json("POST", "/v1/images/pull", payload=payload)
 
-    def snapshot_sandbox(
-        self,
-        sandbox_id: str,
-        image: Image,
-        *,
-        image_id: str | None = None,
-    ) -> JsonObject:
-        payload: JsonObject = {"image": _image_pull_reference(image)}
-        if image_id is not None:
-            payload["id"] = image_id
-        return self._request_json(
-            "POST",
-            f"/v1/sandboxes/{_quote_segment(sandbox_id)}/snapshot",
-            payload=payload,
-        )
-
 
 @dataclass
 class SandboxHandle:
@@ -660,7 +645,7 @@ class SandboxHandle:
         max_stdout_bytes: int | None = None,
         max_stderr_bytes: int | None = None,
     ) -> "JobHandle":
-        _require_agent_sandbox(self.record)
+        require_agent_sandbox_record(self.record)
         return self.client.start_agent(
             self.id,
             command,
@@ -711,9 +696,6 @@ class SandboxHandle:
 
     def download_file(self, container_path: str) -> bytes:
         return self.client.download_file(self.id, container_path)
-
-    def snapshot(self, image: Image, *, image_id: str | None = None) -> JsonObject:
-        return self.client.snapshot_sandbox(self.id, image, image_id=image_id)
 
 
 class _ExecState:
@@ -1354,7 +1336,7 @@ class AsyncSandboxHandle:
         max_stdout_bytes: int | None = None,
         max_stderr_bytes: int | None = None,
     ) -> "AsyncJobHandle":
-        _require_agent_sandbox(self.record)
+        require_agent_sandbox_record(self.record)
         return await self.client.start_agent(
             self.id,
             command,
@@ -1409,11 +1391,6 @@ class AsyncSandboxHandle:
 
     async def download_file(self, container_path: str) -> bytes:
         return await self.client.download_file(self.id, container_path)
-
-    async def snapshot(
-        self, image: Image, *, image_id: str | None = None
-    ) -> JsonObject:
-        return await self.client.snapshot_sandbox(self.id, image, image_id=image_id)
 
 
 @dataclass
@@ -1973,15 +1950,6 @@ class AsyncSandboxClient(_DirectSandboxOperations):
             sandbox_nodes_only=sandbox_nodes_only,
         )
 
-    async def snapshot_sandbox(
-        self,
-        sandbox_id: str,
-        image: Image,
-        *,
-        image_id: str | None = None,
-    ) -> JsonObject:
-        return await super().snapshot_sandbox(sandbox_id, image, image_id=image_id)
-
     async def _client(self) -> Any:
         if self._session is not None:
             return self._session
@@ -2388,17 +2356,6 @@ def _exec_payload(
         "stdin": stdin,
         "tty": tty,
     }
-
-
-def _require_agent_sandbox(record: Mapping[str, Any]) -> None:
-    spec = record.get("spec")
-    if not isinstance(spec, Mapping):
-        return
-    if spec.get("parkable") is not True or spec.get("managed_process") is not True:
-        raise ValueError(
-            "start_agent() requires a sandbox created with parkable=True and "
-            "managed_process=True"
-        )
 
 
 def _job_id(value: str | None) -> str:
