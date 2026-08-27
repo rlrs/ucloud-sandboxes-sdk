@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.10 - 2026-08-27
+
+- Transparently retry the exact `snapshot_publication_pending` pre-dispatch
+  fence for synchronous and asynchronous sandbox operations.
+- Preserve at-most-once behavior for non-idempotent operations by refusing to
+  replay generic structured-capacity or UCloud ingress HTML failures.
+- Document the brief asynchronous publication window for parkable sandboxes
+  and the SDK/backend retry contract.
+
 ## 0.4.9 - 2026-08-27
 
 - Added synchronous and asynchronous `start_agent()` APIs for launching a

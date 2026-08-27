@@ -13,9 +13,9 @@ Install the versioned wheel from the GitHub release (the SDK is not currently
 published on PyPI):
 
 ```bash
-uv add "ucloud-sandboxes-sdk @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.9/ucloud_sandboxes_sdk-0.4.9-py3-none-any.whl"
-uv add "ucloud-sandboxes-sdk[async] @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.9/ucloud_sandboxes_sdk-0.4.9-py3-none-any.whl"
-uv add "ucloud-sandboxes-sdk[inspect] @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.9/ucloud_sandboxes_sdk-0.4.9-py3-none-any.whl"
+uv add "ucloud-sandboxes-sdk @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.10/ucloud_sandboxes_sdk-0.4.10-py3-none-any.whl"
+uv add "ucloud-sandboxes-sdk[async] @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.10/ucloud_sandboxes_sdk-0.4.10-py3-none-any.whl"
+uv add "ucloud-sandboxes-sdk[inspect] @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.10/ucloud_sandboxes_sdk-0.4.10-py3-none-any.whl"
 ```
 
 Use the base package for the synchronous client, the `async` extra for
@@ -92,6 +92,12 @@ release its live runsc backend. Exec and file operations transparently wake it;
 its filesystem and process state remain intact. Parking is opt-in because its
 disk admission includes the complete memory backing required by the sandbox's
 hard limit.
+
+Publication of a parked checkpoint can briefly outlive the park response. If
+an operation reaches the gateway during that exact pre-dispatch window, the
+gateway returns `snapshot_publication_pending`; synchronous and asynchronous
+SDK clients retry that fence automatically. Other non-idempotent exec errors
+are surfaced without replay, so an ambiguous command is never run twice.
 
 For a long-lived agent that must survive relay-driven park/wake and migration,
 create a managed-process sandbox without an initial command and use

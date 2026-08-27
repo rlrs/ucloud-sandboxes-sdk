@@ -2679,9 +2679,25 @@ def _should_retry_ucloud_unavailable(
     path: str = "",
     max_attempts: int = UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS,
 ) -> bool:
-    if attempt >= max_attempts - 1:
-        return False
     normalized_method = method.upper()
+    snapshot_publication_fence = (
+        status_code in {408, 425, 429, 500, 502, 503, 504}
+        and isinstance(body, dict)
+        and body.get("retryable") is True
+        and body.get("error_code") == "snapshot_publication_pending"
+    )
+    attempt_limit = (
+        max_attempts
+        if snapshot_publication_fence
+        else min(max_attempts, UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS)
+    )
+    if attempt >= attempt_limit - 1:
+        return False
+    if snapshot_publication_fence:
+        # The gateway returns this fence before an exec/file/wake request is
+        # dispatched. Replaying this one exact response is therefore safe even
+        # for methods that are not generally idempotent.
+        return True
     if (
         status_code in {408, 425, 429, 500, 502, 503, 504}
         and isinstance(body, dict)
@@ -2694,12 +2710,19 @@ def _should_retry_ucloud_unavailable(
         return True
     if status_code != UCLOUD_UNAVAILABLE_STATUS:
         return False
+    if not (
+        normalized_method in {"GET", "HEAD", "OPTIONS"}
+        or (normalized_method == "POST" and path == "/v1/sandboxes")
+    ):
+        return False
     text = _ucloud_unavailable_error_text(body).lower()
     return "job is unavailable" in text and "ucloud" in text
 
 
 def _ucloud_unavailable_retry_attempts(method: str, path: str) -> int:
-    if method.upper() == "POST" and path == "/v1/sandboxes":
+    if (method.upper() == "POST" and path == "/v1/sandboxes") or path.startswith(
+        "/v1/sandboxes/"
+    ):
         return UCLOUD_CREATE_RETRY_ATTEMPTS
     return UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS
 
