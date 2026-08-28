@@ -508,11 +508,17 @@ class _DirectSandboxOperations:
         container_path: str,
         content: bytes | str,
     ) -> JsonObject:
-        return self._request_json(
-            "PUT",
-            _file_path(sandbox_id, container_path),
-            body=_bytes_payload(content),
-            content_type="application/octet-stream",
+        body = _bytes_payload(content)
+        return self._finish_file_upload(
+            self._request_json(
+                "PUT",
+                _file_path(sandbox_id, container_path),
+                body=body,
+                content_type="application/octet-stream",
+            ),
+            sandbox_id=sandbox_id,
+            container_path=container_path,
+            expected_size=len(body),
         )
 
     def upload_file_from_path(
@@ -930,6 +936,21 @@ class SandboxClient(_DirectSandboxOperations):
         )
         sandbox_id, record = _sandbox_record(response)
         return SandboxHandle(self, sandbox_id, record=record, create_response=response)
+
+    def _finish_file_upload(
+        self,
+        response: JsonObject,
+        *,
+        sandbox_id: str,
+        container_path: str,
+        expected_size: int,
+    ) -> JsonObject:
+        return _validate_file_upload_response(
+            response,
+            sandbox_id=sandbox_id,
+            container_path=container_path,
+            expected_size=expected_size,
+        )
 
     def start_exec(
         self,
@@ -1641,6 +1662,21 @@ class AsyncSandboxClient(_DirectSandboxOperations):
         content: bytes | str,
     ) -> JsonObject:
         return await super().upload_file(sandbox_id, container_path, content)
+
+    async def _finish_file_upload(
+        self,
+        response: Any,
+        *,
+        sandbox_id: str,
+        container_path: str,
+        expected_size: int,
+    ) -> JsonObject:
+        return _validate_file_upload_response(
+            await response,
+            sandbox_id=sandbox_id,
+            container_path=container_path,
+            expected_size=expected_size,
+        )
 
     async def upload_file_from_path(
         self,
@@ -2472,6 +2508,26 @@ def _file_path(sandbox_id: str, container_path: str) -> str:
         f"/v1/sandboxes/{_quote_segment(sandbox_id)}/files?"
         f"{parse.urlencode({'path': container_path})}"
     )
+
+
+def _validate_file_upload_response(
+    response: JsonObject,
+    *,
+    sandbox_id: str,
+    container_path: str,
+    expected_size: int,
+) -> JsonObject:
+    if (
+        response.get("ok") is not True
+        or response.get("sandbox_id") != sandbox_id
+        or response.get("path") != container_path
+        or response.get("size") != expected_size
+    ):
+        raise SandboxApiError(
+            "gateway returned an invalid file upload acknowledgement",
+            body=response,
+        )
+    return response
 
 
 def _exec_events_path(

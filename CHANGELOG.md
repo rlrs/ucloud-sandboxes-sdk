@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.12 - 2026-08-28
+
+- Validate successful file-upload acknowledgements against the requested
+  sandbox, path, and exact byte count for both synchronous and asynchronous
+  clients, preventing an empty or misrouted upload from failing later at exec.
+
 ## 0.4.11 - 2026-08-27
 
 - Unified synchronous and asynchronous managed-agent validation behind one

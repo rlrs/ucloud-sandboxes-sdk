@@ -14,7 +14,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Lock, Thread
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from urllib.parse import parse_qs, unquote, urlparse
 
 import ucloud_sandboxes_sdk.client as client_module
@@ -178,6 +178,55 @@ class SandboxSdkTests(unittest.TestCase):
                         path,
                         "/workspace/data",
                     )
+
+    def test_sync_upload_rejects_a_mismatched_success_acknowledgement(self) -> None:
+        client = SandboxClient("http://gateway.invalid")
+        with patch.object(
+            client,
+            "_request_json",
+            return_value={
+                "ok": True,
+                "sandbox_id": "sandbox",
+                "path": "/workspace/harness.py",
+                "size": 0,
+            },
+        ):
+            with self.assertRaisesRegex(
+                SandboxApiError,
+                "invalid file upload acknowledgement",
+            ):
+                client.upload_file(
+                    "sandbox",
+                    "/workspace/harness.py",
+                    b"# /// script\n# ///\n",
+                )
+
+    def test_async_upload_rejects_a_mismatched_success_acknowledgement(self) -> None:
+        async def scenario() -> None:
+            client = AsyncSandboxClient("http://gateway.invalid")
+            with patch.object(
+                client,
+                "_request_json",
+                new=AsyncMock(
+                    return_value={
+                        "ok": True,
+                        "sandbox_id": "sandbox",
+                        "path": "/workspace/harness.py",
+                        "size": 0,
+                    }
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    SandboxApiError,
+                    "invalid file upload acknowledgement",
+                ):
+                    await client.upload_file(
+                        "sandbox",
+                        "/workspace/harness.py",
+                        b"# /// script\n# ///\n",
+                    )
+
+        asyncio.run(scenario())
 
     def test_sync_and_async_json_responses_are_bounded(self) -> None:
         with (
