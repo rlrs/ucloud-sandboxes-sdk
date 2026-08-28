@@ -2693,24 +2693,25 @@ def _should_retry_ucloud_unavailable(
     max_attempts: int = UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS,
 ) -> bool:
     normalized_method = method.upper()
-    snapshot_publication_fence = (
+    pre_dispatch_fence = (
         status_code in {408, 425, 429, 500, 502, 503, 504}
         and isinstance(body, dict)
         and body.get("retryable") is True
-        and body.get("error_code") == "snapshot_publication_pending"
+        and body.get("error_code")
+        in {"snapshot_publication_pending", "node_active_exec_deferred"}
     )
     stable_create = normalized_method == "POST" and path == "/v1/sandboxes"
     attempt_limit = (
         max_attempts
-        if snapshot_publication_fence or stable_create
+        if pre_dispatch_fence or stable_create
         else min(max_attempts, UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS)
     )
     if attempt >= attempt_limit - 1:
         return False
-    if snapshot_publication_fence:
-        # The gateway returns this fence before an exec/file/wake request is
-        # dispatched. Replaying this one exact response is therefore safe even
-        # for methods that are not generally idempotent.
+    if pre_dispatch_fence:
+        # The gateway returns these exact fences before an exec/file/wake
+        # request is dispatched. Replaying them is therefore safe even for
+        # methods that are not generally idempotent.
         return True
     if (
         status_code in {408, 425, 429, 500, 502, 503, 504}

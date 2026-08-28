@@ -13,9 +13,9 @@ Install the versioned wheel from the GitHub release (the SDK is not currently
 published on PyPI):
 
 ```bash
-uv add "ucloud-sandboxes-sdk @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.10/ucloud_sandboxes_sdk-0.4.10-py3-none-any.whl"
-uv add "ucloud-sandboxes-sdk[async] @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.10/ucloud_sandboxes_sdk-0.4.10-py3-none-any.whl"
-uv add "ucloud-sandboxes-sdk[inspect] @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.10/ucloud_sandboxes_sdk-0.4.10-py3-none-any.whl"
+uv add "ucloud-sandboxes-sdk @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.14/ucloud_sandboxes_sdk-0.4.14-py3-none-any.whl"
+uv add "ucloud-sandboxes-sdk[async] @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.14/ucloud_sandboxes_sdk-0.4.14-py3-none-any.whl"
+uv add "ucloud-sandboxes-sdk[inspect] @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.14/ucloud_sandboxes_sdk-0.4.14-py3-none-any.whl"
 ```
 
 Use the base package for the synchronous client, the `async` extra for
@@ -96,7 +96,9 @@ hard limit.
 Publication of a parked checkpoint can briefly outlive the park response. If
 an operation reaches the gateway during that exact pre-dispatch window, the
 gateway returns `snapshot_publication_pending`; synchronous and asynchronous
-SDK clients retry that fence automatically. Other non-idempotent exec errors
+SDK clients retry that fence automatically. They also retry
+`node_active_exec_deferred`, which is emitted before an exec is dispatched when
+measured node pressure is temporarily high. Other non-idempotent exec errors
 are surfaced without replay, so an ambiguous command is never run twice.
 
 For a long-lived agent that must survive relay-driven park/wake and migration,
@@ -136,6 +138,10 @@ is why a primary agent must use `start_agent()` rather than an attached exec.
 `AsyncSandboxHandle.start_agent()` provides the same contract with `await`.
 Use the returned job handle to wait, inspect status, or read the bounded stdout
 and stderr ledger after a wake or migration.
+
+Bind the rollout with `register_agent_rollout(rollout_id, agent_sandbox)`.
+Generic `register_rollout()` deliberately rejects sandbox identity metadata;
+the managed helper is the one supported path for lifecycle-aware parking.
 
 ## Files
 

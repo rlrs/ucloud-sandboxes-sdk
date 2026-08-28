@@ -123,6 +123,7 @@ class RelayWorkerClientTests(unittest.TestCase):
         self.assertEqual(
             registered["rollout"]["metadata"],
             {
+                "_ucloud_agent_lifecycle": "managed-process-v1",
                 "sandbox_generation": 7,
                 "sandbox_id": "sandbox-agent",
                 "suite": "agent",
@@ -133,6 +134,15 @@ class RelayWorkerClientTests(unittest.TestCase):
                 "run-agent",
                 sandbox,
                 metadata={"sandbox_generation": 8},
+            )
+
+        with self.assertRaisesRegex(RelayApiError, "register_agent_rollout"):
+            RelayWorkerClient("https://relay.invalid").register_rollout(
+                "run-agent",
+                metadata={
+                    "sandbox_id": "sandbox-agent",
+                    "sandbox_generation": 7,
+                },
             )
 
     def test_relay_request_requires_exact_identity(self) -> None:

@@ -24,6 +24,8 @@ JsonObject = dict[str, Any]
 MAX_RELAY_JSON_BYTES = 32 * 1024 * 1024
 MAX_RELAY_HTTP_BODY_BYTES = MAX_RELAY_JSON_BYTES // 2
 RELAY_POLL_TIMEOUT_GRACE_SECONDS = 5.0
+AGENT_LIFECYCLE_METADATA_KEY = "_ucloud_agent_lifecycle"
+MANAGED_AGENT_LIFECYCLE = "managed-process-v1"
 
 
 class RelayApiError(RuntimeError):
@@ -798,6 +800,14 @@ def _registration_payload(
     rollout_id: str,
     metadata: Mapping[str, Any] | None,
 ) -> JsonObject:
+    if (
+        metadata is not None
+        and any(field in metadata for field in ("sandbox_id", "sandbox_generation"))
+        and metadata.get(AGENT_LIFECYCLE_METADATA_KEY) != MANAGED_AGENT_LIFECYCLE
+    ):
+        raise RelayApiError(
+            "sandbox-bound rollouts must use register_agent_rollout()"
+        )
     payload: JsonObject = {"rollout_id": rollout_id}
     if metadata is not None:
         payload["metadata"] = dict(metadata)
@@ -824,6 +834,7 @@ def _agent_rollout_metadata(
     assert generation is not None
     result = dict(metadata or {})
     for field, value in (
+        (AGENT_LIFECYCLE_METADATA_KEY, MANAGED_AGENT_LIFECYCLE),
         ("sandbox_id", sandbox_id),
         ("sandbox_generation", generation),
     ):

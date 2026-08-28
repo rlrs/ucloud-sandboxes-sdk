@@ -741,6 +741,36 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(handle.session_id, "exec-one")
         self.assertEqual(calls, 2)
 
+    def test_sync_client_retries_pre_dispatch_live_pressure_fence_for_exec(self) -> None:
+        calls = 0
+
+        def fake_urlopen(req: object, timeout: object = None) -> object:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise client_module.error.HTTPError(
+                    str(getattr(req, "full_url", "")),
+                    503,
+                    "Service Unavailable",
+                    {"Retry-After": "0"},
+                    io.BytesIO(
+                        b'{"error":"node load is temporarily high",'
+                        b'"error_code":"node_active_exec_deferred",'
+                        b'"retryable":true}'
+                    ),
+                )
+            return _SyncResponse(b'{"session":{"id":"exec-pressure"}}')
+
+        client = SandboxClient("http://gateway.invalid")
+        with (
+            patch.object(client_module, "open_no_redirect", fake_urlopen),
+            patch.object(client_module.time, "sleep", lambda _delay: None),
+        ):
+            handle = client.start_exec("sandbox-one", ["true"])
+
+        self.assertEqual(handle.session_id, "exec-pressure")
+        self.assertEqual(calls, 2)
+
     def test_sync_client_rejects_legacy_image_patterns(self) -> None:
         client = SandboxClient("http://gateway.invalid")
 
@@ -947,6 +977,32 @@ class SandboxSdkTests(unittest.TestCase):
         session_id, calls = asyncio.run(scenario())
 
         self.assertEqual(session_id, "exec-async")
+        self.assertEqual(calls, 2)
+
+    def test_async_client_retries_pre_dispatch_live_pressure_fence_for_exec(self) -> None:
+        async def no_sleep(_delay: float) -> None:
+            return None
+
+        async def scenario() -> tuple[str, int]:
+            session = _ScriptedAsyncSession(
+                lambda _method, _url, _kwargs, call: _AsyncResponse(
+                    '{"error":"node load is temporarily high",'
+                    '"error_code":"node_active_exec_deferred",'
+                    '"retryable":true}'
+                    if call == 1
+                    else '{"session":{"id":"exec-pressure-async"}}',
+                    status=503 if call == 1 else 201,
+                    headers={"Retry-After": "0"},
+                )
+            )
+            client = AsyncSandboxClient("http://gateway.invalid", session=session)
+            with patch.object(client_module.asyncio, "sleep", no_sleep):
+                handle = await client.start_exec("sandbox-one", ["true"])
+            return handle.session_id, len(session.requests)
+
+        session_id, calls = asyncio.run(scenario())
+
+        self.assertEqual(session_id, "exec-pressure-async")
         self.assertEqual(calls, 2)
 
 

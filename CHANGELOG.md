@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.14 - 2026-08-28
+
+- Required sandbox-bound relay registrations to use the managed-agent contract
+  emitted by `register_agent_rollout()`, so a generic attached-exec rollout
+  fails during setup instead of failing its first park attempt.
+- Retry the exact `node_active_exec_deferred` pre-dispatch fence for sync and
+  async exec starts. Generic or post-dispatch failures remain non-retryable.
+
 ## 0.4.13 - 2026-08-28
 
 - Keep stable sandbox creation requests retrying through the extended cold-node
