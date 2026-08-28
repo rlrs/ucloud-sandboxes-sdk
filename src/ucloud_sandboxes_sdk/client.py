@@ -2699,9 +2699,10 @@ def _should_retry_ucloud_unavailable(
         and body.get("retryable") is True
         and body.get("error_code") == "snapshot_publication_pending"
     )
+    stable_create = normalized_method == "POST" and path == "/v1/sandboxes"
     attempt_limit = (
         max_attempts
-        if snapshot_publication_fence
+        if snapshot_publication_fence or stable_create
         else min(max_attempts, UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS)
     )
     if attempt >= attempt_limit - 1:

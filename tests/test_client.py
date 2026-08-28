@@ -650,6 +650,43 @@ class SandboxSdkTests(unittest.TestCase):
                 delta=0.01,
             )
 
+    def test_sync_create_uses_extended_retries_while_node_scales_up(self) -> None:
+        calls = 0
+
+        def fake_urlopen(req: object, timeout: object = None) -> object:
+            del timeout
+            nonlocal calls
+            calls += 1
+            if calls <= client_module.UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS:
+                raise client_module.error.HTTPError(
+                    str(getattr(req, "full_url", "")),
+                    503,
+                    "Service Unavailable",
+                    {"Retry-After": "0"},
+                    io.BytesIO(
+                        b'{"error":"no ready node has resources for sandbox request",'
+                        b'"error_code":"no_ready_node","retryable":true}'
+                    ),
+                )
+            return _SyncResponse(
+                b'{"sandbox":{"spec":{"id":"cold-create-sync"}}}'
+            )
+
+        client = SandboxClient("http://gateway.invalid")
+        with (
+            patch.object(client_module, "open_no_redirect", fake_urlopen),
+            patch.object(client_module.time, "sleep", lambda _delay: None),
+        ):
+            sandbox = client.create_sandbox(
+                SandboxSpec(
+                    id="cold-create-sync",
+                    image=Image.from_registry("busybox:latest"),
+                )
+            )
+
+        self.assertEqual(sandbox.id, "cold-create-sync")
+        self.assertEqual(calls, client_module.UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS + 1)
+
     def test_sync_client_does_not_retry_structured_capacity_for_exec(self) -> None:
         calls = 0
 
@@ -851,6 +888,40 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(sandbox_id, "tmax-task-async")
         self.assertEqual(len(payloads), 2)
         self.assertEqual(payloads[0], payloads[1])
+
+    def test_async_create_uses_extended_retries_while_node_scales_up(self) -> None:
+        async def no_sleep(_delay: float) -> None:
+            return None
+
+        async def scenario() -> tuple[str, int]:
+            session = _ScriptedAsyncSession(
+                lambda _method, _url, _kwargs, call: _AsyncResponse(
+                    '{"error":"no ready node has resources for sandbox request",'
+                    '"error_code":"no_ready_node","retryable":true}'
+                    if call <= client_module.UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS
+                    else '{"sandbox":{"spec":{"id":"cold-create-async"}}}',
+                    status=(
+                        503
+                        if call <= client_module.UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS
+                        else 201
+                    ),
+                    headers={"Retry-After": "0"},
+                )
+            )
+            client = AsyncSandboxClient("http://gateway.invalid", session=session)
+            with patch.object(client_module.asyncio, "sleep", no_sleep):
+                sandbox = await client.create_sandbox(
+                    SandboxSpec(
+                        id="cold-create-async",
+                        image=Image.from_registry("busybox:latest"),
+                    )
+                )
+            return sandbox.id, len(session.requests)
+
+        sandbox_id, calls = asyncio.run(scenario())
+
+        self.assertEqual(sandbox_id, "cold-create-async")
+        self.assertEqual(calls, client_module.UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS + 1)
 
     def test_async_client_retries_pre_dispatch_snapshot_fence_for_exec(self) -> None:
         async def no_sleep(_delay: float) -> None:

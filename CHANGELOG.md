@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.13 - 2026-08-28
+
+- Keep stable sandbox creation requests retrying through the extended cold-node
+  scale-up window instead of applying the shorter generic transient-error cap.
+
 ## 0.4.12 - 2026-08-28
 
 - Validate successful file-upload acknowledgements against the requested
