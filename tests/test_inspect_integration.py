@@ -435,7 +435,7 @@ class InspectIntegrationTests(unittest.TestCase):
         self.assertEqual(captured[0].network, "bridge")
         self.assertEqual(captured[1].network, "none")
 
-    def test_create_retry_classification(self) -> None:
+    def test_create_delegates_retry_policy_to_the_sdk_client(self) -> None:
         retryable_capacity = SandboxApiError(
             "pending",
             status_code=503,
@@ -449,31 +449,19 @@ class InspectIntegrationTests(unittest.TestCase):
             status_code=400,
             body={"error": "invalid sandbox"},
         )
-        cases = (
-            ("capacity", [retryable_capacity, object()], True, 2),
-            (
-                "disconnect",
-                [ServerDisconnectedError("disconnected"), object()],
-                True,
-                2,
-            ),
-            ("rejected", [rejected], False, 1),
-        )
+        cases = (("capacity", retryable_capacity), ("rejected", rejected))
 
-        for label, outcomes, succeeds, attempts in cases:
+        for label, outcome in cases:
             with self.subTest(label=label):
-                client = _ScriptedCreateClient(outcomes)
+                client = _ScriptedCreateClient([outcome, object()])
                 operation = inspect_integration._create_sandbox_with_wait(
                     client,
                     _sandbox_spec(),
                     settings=_settings(inspect_integration),
                 )
-                if succeeds:
-                    self.assertEqual(asyncio.run(operation), {"created": "sandbox-one"})
-                else:
-                    with self.assertRaises(SandboxApiError):
-                        asyncio.run(operation)
-                self.assertEqual(client.attempts, attempts)
+                with self.assertRaises(SandboxApiError):
+                    asyncio.run(operation)
+                self.assertEqual(client.attempts, 1)
 
     def test_image_build_submit_recovery_and_non_resubmission(self) -> None:
         image_id = "behavior-build"

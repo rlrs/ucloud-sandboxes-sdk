@@ -149,6 +149,14 @@ Terminal statuses are:
 `SandboxExecResult.stdout` and `.stderr` are assembled from events whose
 `stream` fields are `stdout` and `stderr`.
 
+Interactive exec sessions additionally support stdin and signals:
+
+- `POST /v1/exec/<session>/stdin`
+- `POST /v1/exec/<session>/close-stdin`
+- `POST /v1/exec/<session>/signal` with `{"signal": 15}`
+
+The signal endpoint is idempotent after the exec session becomes terminal.
+
 ## File Transfer
 
 `PUT /v1/sandboxes/<sandbox-id>/files?path=/absolute/container/path` uploads the

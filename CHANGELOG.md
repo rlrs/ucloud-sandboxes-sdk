@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.15 - 2026-08-29
+
+- Added typed `container`/`linux_host` profiles, `SandboxLinuxHostSpec`, and a
+  `SandboxSpec.benchmark()` factory.
+- Added sync and async `from_env()` constructors for sandbox and relay clients.
+- Added managed relay rollout sessions and worker loops with bounded
+  concurrency, cancellation, lease renewal, retry classification, deterministic
+  unregistration, and explicit rejection of unsupported streaming model calls.
+- Added `RelayApiError.retryable` and `retry_after_seconds`.
+- Added an asyncio subprocess-like sandbox process handle with stdin, separate
+  stdout/stderr streams, wait, terminate, and kill.
+- Removed the Inspect integration's outer create retry loop so the canonical
+  SDK retry and `Retry-After` policy remains authoritative.
+
 ## 0.4.14 - 2026-08-28
 
 - Required sandbox-bound relay registrations to use the managed-agent contract

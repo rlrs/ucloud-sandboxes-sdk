@@ -13,9 +13,9 @@ Install the versioned wheel from the GitHub release (the SDK is not currently
 published on PyPI):
 
 ```bash
-uv add "ucloud-sandboxes-sdk @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.14/ucloud_sandboxes_sdk-0.4.14-py3-none-any.whl"
-uv add "ucloud-sandboxes-sdk[async] @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.14/ucloud_sandboxes_sdk-0.4.14-py3-none-any.whl"
-uv add "ucloud-sandboxes-sdk[inspect] @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.14/ucloud_sandboxes_sdk-0.4.14-py3-none-any.whl"
+uv add "ucloud-sandboxes-sdk @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.15/ucloud_sandboxes_sdk-0.4.15-py3-none-any.whl"
+uv add "ucloud-sandboxes-sdk[async] @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.15/ucloud_sandboxes_sdk-0.4.15-py3-none-any.whl"
+uv add "ucloud-sandboxes-sdk[inspect] @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.15/ucloud_sandboxes_sdk-0.4.15-py3-none-any.whl"
 ```
 
 Use the base package for the synchronous client, the `async` extra for
@@ -35,6 +35,14 @@ client = SandboxClient(
     "https://app-sandboxes.cloud.sdu.dk",
     api_token="<token>",
 )
+```
+
+The same configuration can be loaded directly from
+`UCLOUD_SANDBOX_URL`, `UCLOUD_SANDBOX_API_TOKEN`, and optional
+`UCLOUD_SANDBOX_TIMEOUT_SECONDS`:
+
+```python
+client = SandboxClient.from_env()
 ```
 
 Raw HTTP callers should send the same token as
@@ -143,6 +151,35 @@ Bind the rollout with `register_agent_rollout(rollout_id, agent_sandbox)`.
 Generic `register_rollout()` deliberately rejects sandbox identity metadata;
 the managed helper is the one supported path for lifecycle-aware parking.
 
+Benchmark images that expect a VM-like writable Linux layout can use the typed
+host profile directly, or the higher-level factory:
+
+```python
+from ucloud_sandboxes_sdk import SandboxLinuxHostSpec
+
+spec = SandboxSpec.benchmark(
+    id="swebench-001",
+    image=Image.from_registry("ubuntu:24.04"),
+    cpus=2,
+    memory_mb=4096,
+    disk_mb=20480,
+    linux_host=SandboxLinuxHostSpec(enable_cron=True),
+)
+```
+
+For ACP and persistent harnesses, the async client also exposes a subprocess-like
+process handle. Its stdin accepts UTF-8 bytes, stdout and stderr are independent
+`asyncio.StreamReader` instances, and signals are routed to the exec session:
+
+```python
+process = await async_sandbox.open_process(["python", "harness.py"])
+process.stdin.write(b"request\n")
+await process.stdin.drain()
+line = await process.stdout.readline()
+process.terminate()
+returncode = await process.wait()
+```
+
 ## Files
 
 Upload and download files as raw bytes through the gateway:
@@ -196,53 +233,34 @@ process ledger, relay acceptance, gateway program transition, and checkpoint
 form one fenced protocol. Normal exec and file activity is never implicitly
 treated as safe to checkpoint.
 
-Run a worker near the model endpoint with `RelayWorkerClient`. Polling leases a
-request to one worker; renew the lease while a long local inference call is
-running, then respond with the OpenAI-compatible JSON body:
+Run a worker near the model endpoint with a managed rollout session. It
+registers the rollout, exposes a registration-authenticated tunnel URL, bounds
+concurrency, renews request leases during long calls, classifies polling
+failures, and unregisters on exit:
 
 ```python
-import threading
-from ucloud_sandboxes_sdk import RelayWorkerClient
+from ucloud_sandboxes_sdk import RelayResponse, RelayWorkerClient
 
-relay = RelayWorkerClient(
-    "https://relay.example.org",
-    worker_token="<worker-relay-token>",
-)
-
-relay.register_agent_rollout("run-001", sandbox)
-poll = relay.poll(
+relay = RelayWorkerClient.from_env()
+with relay.rollout_session(
     "run-001",
     worker_id="lumi-worker-1",
-    timeout_seconds=30,
-    limit=8,
-    lease_seconds=600,
-)
-
-for request in poll.requests:
-    stop = threading.Event()
-
-    def renew_loop() -> None:
-        while not stop.wait(60):
-            relay.renew_request(
-                request,
-                worker_id="lumi-worker-1",
-                lease_seconds=600,
-            )
-
-    renewer = threading.Thread(target=renew_loop, daemon=True)
-    renewer.start()
-    try:
-        response = call_local_openai_compatible_model(request.body)
-        relay.respond_to(request, response)
-    except Exception as exc:
-        relay.error_request(request, str(exc))
-    finally:
-        stop.set()
-        renewer.join(timeout=1)
+    sandbox=sandbox,
+) as session:
+    session.run(
+        handler=lambda request: RelayResponse(
+            call_local_openai_compatible_model(request.body)
+        ),
+        max_concurrency=8,
+        lease_seconds=600,
+    )
 ```
 
 Use `AsyncRelayWorkerClient` for async workers; it exposes the same methods with
-`await`.
+`await`. `from_env()` reads `UCLOUD_RELAY_URL`,
+`UCLOUD_RELAY_WORKER_TOKEN`, and optional `UCLOUD_RELAY_TIMEOUT_SECONDS`.
+Streaming model requests (`stream: true`) are rejected with a clear client
+error because the current relay protocol buffers one complete response.
 
 ### General HTTP tunnel
 
@@ -250,17 +268,12 @@ The same relay can expose any buffered HTTP service, not only OpenAI endpoints.
 Register a tunnel and forward each leased request to the worker-local service:
 
 ```python
-from ucloud_sandboxes_sdk import RelayWorkerClient, http_tunnel_url
+from ucloud_sandboxes_sdk import RelayWorkerClient
 
-relay = RelayWorkerClient(
-    "https://relay.example.org",
-    worker_token="<worker-relay-token>",
-)
-relay.register_rollout("dev-api")
-
-while True:
-    for request in relay.poll("dev-api", timeout_seconds=30).requests:
-        relay.forward_to(request, "http://127.0.0.1:8080")
+relay = RelayWorkerClient.from_env()
+with relay.rollout_session("dev-api") as session:
+    print(session.base_url)  # registration-authenticated caller URL
+    session.run(upstream_base_url="http://127.0.0.1:8080")
 ```
 
 Callers use the tunnel URL and a dedicated relay-auth header. Keeping relay
@@ -476,9 +489,9 @@ running, the provider waits for that build instead of submitting another copy
 of the context.
 Multi-service Compose is rejected until the UCloud node agent has
 project-level Compose support. Inspect `read_file()` and `write_file()` use the
-gateway file endpoints. When the gateway reports that a sandbox or builder node
-is scaling up, or the gateway connection briefly drops during scale-up, the
-provider retries until the configured timeout expires. Start and build timeouts
+gateway file endpoints. The SDK owns idempotent sandbox-create retries and
+`Retry-After` handling; the provider separately recovers ambiguous image-build
+submissions. Start and build timeouts
 are treated as total budgets; individual scale-up attempts and build-status
 polls are bounded by the remaining budget. After a builder accepts an image
 build, the provider waits by build ID instead of re-submitting the build.

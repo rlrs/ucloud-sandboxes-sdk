@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import gzip
 import json
+import os
 from pathlib import Path
 import random
 import re
@@ -21,6 +22,7 @@ from typing import (
     BinaryIO,
     Callable,
     Iterator,
+    Literal,
     Mapping,
     Sequence,
 )
@@ -55,6 +57,27 @@ MAX_JSON_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_FILE_RESPONSE_BYTES = 256 * 1024 * 1024
 BUILD_CONTEXT_SPOOL_MEMORY_BYTES = 8 * 1024 * 1024
 BUILD_CONTEXT_STREAM_CHUNK_BYTES = 1024 * 1024
+SANDBOX_PROFILES = {"container", "linux_host"}
+DEFAULT_LINUX_HOST_WRITABLE_PATHS = (
+    "/run",
+    "/run/lock",
+    "/run/sshd",
+    "/tmp",
+    "/var/tmp",
+    "/var/run",
+    "/var/lock",
+    "/var/spool/cron",
+    "/var/spool/cron/crontabs",
+    "/etc/cron.d",
+    "/logs",
+    "/logs/agent",
+    "/logs/verifier",
+    "/tests",
+    "/task",
+    "/oracle",
+    "/workspace",
+)
+SandboxProfile = Literal["container", "linux_host"]
 
 
 class SandboxApiError(RuntimeError):
@@ -139,6 +162,14 @@ class SandboxFilesystemSpec(_DataclassPayload):
 
 
 @dataclass(frozen=True)
+class SandboxLinuxHostSpec(_DataclassPayload):
+    enable_cron: bool = False
+    enable_sshd: bool = False
+    keep_alive: bool = True
+    writable_paths: tuple[str, ...] = DEFAULT_LINUX_HOST_WRITABLE_PATHS
+
+
+@dataclass(frozen=True)
 class SandboxSshSpec(_DataclassPayload):
     enabled: bool = False
     user: str = "root"
@@ -201,10 +232,18 @@ class SandboxSpec:
     labels: Mapping[str, str] = field(default_factory=dict)
     parkable: bool = False
     managed_process: bool = False
+    profile: SandboxProfile = "container"
+    linux_host: SandboxLinuxHostSpec = SandboxLinuxHostSpec()
 
     def __post_init__(self) -> None:
+        if self.profile not in SANDBOX_PROFILES:
+            raise ValueError(
+                "profile must be one of: " + ", ".join(sorted(SANDBOX_PROFILES))
+            )
         if not isinstance(self.ssh, SandboxSshSpec):
             raise TypeError("ssh must be a SandboxSshSpec")
+        if not isinstance(self.linux_host, SandboxLinuxHostSpec):
+            raise TypeError("linux_host must be a SandboxLinuxHostSpec")
         for name, value, expected in (
             ("security", self.security, SandboxSecuritySpec),
             ("filesystem", self.filesystem, SandboxFilesystemSpec),
@@ -217,6 +256,8 @@ class SandboxSpec:
             raise ValueError("managed_process requires parkable=True")
         if self.managed_process and self.command:
             raise ValueError("managed_process sandboxes are started with start_job()")
+        if self.managed_process and self.profile != "container":
+            raise ValueError("managed_process currently requires profile='container'")
         payload = dict(vars(self))
         payload.update(
             image=_image_reference(self.image),
@@ -227,6 +268,7 @@ class SandboxSpec:
             filesystem=(
                 self.filesystem.to_dict() if self.filesystem is not None else None
             ),
+            linux_host=self.linux_host.to_dict(),
             labels=dict(self.labels),
         )
         if not self.parkable:
@@ -234,6 +276,45 @@ class SandboxSpec:
         if not self.managed_process:
             payload.pop("managed_process")
         return payload
+
+    @classmethod
+    def benchmark(
+        cls,
+        *,
+        id: str,
+        image: "Image",
+        command: Sequence[str] = (),
+        env: Mapping[str, str] | None = None,
+        working_dir: str | None = None,
+        memory_mb: int | None = None,
+        cpus: float | None = None,
+        disk_mb: int | None = None,
+        network: str = "bridge",
+        ttl_seconds: int | None = None,
+        ssh: SandboxSshSpec | None = None,
+        linux_host: SandboxLinuxHostSpec | None = None,
+        labels: Mapping[str, str] | None = None,
+    ) -> "SandboxSpec":
+        """Build a VM-like benchmark sandbox with the gateway's host defaults."""
+
+        return cls(
+            id=id,
+            image=image,
+            profile="linux_host",
+            command=command,
+            env=dict(env or {}),
+            working_dir=working_dir,
+            memory_mb=memory_mb,
+            cpus=cpus,
+            disk_mb=disk_mb,
+            network=network,
+            ttl_seconds=ttl_seconds,
+            ssh=ssh or SandboxSshSpec(),
+            security=None,
+            filesystem=None,
+            linux_host=linux_host or SandboxLinuxHostSpec(),
+            labels=dict(labels or {}),
+        )
 
 
 @dataclass(frozen=True)
@@ -570,6 +651,13 @@ class _DirectSandboxOperations:
             "POST", f"/v1/exec/{_quote_segment(session_id)}/close-stdin"
         )
 
+    def signal_exec(self, session_id: str, signal: int) -> JsonObject:
+        return self._request_json(
+            "POST",
+            f"/v1/exec/{_quote_segment(session_id)}/signal",
+            payload={"signal": _process_signal(signal)},
+        )
+
     def pull_image(
         self,
         image: Image,
@@ -792,6 +880,15 @@ class ExecHandle(_ExecState):
     def close_stdin(self) -> JsonObject:
         return self.client.close_exec_stdin(self.session_id)
 
+    def signal(self, signal: int) -> JsonObject:
+        return self.client.signal_exec(self.session_id, signal)
+
+    def terminate(self) -> JsonObject:
+        return self.signal(15)
+
+    def kill(self) -> JsonObject:
+        return self.signal(9)
+
     def events(
         self,
         *,
@@ -907,6 +1004,30 @@ class SandboxClient(_DirectSandboxOperations):
         self.timeout_seconds = timeout_seconds
         self.headers = sandbox_auth_headers(api_token)
         self.headers.update(dict(headers or {}))
+
+    @classmethod
+    def from_env(
+        cls,
+        *,
+        env: Mapping[str, str] | None = None,
+        timeout_seconds: float | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> "SandboxClient":
+        values = os.environ if env is None else env
+        return cls(
+            _required_env(values, "UCLOUD_SANDBOX_URL"),
+            api_token=values.get("UCLOUD_SANDBOX_API_TOKEN"),
+            timeout_seconds=(
+                _positive_env_float(
+                    values,
+                    "UCLOUD_SANDBOX_TIMEOUT_SECONDS",
+                    default=30.0,
+                )
+                if timeout_seconds is None
+                else timeout_seconds
+            ),
+            headers=headers,
+        )
 
     def list_sandboxes(self) -> list[JsonObject]:
         return _records(self._request_json("GET", "/v1/sandboxes"), "sandboxes")
@@ -1327,6 +1448,20 @@ class AsyncSandboxHandle:
             tty=tty,
         )
 
+    async def open_process(
+        self,
+        command: str | Sequence[str],
+        *,
+        env: Mapping[str, str] | None = None,
+        working_dir: str | None = None,
+    ) -> "AsyncSandboxProcess":
+        return await self.client.open_process(
+            self.id,
+            command,
+            env=env,
+            working_dir=working_dir,
+        )
+
     async def start_job(
         self,
         command: str | Sequence[str],
@@ -1435,6 +1570,15 @@ class AsyncExecHandle(_ExecState):
     async def close_stdin(self) -> JsonObject:
         return await self.client.close_exec_stdin(self.session_id)
 
+    async def signal(self, signal: int) -> JsonObject:
+        return await self.client.signal_exec(self.session_id, signal)
+
+    async def terminate(self) -> JsonObject:
+        return await self.signal(15)
+
+    async def kill(self) -> JsonObject:
+        return await self.signal(9)
+
     async def events(
         self,
         *,
@@ -1482,6 +1626,148 @@ class AsyncExecHandle(_ExecState):
                 terminal_seen = True
                 if not new_events:
                     return self._result(events)
+
+
+class AsyncProcessStdin:
+    """Small StreamWriter-compatible adapter for a sandbox exec session."""
+
+    def __init__(self, handle: AsyncExecHandle) -> None:
+        self._handle = handle
+        self._buffer = bytearray()
+        self._lock = asyncio.Lock()
+        self._closing = False
+        self._close_task: asyncio.Task[None] | None = None
+
+    def write(self, data: bytes | bytearray | memoryview | str) -> None:
+        if self._closing:
+            raise RuntimeError("stdin is closing")
+        if isinstance(data, str):
+            encoded = data.encode("utf-8")
+        elif isinstance(data, (bytes, bytearray, memoryview)):
+            encoded = bytes(data)
+        else:
+            raise TypeError("stdin.write() requires bytes or str")
+        self._buffer.extend(encoded)
+
+    async def drain(self) -> None:
+        async with self._lock:
+            if not self._buffer:
+                return
+            data = bytes(self._buffer)
+            self._buffer.clear()
+            try:
+                await self._handle.write_stdin(data)
+            except Exception:
+                self._buffer[:0] = data
+                raise
+
+    def close(self) -> None:
+        if self._close_task is not None:
+            return
+        self._closing = True
+        self._close_task = asyncio.create_task(self._close())
+
+    async def wait_closed(self) -> None:
+        if self._close_task is None:
+            self.close()
+        assert self._close_task is not None
+        await self._close_task
+
+    def is_closing(self) -> bool:
+        return self._closing
+
+    async def _close(self) -> None:
+        await self.drain()
+        await self._handle.close_stdin()
+
+
+class AsyncSandboxProcess:
+    """An asyncio subprocess-like handle backed by sandbox exec events."""
+
+    def __init__(self, handle: AsyncExecHandle) -> None:
+        self.handle = handle
+        self.stdin = AsyncProcessStdin(handle)
+        self.stdout = asyncio.StreamReader()
+        self.stderr = asyncio.StreamReader()
+        self.returncode: int | None = None
+        self._loop = asyncio.get_running_loop()
+        self._exit_waiter: asyncio.Future[int] = self._loop.create_future()
+        self._pump_task = asyncio.create_task(self._pump())
+        self._signal_tasks: set[asyncio.Task[None]] = set()
+
+    @property
+    def session_id(self) -> str:
+        return self.handle.session_id
+
+    @property
+    def sandbox_id(self) -> str:
+        return self.handle.sandbox_id
+
+    async def wait(self) -> int:
+        return await asyncio.shield(self._exit_waiter)
+
+    def terminate(self) -> None:
+        self._schedule_signal(15)
+
+    def kill(self) -> None:
+        self._schedule_signal(9)
+
+    async def communicate(
+        self,
+        input: bytes | str | None = None,
+    ) -> tuple[bytes, bytes]:
+        if input is not None:
+            self.stdin.write(input)
+        self.stdin.close()
+        stdout, stderr, _ = await asyncio.gather(
+            self.stdout.read(),
+            self.stderr.read(),
+            self.wait(),
+        )
+        await self.stdin.wait_closed()
+        return stdout, stderr
+
+    def _schedule_signal(self, signal: int) -> None:
+        if self.returncode is not None:
+            return
+        task = asyncio.create_task(self._signal(signal))
+        self._signal_tasks.add(task)
+        task.add_done_callback(self._signal_tasks.discard)
+
+    async def _signal(self, signal: int) -> None:
+        try:
+            await self.handle.signal(signal)
+        except Exception as exc:
+            self._fail(exc)
+
+    async def _pump(self) -> None:
+        try:
+            async for event in self.handle.events(wait_seconds=1.0):
+                stream = event.get("stream")
+                data = event.get("data")
+                if isinstance(data, str) and data:
+                    encoded = data.encode("utf-8")
+                    if stream == "stdout":
+                        self.stdout.feed_data(encoded)
+                    elif stream == "stderr":
+                        self.stderr.feed_data(encoded)
+            exit_code = self.handle.session.get("exit_code")
+            self.returncode = int(exit_code) if exit_code is not None else 1
+            if not self._exit_waiter.done():
+                self._exit_waiter.set_result(self.returncode)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._fail(exc)
+        finally:
+            self.stdout.feed_eof()
+            self.stderr.feed_eof()
+
+    def _fail(self, exc: BaseException) -> None:
+        if not self._exit_waiter.done():
+            self._exit_waiter.set_exception(exc)
+        self.stdout.set_exception(exc)
+        self.stderr.set_exception(exc)
 
 
 @dataclass
@@ -1553,6 +1839,32 @@ class AsyncSandboxClient(_DirectSandboxOperations):
         self._owned_session: Any | None = None
         self.headers = sandbox_auth_headers(api_token)
         self.headers.update(dict(headers or {}))
+
+    @classmethod
+    def from_env(
+        cls,
+        *,
+        env: Mapping[str, str] | None = None,
+        timeout_seconds: float | None = None,
+        headers: Mapping[str, str] | None = None,
+        session: Any | None = None,
+    ) -> "AsyncSandboxClient":
+        values = os.environ if env is None else env
+        return cls(
+            _required_env(values, "UCLOUD_SANDBOX_URL"),
+            api_token=values.get("UCLOUD_SANDBOX_API_TOKEN"),
+            timeout_seconds=(
+                _positive_env_float(
+                    values,
+                    "UCLOUD_SANDBOX_TIMEOUT_SECONDS",
+                    default=30.0,
+                )
+                if timeout_seconds is None
+                else timeout_seconds
+            ),
+            headers=headers,
+            session=session,
+        )
 
     async def __aenter__(self) -> "AsyncSandboxClient":
         await self._client()
@@ -1716,6 +2028,24 @@ class AsyncSandboxClient(_DirectSandboxOperations):
         session = _exec_session(response)
         return AsyncExecHandle(self, session["id"], sandbox_id, session=session)
 
+    async def open_process(
+        self,
+        sandbox_id: str,
+        command: str | Sequence[str],
+        *,
+        env: Mapping[str, str] | None = None,
+        working_dir: str | None = None,
+    ) -> AsyncSandboxProcess:
+        handle = await self.start_exec(
+            sandbox_id,
+            command,
+            env=env,
+            working_dir=working_dir,
+            stdin=True,
+            tty=False,
+        )
+        return AsyncSandboxProcess(handle)
+
     async def exec(
         self,
         sandbox_id: str,
@@ -1858,6 +2188,9 @@ class AsyncSandboxClient(_DirectSandboxOperations):
 
     async def close_exec_stdin(self, session_id: str) -> JsonObject:
         return await super().close_exec_stdin(session_id)
+
+    async def signal_exec(self, session_id: str, signal: int) -> JsonObject:
+        return await super().signal_exec(session_id, signal)
 
     async def list_images(self) -> list[JsonObject]:
         return _records(await self._request_json("GET", "/v1/images"), "images")
@@ -2239,6 +2572,31 @@ def _non_empty_string(name: str, value: object) -> str:
     return text
 
 
+def _required_env(env: Mapping[str, str], name: str) -> str:
+    value = str(env.get(name) or "").strip()
+    if not value:
+        raise ValueError(f"{name} is required")
+    return value
+
+
+def _positive_env_float(
+    env: Mapping[str, str],
+    name: str,
+    *,
+    default: float,
+) -> float:
+    raw = str(env.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be positive")
+    return value
+
+
 def _aiohttp_timeout(timeout_seconds: float | None) -> object:
     if timeout_seconds is None:
         return None
@@ -2399,6 +2757,12 @@ def _job_id(value: str | None) -> str:
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", result) is None:
         raise ValueError("job_id must match [A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
     return result
+
+
+def _process_signal(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 64:
+        raise ValueError("signal must be an integer in [1, 64]")
+    return value
 
 
 def _job_payload(

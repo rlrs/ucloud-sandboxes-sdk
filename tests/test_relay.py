@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -18,6 +18,7 @@ from ucloud_sandboxes_sdk import (
     AsyncRelayWorkerClient,
     RelayApiError,
     RelayRequest,
+    RelayResponse,
     RelayWorkerClient,
     http_tunnel_url,
     model_relay_env,
@@ -100,6 +101,122 @@ class RelayUrlConfigTests(unittest.TestCase):
 
 
 class RelayWorkerClientTests(unittest.TestCase):
+    def test_relay_error_and_environment_configuration_match_sandbox_semantics(
+        self,
+    ) -> None:
+        error = RelayApiError(
+            "busy",
+            status_code=503,
+            body={"retryable": True},
+            headers={"Retry-After": "2.5"},
+        )
+        client = RelayWorkerClient.from_env(
+            env={
+                "UCLOUD_RELAY_URL": "https://relay.example/",
+                "UCLOUD_RELAY_WORKER_TOKEN": "worker-secret",
+                "UCLOUD_RELAY_TIMEOUT_SECONDS": "45",
+            }
+        )
+
+        self.assertTrue(error.retryable)
+        self.assertEqual(error.retry_after_seconds, 2.5)
+        self.assertEqual(client.relay_url, "https://relay.example")
+        self.assertEqual(client.timeout_seconds, 45.0)
+        self.assertEqual(client.headers["Authorization"], "Bearer worker-secret")
+
+    def test_managed_sync_session_renews_and_unregisters(self) -> None:
+        cancel = Event()
+
+        def handle(_request: RelayRequest) -> RelayResponse:
+            cancel.set()
+            Event().wait(0.04)
+            return RelayResponse(
+                {"choices": []},
+                headers={"X-Model": "local"},
+            )
+
+        with running_relay() as relay:
+            client = RelayWorkerClient(relay.base_url, worker_token="worker-token")
+            with client.rollout_session("run-managed", worker_id="worker-1") as session:
+                self.assertIn(REGISTRATION_TOKEN, session.base_url)
+                self.assertTrue(session.openai_base_url.endswith("/v1"))
+                session.run(
+                    handler=handle,
+                    cancel=cancel,
+                    max_concurrency=1,
+                    poll_timeout_seconds=0,
+                    lease_seconds=0.06,
+                    renewal_interval_seconds=0.01,
+                )
+                self.assertIn("run-managed", relay.state.rollouts)
+
+            self.assertNotIn("run-managed", relay.state.rollouts)
+            self.assertGreaterEqual(relay.state.renew_attempts, 1)
+            self.assertEqual(relay.state.respond_attempts, 1)
+
+    def test_managed_async_session_runs_handler_and_unregisters(self) -> None:
+        async def scenario(base_url: str, state: FakeRelayState) -> None:
+            cancel = asyncio.Event()
+
+            async def handle(_request: RelayRequest) -> dict:
+                cancel.set()
+                await asyncio.sleep(0)
+                return {"choices": []}
+
+            async with AsyncRelayWorkerClient(
+                base_url,
+                worker_token="worker-token",
+            ) as client:
+                async with client.rollout_session(
+                    "run-async-managed",
+                    worker_id="worker-async",
+                ) as session:
+                    await session.run(
+                        handler=handle,
+                        cancel=cancel,
+                        max_concurrency=1,
+                        poll_timeout_seconds=0,
+                        lease_seconds=1,
+                        renewal_interval_seconds=0.1,
+                    )
+                    self.assertIn("run-async-managed", state.rollouts)
+                self.assertNotIn("run-async-managed", state.rollouts)
+
+        with running_relay() as relay:
+            asyncio.run(scenario(relay.base_url, relay.state))
+
+    def test_worker_rejects_streaming_model_requests_explicitly(self) -> None:
+        cancel = Event()
+        called = False
+
+        def handle(_request: RelayRequest) -> dict:
+            nonlocal called
+            called = True
+            return {}
+
+        with running_relay() as relay:
+            relay.state.poll_overrides = {
+                "body": {
+                    "encoding": "json",
+                    "value": {"model": "test-model", "stream": True},
+                }
+            }
+            relay.state.cancel_event = cancel
+            client = RelayWorkerClient(relay.base_url, worker_token="worker-token")
+            client.register_rollout("streaming-run")
+            client.run_worker(
+                "streaming-run",
+                handler=handle,
+                cancel=cancel,
+                max_concurrency=1,
+                poll_timeout_seconds=0,
+                lease_seconds=1,
+            )
+
+        self.assertFalse(called)
+        self.assertEqual(relay.state.last_error_payload["status"], 400)
+        self.assertIn("streaming", relay.state.last_error_payload["error"])
+
     def test_agent_rollout_registration_binds_sandbox_generation(self) -> None:
         sandbox = SimpleNamespace(
             id="sandbox-agent",
@@ -432,6 +549,9 @@ class FakeRelayState:
         self.upstream_body = b""
         self.upstream_response_body = b"\xffresponse"
         self.respond_attempts = 0
+        self.renew_attempts = 0
+        self.last_error_payload: dict = {}
+        self.cancel_event: Event | None = None
         self.registration_rollout_id: str | None = None
         self.registration_token = REGISTRATION_TOKEN
         self.poll_rollout_id: str | None = None
@@ -521,6 +641,7 @@ class FakeRelayHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/worker/renew":
             with self.state.lock:
+                self.state.renew_attempts += 1
                 request = dict(
                     self.state.polled_request or _relay_request(rollout_id="run-001")
                 )
@@ -545,6 +666,14 @@ class FakeRelayHandler(BaseHTTPRequestHandler):
                     "duplicate": False,
                 }
             )
+            return
+        if parsed.path == "/worker/error":
+            with self.state.lock:
+                self.state.last_error_payload = dict(payload)
+                cancel_event = self.state.cancel_event
+            if cancel_event is not None:
+                cancel_event.set()
+            self._write_json({"ok": True, "request_id": payload.get("request_id")})
             return
         self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 

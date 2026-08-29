@@ -19,12 +19,14 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import ucloud_sandboxes_sdk.client as client_module
 from ucloud_sandboxes_sdk import (
+    AsyncSandboxProcess,
     AsyncSandboxClient,
     ExecEventHistoryLostError,
     Image,
     SandboxApiError,
     SandboxClient,
     SandboxFilesystemSpec,
+    SandboxLinuxHostSpec,
     SandboxSecuritySpec,
     SandboxSpec,
     SandboxSshSpec,
@@ -96,6 +98,35 @@ class _ScriptedAsyncSession:
 
 
 class SandboxSdkTests(unittest.TestCase):
+    def test_profiles_benchmark_factory_and_environment_constructors(self) -> None:
+        benchmark = SandboxSpec.benchmark(
+            id="benchmark-one",
+            image=Image.from_registry("ubuntu:24.04"),
+            memory_mb=1024,
+            linux_host=SandboxLinuxHostSpec(enable_cron=True),
+        ).to_dict()
+
+        self.assertEqual(benchmark["profile"], "linux_host")
+        self.assertTrue(benchmark["linux_host"]["enable_cron"])
+        self.assertIsNone(benchmark["security"])
+        self.assertIsNone(benchmark["filesystem"])
+        client = SandboxClient.from_env(
+            env={
+                "UCLOUD_SANDBOX_URL": "https://gateway.example/",
+                "UCLOUD_SANDBOX_API_TOKEN": "secret",
+                "UCLOUD_SANDBOX_TIMEOUT_SECONDS": "45",
+            }
+        )
+        self.assertEqual(client.base_url, "https://gateway.example")
+        self.assertEqual(client.timeout_seconds, 45.0)
+        self.assertEqual(client.headers["X-UCloud-Sandbox-Token"], "secret")
+        with self.assertRaisesRegex(ValueError, "profile"):
+            SandboxSpec(
+                id="invalid-profile",
+                image=Image.from_registry("busybox"),
+                profile="vm",  # type: ignore[arg-type]
+            )
+
     def test_credentialed_clients_reject_redirects(self) -> None:
         with running_redirect_gateway() as gateway:
             sync_client = SandboxClient(gateway.base_url, api_token="secret-token")
@@ -830,6 +861,24 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(downloaded, b"async bytes\n")
         self.assertEqual(ssh_command, "ssh -p 22000 sandbox@127.0.0.1")
 
+    def test_async_process_exposes_subprocess_streams_and_stdin(self) -> None:
+        async def scenario(base_url: str) -> tuple[bytes, bytes, int, str]:
+            async with AsyncSandboxClient(base_url) as client:
+                process = await client.open_process("sandbox-one", ["cat"])
+                self.assertIsInstance(process, AsyncSandboxProcess)
+                stdout, stderr = await process.communicate(b"hello\n")
+                return stdout, stderr, await process.wait(), process.session_id
+
+        with running_gateway() as gateway:
+            stdout, stderr, returncode, session_id = asyncio.run(
+                scenario(gateway.base_url)
+            )
+
+        self.assertEqual(stdout, b"stdout\n")
+        self.assertEqual(stderr, b"stderr\n")
+        self.assertEqual(returncode, 0)
+        self.assertTrue(session_id.startswith("exec-"))
+
     def test_async_build_image_accepts_per_call_timeout(self) -> None:
         async def scenario() -> list[object]:
             session = _ScriptedAsyncSession(
@@ -1118,6 +1167,7 @@ class FakeGatewayState:
         self.build_contexts: dict[str, bytes] = {}
         self.build_context_puts = 0
         self.exec_counter = 0
+        self.last_exec_signal: int | None = None
 
     def next_exec_id(self) -> str:
         with self.lock:
@@ -1402,6 +1452,12 @@ class FakeGatewayHandler(BaseHTTPRequestHandler):
             return
         if exec_id is not None and path.endswith("/close-stdin"):
             self._write_json({"ok": True})
+            return
+        if exec_id is not None and path.endswith("/signal"):
+            with self.state.lock:
+                self.state.last_exec_signal = int(payload.get("signal") or 0)
+                session = self.state.exec_sessions.get(exec_id)
+            self._write_json({"session": session or {}})
             return
         self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 

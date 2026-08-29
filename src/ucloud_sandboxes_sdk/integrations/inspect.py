@@ -832,19 +832,12 @@ async def _create_sandbox_with_wait(
     *,
     settings: _InspectSettings,
 ) -> AsyncSandboxHandle:
-    return await _retry_scale_up(
-        "sandbox node",
-        timeout_seconds=settings.start_timeout_seconds,
-        retry_interval_seconds=settings.retry_interval_seconds,
-        retry_client_errors=True,
-        retry_timeout_errors=True,
-        operation=lambda timeout_seconds: client.create_sandbox(
-            spec,
-            request_timeout_seconds=min(
-                DEFAULT_SCALE_UP_REQUEST_TIMEOUT_SECONDS,
-                timeout_seconds,
-            ),
-        ),
+    # Sandbox creation already has stable-id replay, retryability checks, and
+    # Retry-After handling in AsyncSandboxClient. A second integration-level
+    # loop can replay permanent failures and distort the server's backoff.
+    return await client.create_sandbox(
+        spec,
+        request_timeout_seconds=settings.start_timeout_seconds,
     )
 
 
@@ -1169,70 +1162,6 @@ async def _sleep_with_deadline(seconds: float, deadline: float) -> None:
 
 def _registry_image(reference: str) -> Image:
     return Image.from_registry(reference)
-
-
-async def _retry_scale_up(
-    label: str,
-    *,
-    timeout_seconds: int,
-    retry_interval_seconds: float,
-    retry_client_errors: bool,
-    retry_timeout_errors: bool,
-    operation: Any,
-) -> Any:
-    timeout_seconds = max(0, int(timeout_seconds))
-    retry_interval_seconds = max(0.0, float(retry_interval_seconds))
-    deadline = time.monotonic() + timeout_seconds
-    attempts = 0
-    last_error: BaseException | None = None
-    while True:
-        attempts += 1
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError(
-                f"Timed out waiting for UCloud {label} readiness "
-                f"after {timeout_seconds}s and {attempts - 1} attempt(s): {last_error}"
-            ) from last_error
-        try:
-            return await operation(max(0.001, remaining))
-        except SandboxApiError as exc:
-            last_error = exc
-            if not _is_retryable_gateway_error(exc):
-                raise
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(
-                    f"Timed out waiting for UCloud {label} readiness "
-                    f"after {timeout_seconds}s and {attempts} attempt(s): {exc}"
-                ) from exc
-            retry_after = exc.retry_after_seconds
-            delay = max(
-                retry_interval_seconds,
-                retry_after if retry_after is not None else 0.0,
-            )
-            await asyncio.sleep(min(delay, remaining))
-        except ClientError as exc:
-            if not retry_client_errors:
-                raise
-            last_error = exc
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(
-                    f"Timed out waiting for UCloud {label} readiness "
-                    f"after {timeout_seconds}s and {attempts} attempt(s): {exc}"
-                ) from exc
-            await asyncio.sleep(min(retry_interval_seconds, remaining))
-        except TimeoutError as exc:
-            if not retry_timeout_errors:
-                raise
-            last_error = exc
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(
-                    f"Timed out waiting for UCloud {label} readiness "
-                    f"after {timeout_seconds}s and {attempts} attempt(s): {exc}"
-                ) from exc
-            await asyncio.sleep(min(retry_interval_seconds, remaining))
 
 
 def _is_retryable_gateway_error(exc: SandboxApiError) -> bool:

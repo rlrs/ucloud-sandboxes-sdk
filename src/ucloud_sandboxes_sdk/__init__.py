@@ -3,8 +3,10 @@ from __future__ import annotations
 from .client import (
     AsyncExecHandle,
     AsyncJobHandle,
+    AsyncProcessStdin,
     AsyncSandboxClient,
     AsyncSandboxHandle,
+    AsyncSandboxProcess,
     ExecEventHistoryLostError,
     Image,
     JobHandle,
@@ -15,6 +17,8 @@ from .client import (
     SandboxHandle,
     SandboxJobLogChunk,
     SandboxJobRecord,
+    SandboxLinuxHostSpec,
+    SandboxProfile,
     SandboxSecuritySpec,
     SandboxSpec,
     SandboxSshSpec,
@@ -23,22 +27,28 @@ from .client import (
 )
 from .relay import (
     AsyncRelayWorkerClient,
+    AsyncRelaySession,
     RelayApiError,
     RelayPollResult,
     RelayRequest,
+    RelayResponse,
+    RelaySession,
     RelayWorkerClient,
     http_tunnel_url,
     model_relay_env,
 )
 
-__version__ = "0.4.14"
+__version__ = "0.4.15"
 
 __all__ = [
     "AsyncExecHandle",
     "AsyncJobHandle",
+    "AsyncProcessStdin",
     "AsyncRelayWorkerClient",
+    "AsyncRelaySession",
     "AsyncSandboxClient",
     "AsyncSandboxHandle",
+    "AsyncSandboxProcess",
     "ExecEventHistoryLostError",
     "Image",
     "JobHandle",
@@ -49,6 +59,8 @@ __all__ = [
     "SandboxHandle",
     "SandboxJobLogChunk",
     "SandboxJobRecord",
+    "SandboxLinuxHostSpec",
+    "SandboxProfile",
     "SandboxSecuritySpec",
     "SandboxSpec",
     "SandboxSshSpec",
@@ -57,6 +69,8 @@ __all__ = [
     "RelayApiError",
     "RelayPollResult",
     "RelayRequest",
+    "RelayResponse",
+    "RelaySession",
     "RelayWorkerClient",
     "__version__",
     "http_tunnel_url",
