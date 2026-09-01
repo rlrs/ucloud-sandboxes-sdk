@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Preserved explicit gateway image-name versus registry-reference intent across
+  sandbox creation, capacity preparation, and image pulls in both sync and
+  async clients, including safe retries for transient pre-dispatch image
+  resolution fences.
+- Made exec event polling adapt to the client's HTTP timeout and use bounded
+  long polls, reducing quiet polling load without delaying output or process
+  completion notifications.
+
 ## 0.4.15 - 2026-08-29
 
 - Added typed `container`/`linux_host` profiles, `SandboxLinuxHostSpec`, and a

@@ -170,6 +170,53 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(raised.exception.expected_sequence, 1)
         self.assertEqual(raised.exception.received_sequence, 2)
 
+    def test_exec_wait_adapts_long_poll_to_transport_timeout(self) -> None:
+        class TerminalClient:
+            timeout_seconds = 5.0
+
+            def __init__(self) -> None:
+                self.waits: list[float] = []
+
+            def read_exec_events(self, *_args: object, **kwargs: object) -> dict:
+                self.waits.append(float(kwargs["wait_seconds"]))
+                return {
+                    "events": [],
+                    "session": {"status": "exited", "exit_code": 0},
+                }
+
+        client = TerminalClient()
+        result = client_module.ExecHandle(
+            client,
+            "exec-adaptive",
+            "sandbox-one",
+        ).wait(timeout_seconds=10)
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(client.waits, [4.0])
+
+    def test_exec_wait_preserves_explicit_poll_duration(self) -> None:
+        class TerminalClient:
+            timeout_seconds = 5.0
+
+            def __init__(self) -> None:
+                self.waits: list[float] = []
+
+            def read_exec_events(self, *_args: object, **kwargs: object) -> dict:
+                self.waits.append(float(kwargs["wait_seconds"]))
+                return {
+                    "events": [],
+                    "session": {"status": "exited", "exit_code": 0},
+                }
+
+        client = TerminalClient()
+        client_module.ExecHandle(
+            client,
+            "exec-explicit",
+            "sandbox-one",
+        ).wait(timeout_seconds=10, poll_wait_seconds=1.25)
+
+        self.assertEqual(client.waits, [1.25])
+
     def test_async_exec_wait_rejects_noncontiguous_event_history(self) -> None:
         class GapClient:
             async def read_exec_events(
@@ -194,6 +241,38 @@ class SandboxSdkTests(unittest.TestCase):
             self.assertEqual(raised.exception.received_sequence, 4)
 
         asyncio.run(scenario())
+
+    def test_async_exec_wait_adapts_long_poll_to_transport_timeout(self) -> None:
+        class TerminalClient:
+            timeout_seconds = 10.0
+
+            def __init__(self) -> None:
+                self.waits: list[float] = []
+
+            async def read_exec_events(
+                self,
+                *_args: object,
+                **kwargs: object,
+            ) -> dict:
+                self.waits.append(float(kwargs["wait_seconds"]))
+                return {
+                    "events": [],
+                    "session": {"status": "exited", "exit_code": 0},
+                }
+
+        async def scenario() -> tuple[int | None, list[float]]:
+            client = TerminalClient()
+            result = await client_module.AsyncExecHandle(
+                client,
+                "exec-async-adaptive",
+                "sandbox-one",
+            ).wait(timeout_seconds=10)
+            return result.exit_code, client.waits
+
+        exit_code, waits = asyncio.run(scenario())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(waits, [8.0])
 
     def test_request_and_local_file_uploads_are_bounded(self) -> None:
         client = SandboxClient("http://gateway.invalid")
@@ -330,6 +409,103 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(ssh_target.port, 22000)
         self.assertEqual(ssh_target.command, "ssh -p 22000 sandbox@127.0.0.1")
         self.assertEqual(deleted["deleted"]["spec"]["id"], "sdk-one")
+
+    def test_sync_image_operations_send_reference_kind_header(self) -> None:
+        observed: list[tuple[str, str]] = []
+
+        def fake_urlopen(req: object, timeout: object = None) -> _SyncResponse:
+            del timeout
+            path = urlparse(str(getattr(req, "full_url", ""))).path
+            headers = {
+                key.lower(): value
+                for key, value in getattr(req, "header_items")()
+            }
+            observed.append(
+                (
+                    path,
+                    headers[client_module.IMAGE_REFERENCE_KIND_HEADER.lower()],
+                )
+            )
+            if path == "/v1/sandboxes":
+                payload = json.loads(getattr(req, "data").decode("utf-8"))
+                return _SyncResponse(
+                    json.dumps({"sandbox": {"spec": payload}}).encode("utf-8"),
+                    status=201,
+                )
+            return _SyncResponse(b"{}")
+
+        client = SandboxClient("http://gateway.invalid")
+        with patch.object(client_module, "open_no_redirect", fake_urlopen):
+            for kind, image in (
+                ("registry", Image.from_registry("busybox")),
+                ("name", Image.from_name("gateway-image")),
+            ):
+                client.create_sandbox(SandboxSpec(id=f"create-{kind}", image=image))
+                client.prepare_capacity(count=1, image=image)
+                client.pull_image(image)
+
+        self.assertEqual(
+            observed,
+            [
+                ("/v1/sandboxes", "registry"),
+                ("/v1/capacity/prepare", "registry"),
+                ("/v1/images/pull", "registry"),
+                ("/v1/sandboxes", "name"),
+                ("/v1/capacity/prepare", "name"),
+                ("/v1/images/pull", "name"),
+            ],
+        )
+
+    def test_async_image_operations_send_reference_kind_header(self) -> None:
+        async def scenario() -> list[tuple[str, str]]:
+            def respond(
+                _method: str,
+                url: object,
+                kwargs: dict[str, object],
+                _call: int,
+            ) -> _AsyncResponse:
+                path = urlparse(str(url)).path
+                if path == "/v1/sandboxes":
+                    payload = dict(kwargs.get("json") or {})
+                    return _AsyncResponse(
+                        json.dumps({"sandbox": {"spec": payload}}),
+                        status=201,
+                    )
+                return _AsyncResponse("{}")
+
+            session = _ScriptedAsyncSession(respond)
+            client = AsyncSandboxClient(
+                "http://gateway.invalid",
+                session=session,
+            )
+            for kind, image in (
+                ("registry", Image.from_registry("busybox")),
+                ("name", Image.from_name("gateway-image")),
+            ):
+                await client.create_sandbox(
+                    SandboxSpec(id=f"create-async-{kind}", image=image)
+                )
+                await client.prepare_capacity(count=1, image=image)
+                await client.pull_image(image)
+            return [
+                (
+                    urlparse(str(url)).path,
+                    str(dict(kwargs["headers"])[client_module.IMAGE_REFERENCE_KIND_HEADER]),
+                )
+                for _method, url, kwargs in session.requests
+            ]
+
+        self.assertEqual(
+            asyncio.run(scenario()),
+            [
+                ("/v1/sandboxes", "registry"),
+                ("/v1/capacity/prepare", "registry"),
+                ("/v1/images/pull", "registry"),
+                ("/v1/sandboxes", "name"),
+                ("/v1/capacity/prepare", "name"),
+                ("/v1/images/pull", "name"),
+            ],
+        )
 
     def test_sync_client_image_cache_methods(self) -> None:
         with docker_context() as context, running_gateway() as gateway:
@@ -681,6 +857,53 @@ class SandboxSdkTests(unittest.TestCase):
                 delta=0.01,
             )
 
+    def test_sync_client_retries_incomplete_image_inventory_before_dispatch(
+        self,
+    ) -> None:
+        attempts: dict[str, int] = {}
+        observed: list[tuple[str, bytes]] = []
+
+        def fake_urlopen(req: object, timeout: object = None) -> object:
+            del timeout
+            path = urlparse(str(getattr(req, "full_url", ""))).path
+            body = bytes(getattr(req, "data", b""))
+            observed.append((path, body))
+            attempts[path] = attempts.get(path, 0) + 1
+            if attempts[path] == 1:
+                raise client_module.error.HTTPError(
+                    str(getattr(req, "full_url", "")),
+                    503,
+                    "Service Unavailable",
+                    {"Retry-After": "0"},
+                    io.BytesIO(
+                        b'{"error":"image inventory is temporarily incomplete",'
+                        b'"error_code":"image_inventory_incomplete",'
+                        b'"retryable":true}'
+                    ),
+                )
+            return _SyncResponse(b"{}")
+
+        client = SandboxClient("http://gateway.invalid")
+        image = Image.from_name("gateway-image")
+        with (
+            patch.object(client_module, "open_no_redirect", fake_urlopen),
+            patch.object(client_module.time, "sleep", lambda _delay: None),
+        ):
+            client.prepare_capacity(count=1, image=image)
+            client.pull_image(image)
+
+        self.assertEqual(
+            [path for path, _body in observed],
+            [
+                "/v1/capacity/prepare",
+                "/v1/capacity/prepare",
+                "/v1/images/pull",
+                "/v1/images/pull",
+            ],
+        )
+        self.assertEqual(observed[0][1], observed[1][1])
+        self.assertEqual(observed[2][1], observed[3][1])
+
     def test_sync_create_uses_extended_retries_while_node_scales_up(self) -> None:
         calls = 0
 
@@ -967,6 +1190,63 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(sandbox_id, "tmax-task-async")
         self.assertEqual(len(payloads), 2)
         self.assertEqual(payloads[0], payloads[1])
+
+    def test_async_client_retries_incomplete_image_inventory_before_dispatch(
+        self,
+    ) -> None:
+        async def no_sleep(_delay: float) -> None:
+            return None
+
+        async def scenario() -> list[tuple[str, dict[str, object]]]:
+            attempts: dict[str, int] = {}
+
+            def respond(
+                _method: str,
+                url: object,
+                _kwargs: dict[str, object],
+                _call: int,
+            ) -> _AsyncResponse:
+                path = urlparse(str(url)).path
+                attempts[path] = attempts.get(path, 0) + 1
+                return _AsyncResponse(
+                    (
+                        '{"error":"image inventory is temporarily incomplete",'
+                        '"error_code":"image_inventory_incomplete",'
+                        '"retryable":true}'
+                        if attempts[path] == 1
+                        else "{}"
+                    ),
+                    status=503 if attempts[path] == 1 else 200,
+                    headers={"Retry-After": "0"},
+                )
+
+            session = _ScriptedAsyncSession(respond)
+            client = AsyncSandboxClient(
+                "http://gateway.invalid",
+                session=session,
+            )
+            image = Image.from_name("gateway-image")
+            with patch.object(client_module.asyncio, "sleep", no_sleep):
+                await client.prepare_capacity(count=1, image=image)
+                await client.pull_image(image)
+            return [
+                (urlparse(str(url)).path, dict(kwargs.get("json") or {}))
+                for _method, url, kwargs in session.requests
+            ]
+
+        observed = asyncio.run(scenario())
+
+        self.assertEqual(
+            [path for path, _payload in observed],
+            [
+                "/v1/capacity/prepare",
+                "/v1/capacity/prepare",
+                "/v1/images/pull",
+                "/v1/images/pull",
+            ],
+        )
+        self.assertEqual(observed[0][1], observed[1][1])
+        self.assertEqual(observed[2][1], observed[3][1])
 
     def test_async_create_uses_extended_retries_while_node_scales_up(self) -> None:
         async def no_sleep(_delay: float) -> None:

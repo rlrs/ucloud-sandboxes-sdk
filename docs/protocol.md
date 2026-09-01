@@ -67,6 +67,14 @@ configured without sandbox networking.
 The SDK requires `image` to be an `Image` helper. `Image.from_registry(...)`
 sends a registry tag, `Image.from_name(...)` sends a gateway image id, and
 `Image.from_dockerfile(...)` carries build metadata for `build_image()`.
+For sandbox creation, prepared capacity, and explicit image pulls, the SDK also
+sends `X-UCloud-Image-Reference-Kind: registry` or `name`. This preserves the
+distinction for bare values such as `busybox`, which can otherwise be either a
+valid registry tag or an image id. The header is backward compatible: older
+gateways ignore it, and an omitted header (or explicit `auto`) retains legacy
+best-effort resolution. A `name` request fails clearly when a complete inventory
+does not contain the id and returns a retryable error while inventory is partial;
+a `registry` request never probes image ids.
 The gateway owns placement and may return `503` while nodes are scaling up.
 
 The Inspect AI provider reads `UCLOUD_SANDBOX_SECURITY` as a JSON object and
@@ -137,6 +145,10 @@ builder/control-plane Docker daemon and should not be treated as portable.
 
 Exec is session based. `POST /v1/sandboxes/<id>/exec` starts a session and
 returns a session object. The SDK then polls `GET /v1/exec/<session>/events`.
+High-level clients use an adaptive long-poll duration capped at 20 seconds and
+80% of the configured HTTP timeout. The server wakes the request as soon as an
+event or terminal state is available, so this reduces idle request volume
+without delaying output.
 Events are ordered by integer `sequence`; clients pass `after` to avoid
 re-reading events. A missing, repeated, or out-of-order sequence raises
 `ExecEventHistoryLostError`; the SDK never returns partial output as complete.

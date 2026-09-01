@@ -43,6 +43,16 @@ JsonObject = dict[str, Any]
 TERMINAL_EXEC_STATUSES = {"exited", "failed"}
 TERMINAL_JOB_STATES = {"exited", "signaled", "failed"}
 SANDBOX_TOKEN_HEADER = "X-UCloud-Sandbox-Token"
+IMAGE_REFERENCE_KIND_HEADER = "X-UCloud-Image-Reference-Kind"
+IMAGE_RESOLUTION_PRE_DISPATCH_ERROR_CODES = frozenset(
+    {
+        "image_inventory_incomplete",
+        "managed_registry_digest_protection_unavailable",
+    }
+)
+IMAGE_RESOLUTION_PRE_DISPATCH_PATHS = frozenset(
+    {"/v1/capacity/prepare", "/v1/images/pull"}
+)
 UCLOUD_UNAVAILABLE_STATUS = 503
 UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS = 6
 UCLOUD_CREATE_RETRY_ATTEMPTS = 16
@@ -51,6 +61,7 @@ UCLOUD_UNAVAILABLE_RETRY_MAX_DELAY_SECONDS = 4.0
 UCLOUD_CREATE_RETRY_MAX_DELAY_SECONDS = 30.0
 UCLOUD_RETRY_AFTER_JITTER_RATIO = 0.25
 DEFAULT_CREATE_TIMEOUT_SECONDS = 10 * 60.0
+DEFAULT_EXEC_EVENT_WAIT_SECONDS = 20.0
 MAX_JSON_BODY_BYTES = 16 * 1024 * 1024
 MAX_FILE_BODY_BYTES = 256 * 1024 * 1024
 MAX_JSON_RESPONSE_BYTES = 16 * 1024 * 1024
@@ -78,6 +89,16 @@ DEFAULT_LINUX_HOST_WRITABLE_PATHS = (
     "/workspace",
 )
 SandboxProfile = Literal["container", "linux_host"]
+
+
+def _exec_event_wait_seconds(client: object, requested: float | None) -> float:
+    if requested is not None:
+        return max(0.0, float(requested))
+    timeout = float(getattr(client, "timeout_seconds", 30.0))
+    # Keep margin for connection setup, ingress and response decoding. The
+    # server wakes long polls immediately when output or completion arrives,
+    # so a longer quiet wait reduces request volume without adding latency.
+    return max(0.0, min(DEFAULT_EXEC_EVENT_WAIT_SECONDS, timeout * 0.8))
 
 
 class SandboxApiError(RuntimeError):
@@ -544,6 +565,10 @@ class _DirectSandboxOperations:
                 ttl_seconds=ttl_seconds,
                 prepare_id=prepare_id,
             ),
+            extra_headers=_image_reference_headers(
+                image,
+                pull_reference=True,
+            ),
         )
 
     def delete_prepared_capacity(self, prepare_id: str) -> JsonObject:
@@ -678,7 +703,12 @@ class _DirectSandboxOperations:
             disk_mb=disk_mb,
             sandbox_nodes_only=sandbox_nodes_only,
         )
-        return self._request_json("POST", "/v1/images/pull", payload=payload)
+        return self._request_json(
+            "POST",
+            "/v1/images/pull",
+            payload=payload,
+            extra_headers=_image_reference_headers(image, pull_reference=True),
+        )
 
 
 @dataclass
@@ -892,15 +922,16 @@ class ExecHandle(_ExecState):
     def events(
         self,
         *,
-        wait_seconds: float = 30.0,
+        wait_seconds: float | None = None,
         limit: int = 100,
     ) -> Iterator[JsonObject]:
+        resolved_wait_seconds = _exec_event_wait_seconds(self.client, wait_seconds)
         while True:
             payload = self.client.read_exec_events(
                 self.session_id,
                 after=self.last_sequence,
                 limit=limit,
-                wait_seconds=wait_seconds,
+                wait_seconds=resolved_wait_seconds,
             )
             events = self._accept_events(payload)
             for event in events:
@@ -912,16 +943,20 @@ class ExecHandle(_ExecState):
         self,
         *,
         timeout_seconds: float | None = None,
-        poll_wait_seconds: float = 1.0,
+        poll_wait_seconds: float | None = None,
         settle_seconds: float = 0.2,
     ) -> SandboxExecResult:
         events: list[JsonObject] = []
         deadline = _deadline(timeout_seconds)
         terminal_seen = False
+        resolved_poll_wait = _exec_event_wait_seconds(
+            self.client,
+            poll_wait_seconds,
+        )
         while True:
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(f"exec session timed out: {self.session_id}")
-            wait_seconds = settle_seconds if terminal_seen else poll_wait_seconds
+            wait_seconds = settle_seconds if terminal_seen else resolved_poll_wait
             if deadline is not None:
                 wait_seconds = min(wait_seconds, max(0.0, deadline - time.monotonic()))
             payload = self.client.read_exec_events(
@@ -1049,6 +1084,7 @@ class SandboxClient(_DirectSandboxOperations):
             "POST",
             "/v1/sandboxes",
             payload=spec.to_dict(),
+            extra_headers=_image_reference_headers(spec.image),
             timeout_seconds=(
                 DEFAULT_CREATE_TIMEOUT_SECONDS
                 if request_timeout_seconds is None
@@ -1327,6 +1363,7 @@ class SandboxClient(_DirectSandboxOperations):
         body_size: int | None = None,
         content_type: str | None = None,
         timeout_seconds: float | None = None,
+        extra_headers: Mapping[str, str] | None = None,
     ) -> JsonObject:
         raw_body, headers, streamed_body = _node_request_content(
             self.headers,
@@ -1334,6 +1371,7 @@ class SandboxClient(_DirectSandboxOperations):
             body,
             body_size,
             content_type,
+            extra_headers,
         )
         timeout = self.timeout_seconds if timeout_seconds is None else timeout_seconds
         deadline = _deadline(timeout)
@@ -1582,15 +1620,16 @@ class AsyncExecHandle(_ExecState):
     async def events(
         self,
         *,
-        wait_seconds: float = 30.0,
+        wait_seconds: float | None = None,
         limit: int = 100,
     ) -> AsyncIterator[JsonObject]:
+        resolved_wait_seconds = _exec_event_wait_seconds(self.client, wait_seconds)
         while True:
             payload = await self.client.read_exec_events(
                 self.session_id,
                 after=self.last_sequence,
                 limit=limit,
-                wait_seconds=wait_seconds,
+                wait_seconds=resolved_wait_seconds,
             )
             events = self._accept_events(payload)
             for event in events:
@@ -1602,16 +1641,20 @@ class AsyncExecHandle(_ExecState):
         self,
         *,
         timeout_seconds: float | None = None,
-        poll_wait_seconds: float = 1.0,
+        poll_wait_seconds: float | None = None,
         settle_seconds: float = 0.2,
     ) -> SandboxExecResult:
         events: list[JsonObject] = []
         deadline = _deadline(timeout_seconds)
         terminal_seen = False
+        resolved_poll_wait = _exec_event_wait_seconds(
+            self.client,
+            poll_wait_seconds,
+        )
         while True:
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(f"exec session timed out: {self.session_id}")
-            wait_seconds = settle_seconds if terminal_seen else poll_wait_seconds
+            wait_seconds = settle_seconds if terminal_seen else resolved_poll_wait
             if deadline is not None:
                 wait_seconds = min(wait_seconds, max(0.0, deadline - time.monotonic()))
             payload = await self.client.read_exec_events(
@@ -1742,7 +1785,7 @@ class AsyncSandboxProcess:
 
     async def _pump(self) -> None:
         try:
-            async for event in self.handle.events(wait_seconds=1.0):
+            async for event in self.handle.events():
                 stream = event.get("stream")
                 data = event.get("data")
                 if isinstance(data, str) and data:
@@ -1953,6 +1996,7 @@ class AsyncSandboxClient(_DirectSandboxOperations):
             "POST",
             "/v1/sandboxes",
             payload=spec.to_dict(),
+            extra_headers=_image_reference_headers(spec.image),
             timeout_seconds=(
                 DEFAULT_CREATE_TIMEOUT_SECONDS
                 if request_timeout_seconds is None
@@ -2343,6 +2387,7 @@ class AsyncSandboxClient(_DirectSandboxOperations):
         body_size: int | None = None,
         content_type: str | None = None,
         timeout_seconds: float | None = None,
+        extra_headers: Mapping[str, str] | None = None,
     ) -> JsonObject:
         _, headers, streamed_body = _node_request_content(
             self.headers,
@@ -2350,6 +2395,7 @@ class AsyncSandboxClient(_DirectSandboxOperations):
             body,
             body_size,
             content_type,
+            extra_headers,
         )
         timeout = self.timeout_seconds if timeout_seconds is None else timeout_seconds
         raw, status, received_headers = await self._send(
@@ -2557,6 +2603,26 @@ def _image_reference(image: object) -> str:
     if not isinstance(image, Image):
         raise TypeError("sandbox image must be an Image")
     return image.reference
+
+
+def _image_reference_headers(
+    image: Image | None,
+    *,
+    pull_reference: bool = False,
+) -> dict[str, str]:
+    if image is None:
+        return {}
+    if not isinstance(image, Image):
+        raise TypeError("sandbox image must be an Image")
+    if pull_reference and image.tag is not None:
+        kind = "registry"
+    elif image.name is not None:
+        kind = "name"
+    elif image.tag is not None:
+        kind = "registry"
+    else:
+        return {}
+    return {IMAGE_REFERENCE_KIND_HEADER: kind}
 
 
 def _image_pull_reference(image: Image) -> str:
@@ -2938,6 +3004,7 @@ def _node_request_content(
     body: bytes | BinaryIO | None,
     body_size: int | None,
     content_type: str | None,
+    extra_headers: Mapping[str, str] | None,
 ) -> tuple[bytes | BinaryIO | None, dict[str, str], bool]:
     serialized = json.dumps(payload).encode("utf-8") if payload is not None else None
     request_body = serialized if serialized is not None else body
@@ -2948,6 +3015,7 @@ def _node_request_content(
     if known_size is not None and known_size > body_limit:
         raise SandboxApiError(f"request body exceeds the {body_limit} byte limit")
     headers = dict(default_headers)
+    headers.update(dict(extra_headers or {}))
     if payload is not None:
         headers["Content-Type"] = "application/json"
     elif content_type is not None:
@@ -3057,12 +3125,21 @@ def _should_retry_ucloud_unavailable(
     max_attempts: int = UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS,
 ) -> bool:
     normalized_method = method.upper()
+    error_code = body.get("error_code") if isinstance(body, dict) else None
+    image_resolution_fence = (
+        normalized_method == "POST"
+        and path in IMAGE_RESOLUTION_PRE_DISPATCH_PATHS
+        and error_code in IMAGE_RESOLUTION_PRE_DISPATCH_ERROR_CODES
+    )
     pre_dispatch_fence = (
         status_code in {408, 425, 429, 500, 502, 503, 504}
         and isinstance(body, dict)
         and body.get("retryable") is True
-        and body.get("error_code")
-        in {"snapshot_publication_pending", "node_active_exec_deferred"}
+        and (
+            error_code
+            in {"snapshot_publication_pending", "node_active_exec_deferred"}
+            or image_resolution_fence
+        )
     )
     stable_create = normalized_method == "POST" and path == "/v1/sandboxes"
     attempt_limit = (
@@ -3073,9 +3150,9 @@ def _should_retry_ucloud_unavailable(
     if attempt >= attempt_limit - 1:
         return False
     if pre_dispatch_fence:
-        # The gateway returns these exact fences before an exec/file/wake
-        # request is dispatched. Replaying them is therefore safe even for
-        # methods that are not generally idempotent.
+        # The gateway returns these exact fences before downstream work is
+        # dispatched. Replaying them is therefore safe even for methods that
+        # are not generally idempotent.
         return True
     if (
         status_code in {408, 425, 429, 500, 502, 503, 504}
