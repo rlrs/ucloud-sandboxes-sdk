@@ -3137,7 +3137,11 @@ def _should_retry_ucloud_unavailable(
         and body.get("retryable") is True
         and (
             error_code
-            in {"snapshot_publication_pending", "node_active_exec_deferred"}
+            in {
+                "http_request_capacity_exhausted",
+                "snapshot_publication_pending",
+                "node_active_exec_deferred",
+            }
             or image_resolution_fence
         )
     )

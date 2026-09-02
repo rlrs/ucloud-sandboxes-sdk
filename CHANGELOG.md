@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.4.16 - 2026-09-03
+
+- Retry the service's explicit `http_request_capacity_exhausted` pre-dispatch
+  fence for synchronous and asynchronous requests, including exec starts and
+  cleanup. Generic retryable 503 responses remain non-replayable for mutating
+  methods because they do not prove the request was rejected before dispatch.
+
 - Preserved explicit gateway image-name versus registry-reference intent across
   sandbox creation, capacity preparation, and image pulls in both sync and
   async clients, including safe retries for transient pre-dispatch image

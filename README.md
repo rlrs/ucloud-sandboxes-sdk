@@ -106,8 +106,10 @@ an operation reaches the gateway during that exact pre-dispatch window, the
 gateway returns `snapshot_publication_pending`; synchronous and asynchronous
 SDK clients retry that fence automatically. They also retry
 `node_active_exec_deferred`, which is emitted before an exec is dispatched when
-measured node pressure is temporarily high. Other non-idempotent exec errors
-are surfaced without replay, so an ambiguous command is never run twice.
+measured node pressure is temporarily high, and
+`http_request_capacity_exhausted`, which guarantees that HTTP admission rejected
+the request before its handler ran. Other non-idempotent exec errors are surfaced
+without replay, so an ambiguous command is never run twice.
 
 For a long-lived agent that must survive relay-driven park/wake and migration,
 create a managed-process sandbox without an initial command and use
