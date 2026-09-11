@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import inspect
 import json
+import math
 import os
 from threading import Event, Thread
 import time
@@ -32,6 +33,7 @@ JsonObject = dict[str, Any]
 MAX_RELAY_JSON_BYTES = 32 * 1024 * 1024
 MAX_RELAY_HTTP_BODY_BYTES = MAX_RELAY_JSON_BYTES // 2
 RELAY_POLL_TIMEOUT_GRACE_SECONDS = 5.0
+DEFAULT_FORWARD_TIMEOUT_SECONDS = 7200.0
 AGENT_LIFECYCLE_METADATA_KEY = "_ucloud_agent_lifecycle"
 MANAGED_AGENT_LIFECYCLE = "managed-process-v1"
 
@@ -223,11 +225,13 @@ class RelayWorkerClient(_RelayWorkerState):
         *,
         worker_token: str | None = None,
         timeout_seconds: float = 30.0,
+        forward_timeout_seconds: float = DEFAULT_FORWARD_TIMEOUT_SECONDS,
         headers: Mapping[str, str] | None = None,
     ) -> None:
         super().__init__()
         self.relay_url = relay_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
+        self.forward_timeout_seconds = _forward_timeout(forward_timeout_seconds)
         self.headers = dict(headers or {})
         if worker_token is not None:
             self.headers["Authorization"] = f"Bearer {worker_token}"
@@ -238,6 +242,7 @@ class RelayWorkerClient(_RelayWorkerState):
         *,
         env: Mapping[str, str] | None = None,
         timeout_seconds: float | None = None,
+        forward_timeout_seconds: float | None = None,
         headers: Mapping[str, str] | None = None,
     ) -> "RelayWorkerClient":
         values = os.environ if env is None else env
@@ -252,6 +257,15 @@ class RelayWorkerClient(_RelayWorkerState):
                 )
                 if timeout_seconds is None
                 else timeout_seconds
+            ),
+            forward_timeout_seconds=(
+                _positive_env_float(
+                    values,
+                    "UCLOUD_RELAY_FORWARD_TIMEOUT_SECONDS",
+                    default=DEFAULT_FORWARD_TIMEOUT_SECONDS,
+                )
+                if forward_timeout_seconds is None
+                else forward_timeout_seconds
             ),
             headers=headers,
         )
@@ -474,6 +488,9 @@ class RelayWorkerClient(_RelayWorkerState):
         timeout_seconds: float | None = None,
     ) -> JsonObject:
         _validate_http_body_size(relay_request.body_bytes)
+        timeout = _forward_timeout(
+            self.forward_timeout_seconds if timeout_seconds is None else timeout_seconds
+        )
         upstream_request = request.Request(
             upstream_base_url.rstrip("/") + relay_request.endpoint,
             data=relay_request.body_bytes or None,
@@ -483,17 +500,15 @@ class RelayWorkerClient(_RelayWorkerState):
         try:
             upstream = open_no_redirect(
                 upstream_request,
-                timeout=timeout_seconds or self.timeout_seconds,
+                timeout=timeout,
             )
         except error.HTTPError as exc:
             upstream = exc
         except OSError as exc:
             return self.commit_response_bytes_to(
                 relay_request,
-                json.dumps({"error": f"upstream request failed: {exc}"}).encode(
-                    "utf-8"
-                ),
-                status=502,
+                _forward_error_body(exc, timeout),
+                status=504 if _is_forward_timeout(exc) else 502,
                 headers={"Content-Type": "application/json"},
             )
         try:
@@ -502,6 +517,13 @@ class RelayWorkerClient(_RelayWorkerState):
             headers = _safe_http_headers(dict(upstream.headers))
         except ResponseTooLargeError as exc:
             raise RelayApiError(str(exc)) from exc
+        except OSError as exc:
+            return self.commit_response_bytes_to(
+                relay_request,
+                _forward_error_body(exc, timeout),
+                status=504 if _is_forward_timeout(exc) else 502,
+                headers={"Content-Type": "application/json"},
+            )
         finally:
             upstream.close()
         return self.commit_response_bytes_to(
@@ -603,12 +625,14 @@ class AsyncRelayWorkerClient(_RelayWorkerState):
         *,
         worker_token: str | None = None,
         timeout_seconds: float = 30.0,
+        forward_timeout_seconds: float = DEFAULT_FORWARD_TIMEOUT_SECONDS,
         headers: Mapping[str, str] | None = None,
         session: Any | None = None,
     ) -> None:
         super().__init__()
         self.relay_url = relay_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
+        self.forward_timeout_seconds = _forward_timeout(forward_timeout_seconds)
         self.headers = dict(headers or {})
         if worker_token is not None:
             self.headers["Authorization"] = f"Bearer {worker_token}"
@@ -621,6 +645,7 @@ class AsyncRelayWorkerClient(_RelayWorkerState):
         *,
         env: Mapping[str, str] | None = None,
         timeout_seconds: float | None = None,
+        forward_timeout_seconds: float | None = None,
         headers: Mapping[str, str] | None = None,
         session: Any | None = None,
     ) -> "AsyncRelayWorkerClient":
@@ -636,6 +661,15 @@ class AsyncRelayWorkerClient(_RelayWorkerState):
                 )
                 if timeout_seconds is None
                 else timeout_seconds
+            ),
+            forward_timeout_seconds=(
+                _positive_env_float(
+                    values,
+                    "UCLOUD_RELAY_FORWARD_TIMEOUT_SECONDS",
+                    default=DEFAULT_FORWARD_TIMEOUT_SECONDS,
+                )
+                if forward_timeout_seconds is None
+                else forward_timeout_seconds
             ),
             headers=headers,
             session=session,
@@ -871,14 +905,16 @@ class AsyncRelayWorkerClient(_RelayWorkerState):
         timeout_seconds: float | None = None,
     ) -> JsonObject:
         _validate_http_body_size(relay_request.body_bytes)
+        timeout = _forward_timeout(
+            self.forward_timeout_seconds if timeout_seconds is None else timeout_seconds
+        )
         client = await self._client()
         request_options: dict[str, Any] = {
             "data": relay_request.body_bytes or None,
             "headers": _safe_http_headers(relay_request.headers),
             "allow_redirects": False,
+            "timeout": timeout,
         }
-        if timeout_seconds is not None:
-            request_options["timeout"] = timeout_seconds
         try:
             async with client.request(
                 relay_request.method,
@@ -895,10 +931,8 @@ class AsyncRelayWorkerClient(_RelayWorkerState):
         except Exception as exc:
             return await self.commit_response_bytes_to(
                 relay_request,
-                json.dumps({"error": f"upstream request failed: {exc}"}).encode(
-                    "utf-8"
-                ),
-                status=502,
+                _forward_error_body(exc, timeout),
+                status=504 if _is_forward_timeout(exc) else 502,
                 headers={"Content-Type": "application/json"},
             )
         return await self.commit_response_bytes_to(
@@ -961,9 +995,7 @@ class AsyncRelayWorkerClient(_RelayWorkerState):
                 headers=headers,
                 allow_redirects=False,
                 timeout=(
-                    self.timeout_seconds
-                    if timeout_seconds is None
-                    else timeout_seconds
+                    self.timeout_seconds if timeout_seconds is None else timeout_seconds
                 ),
             ) as response:
                 try:
@@ -1255,9 +1287,8 @@ def _run_sync_worker(
                 poll_errors = 0
             except RelayApiError as exc:
                 poll_errors += 1
-                if (
-                    not _relay_error_is_retryable(exc)
-                    or poll_errors >= max(1, max_consecutive_poll_errors)
+                if not _relay_error_is_retryable(exc) or poll_errors >= max(
+                    1, max_consecutive_poll_errors
                 ):
                     raise
                 stop.wait(_relay_retry_delay(exc, poll_errors))
@@ -1303,8 +1334,8 @@ async def _run_async_worker(
     try:
         while not stop.is_set():
             completed = {task for task in tasks if task.done()}
-            tasks.difference_update(completed)
             for task in completed:
+                tasks.remove(task)
                 task.result()
             available = max_concurrency - len(tasks)
             if available <= 0:
@@ -1322,9 +1353,8 @@ async def _run_async_worker(
                 poll_errors = 0
             except RelayApiError as exc:
                 poll_errors += 1
-                if (
-                    not _relay_error_is_retryable(exc)
-                    or poll_errors >= max(1, max_consecutive_poll_errors)
+                if not _relay_error_is_retryable(exc) or poll_errors >= max(
+                    1, max_consecutive_poll_errors
                 ):
                     raise
                 await _wait_async_cancel(stop, _relay_retry_delay(exc, poll_errors))
@@ -1343,16 +1373,16 @@ async def _run_async_worker(
                         )
                     )
                 )
-    except asyncio.CancelledError:
+        if tasks:
+            await asyncio.gather(*tasks)
+    except BaseException:
+        # Preserve the triggering failure (or external cancellation). Cleanup
+        # failures in sibling requests must not replace its traceback.
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-            tasks.clear()
         raise
-    finally:
-        if tasks:
-            await asyncio.gather(*tasks)
 
 
 def _handle_sync_request(
@@ -1426,27 +1456,54 @@ async def _handle_async_request(
         )
     )
     try:
-        if _is_streaming_model_request(relay_request):
-            await client.error_request(
-                relay_request,
-                "streaming model requests are not supported by the relay protocol",
-                status=400,
-            )
-        elif upstream_base_url is not None:
-            await client.forward_to(relay_request, upstream_base_url)
-        else:
-            assert handler is not None
-            result = handler(relay_request)
-            if inspect.isawaitable(result):
-                result = await result
-            await _commit_async_handler_result(client, relay_request, result)
-    except RelayApiError:
+        try:
+            if _is_streaming_model_request(relay_request):
+                await client.error_request(
+                    relay_request,
+                    "streaming model requests are not supported by the relay protocol",
+                    status=400,
+                )
+            elif upstream_base_url is not None:
+                await client.forward_to(relay_request, upstream_base_url)
+            else:
+                assert handler is not None
+                result = handler(relay_request)
+                if inspect.isawaitable(result):
+                    result = await result
+                await _commit_async_handler_result(client, relay_request, result)
+        except RelayApiError:
+            raise
+        except Exception as exc:
+            await client.error_request(relay_request, str(exc) or type(exc).__name__)
+    except BaseException:
+        stop.set()
+        renewer.cancel()
+        await asyncio.gather(renewer, return_exceptions=True)
         raise
-    except Exception as exc:
-        await client.error_request(relay_request, str(exc))
-    finally:
+    else:
         stop.set()
         await renewer
+
+
+def _forward_timeout(value: float) -> float:
+    if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
+        raise ValueError("forward timeout must be finite and positive")
+    return float(value)
+
+
+def _is_forward_timeout(exc: Exception) -> bool:
+    cause = exc.reason if isinstance(exc, error.URLError) else exc
+    return isinstance(cause, (TimeoutError, asyncio.TimeoutError))
+
+
+def _forward_error_body(exc: Exception, timeout: float) -> bytes:
+    if _is_forward_timeout(exc):
+        message = (
+            f"upstream request timed out (forwarding timeout: {timeout:g} seconds)"
+        )
+    else:
+        message = f"upstream request failed: {str(exc) or type(exc).__name__}"
+    return json.dumps({"error": message}).encode("utf-8")
 
 
 def _renew_sync_lease(
@@ -1574,9 +1631,7 @@ async def _commit_async_handler_result(
 
 def _is_streaming_model_request(relay_request: RelayRequest) -> bool:
     path = relay_request.endpoint.partition("?")[0].rstrip("/")
-    model_endpoint = path.endswith(
-        ("/chat/completions", "/completions", "/responses")
-    )
+    model_endpoint = path.endswith(("/chat/completions", "/completions", "/responses"))
     return (
         model_endpoint
         and isinstance(relay_request.body, Mapping)
@@ -1668,9 +1723,7 @@ def _registration_payload(
         and any(field in metadata for field in ("sandbox_id", "sandbox_generation"))
         and metadata.get(AGENT_LIFECYCLE_METADATA_KEY) != MANAGED_AGENT_LIFECYCLE
     ):
-        raise RelayApiError(
-            "sandbox-bound rollouts must use register_agent_rollout()"
-        )
+        raise RelayApiError("sandbox-bound rollouts must use register_agent_rollout()")
     payload: JsonObject = {"rollout_id": rollout_id}
     if metadata is not None:
         payload["metadata"] = dict(metadata)

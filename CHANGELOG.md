@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 0.4.17 - 2026-09-11
+
+- Separate upstream forwarding timeouts from gateway control-call timeouts in
+  sync and async relay clients. Forwarding defaults to 7,200 seconds and accepts
+  `forward_timeout_seconds` or `UCLOUD_RELAY_FORWARD_TIMEOUT_SECONDS`; explicit
+  per-request deadlines override injected HTTP session defaults.
+- Report upstream timeouts as HTTP 504 with a descriptive error and the
+  configured forwarding budget, including synchronous response-body timeouts.
+- Preserve the original async worker or forwarding exception while cancelling
+  and draining sibling requests and lease-renewal tasks.
+- Document client-side rollout supervision that surfaces worker failures before
+  cancellation cleanup.
+
 ## 0.4.16 - 2026-09-03
 
 - Retry the service's explicit `http_request_capacity_exhausted` pre-dispatch

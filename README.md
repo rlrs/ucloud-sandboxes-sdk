@@ -13,9 +13,9 @@ Install the versioned wheel from the GitHub release (the SDK is not currently
 published on PyPI):
 
 ```bash
-uv add "ucloud-sandboxes-sdk @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.15/ucloud_sandboxes_sdk-0.4.15-py3-none-any.whl"
-uv add "ucloud-sandboxes-sdk[async] @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.15/ucloud_sandboxes_sdk-0.4.15-py3-none-any.whl"
-uv add "ucloud-sandboxes-sdk[inspect] @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.15/ucloud_sandboxes_sdk-0.4.15-py3-none-any.whl"
+uv add "ucloud-sandboxes-sdk @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.17/ucloud_sandboxes_sdk-0.4.17-py3-none-any.whl"
+uv add "ucloud-sandboxes-sdk[async] @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.17/ucloud_sandboxes_sdk-0.4.17-py3-none-any.whl"
+uv add "ucloud-sandboxes-sdk[inspect] @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.17/ucloud_sandboxes_sdk-0.4.17-py3-none-any.whl"
 ```
 
 Use the base package for the synchronous client, the `async` extra for
@@ -261,8 +261,50 @@ with relay.rollout_session(
 Use `AsyncRelayWorkerClient` for async workers; it exposes the same methods with
 `await`. `from_env()` reads `UCLOUD_RELAY_URL`,
 `UCLOUD_RELAY_WORKER_TOKEN`, and optional `UCLOUD_RELAY_TIMEOUT_SECONDS`.
+Upstream forwarding has its own `forward_timeout_seconds` budget (default
+7,200 seconds), also configurable with `UCLOUD_RELAY_FORWARD_TIMEOUT_SECONDS`.
+Gateway control calls retain their separate 30-second default. For example,
+`AsyncRelayWorkerClient.from_env(forward_timeout_seconds=1800)` allows long
+model generations without lengthening control-call timeouts. A per-call
+`forward_to(..., timeout_seconds=...)` overrides the forwarding budget, including
+when using an injected HTTP session. Async forwarding applies a total request
+deadline; synchronous forwarding uses the underlying socket timeout.
+
+Choose a budget that covers queueing, prefill and generation: 8,192 output tokens
+at 26 tokens/second already require about 315 seconds. The gateway request
+lifetime and the outer rollout deadline must also accommodate that work.
+Upstream timeouts are returned as HTTP 504 with the configured budget in the
+error message. This setting controls `forward_to` and `run_worker` with
+`upstream_base_url`; custom handlers must configure their own model client.
+
 Streaming model requests (`stream: true`) are rejected with a clear client
 error because the current relay protocol buffers one complete response.
+
+When supervising a rollout and a background relay worker, await the worker's
+result before reporting cancellation of the rollout. A callback that only
+cancels the rollout can hide the worker's original error. This pattern retains
+the primary error while draining both tasks:
+
+```python
+rollout_task = asyncio.create_task(run_rollout())
+worker_task = asyncio.create_task(relay.run_worker(
+    rollout_id, upstream_base_url=model_url,
+))
+try:
+    done, _ = await asyncio.wait(
+        {rollout_task, worker_task}, return_when=asyncio.FIRST_COMPLETED,
+    )
+    if worker_task in done:
+        await worker_task  # Propagate the actual worker failure.
+        if not rollout_task.done():
+            raise RuntimeError("relay worker stopped before rollout completed")
+    result = await rollout_task
+finally:
+    for task in (rollout_task, worker_task):
+        if not task.done():
+            task.cancel()
+    await asyncio.gather(rollout_task, worker_task, return_exceptions=True)
+```
 
 ### General HTTP tunnel
 
