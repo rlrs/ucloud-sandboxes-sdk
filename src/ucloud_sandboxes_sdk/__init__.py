@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .network_policy import SandboxNetworkPolicy
 from .client import (
     AsyncExecHandle,
     AsyncJobHandle,
@@ -61,6 +62,7 @@ __all__ = [
     "SandboxJobRecord",
     "SandboxLinuxHostSpec",
     "SandboxProfile",
+    "SandboxNetworkPolicy",
     "SandboxSecuritySpec",
     "SandboxSpec",
     "SandboxSshSpec",

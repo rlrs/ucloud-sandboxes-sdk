@@ -29,6 +29,7 @@ from typing import (
 from urllib import error, parse, request
 import uuid
 
+from .network_policy import SandboxNetworkPolicy
 from ._http import (
     ResponseTooLargeError,
     open_no_redirect,
@@ -250,6 +251,9 @@ class SandboxSpec:
     # SDK-created sandboxes to that usable path; callers that intentionally
     # target a no-network node can still request "none" explicitly.
     network: str = "bridge"
+    network_policy: SandboxNetworkPolicy = field(
+        default_factory=SandboxNetworkPolicy, kw_only=True
+    )
     ttl_seconds: int | None = None
     ssh: SandboxSshSpec = SandboxSshSpec()
     security: SandboxSecuritySpec | None = SandboxSecuritySpec()
@@ -261,12 +265,20 @@ class SandboxSpec:
     linux_host: SandboxLinuxHostSpec = SandboxLinuxHostSpec()
 
     def __post_init__(self) -> None:
+        if not isinstance(self.network_policy, SandboxNetworkPolicy):
+            raise TypeError("network_policy must be a SandboxNetworkPolicy")
         if self.profile not in SANDBOX_PROFILES:
             raise ValueError(
                 "profile must be one of: " + ", ".join(sorted(SANDBOX_PROFILES))
             )
         if not isinstance(self.ssh, SandboxSshSpec):
             raise TypeError("ssh must be a SandboxSshSpec")
+        if self.network_policy.egress == "relay" and (
+            self.network != "bridge" or self.ssh.enabled
+        ):
+            raise ValueError(
+                "relay egress requires bridge networking without inbound SSH"
+            )
         if not isinstance(self.linux_host, SandboxLinuxHostSpec):
             raise TypeError("linux_host must be a SandboxLinuxHostSpec")
         for name, value, expected in (
@@ -296,6 +308,10 @@ class SandboxSpec:
             linux_host=self.linux_host.to_dict(),
             labels=dict(self.labels),
         )
+        if self.network_policy.egress == "direct":
+            payload.pop("network_policy")
+        else:
+            payload["network_policy"] = self.network_policy.to_dict()
         if not self.parkable:
             payload.pop("parkable")
         if not self.managed_process:
@@ -315,6 +331,7 @@ class SandboxSpec:
         cpus: float | None = None,
         disk_mb: int | None = None,
         network: str = "bridge",
+        network_policy: SandboxNetworkPolicy = SandboxNetworkPolicy(),
         ttl_seconds: int | None = None,
         ssh: SandboxSshSpec | None = None,
         linux_host: SandboxLinuxHostSpec | None = None,
@@ -333,6 +350,7 @@ class SandboxSpec:
             cpus=cpus,
             disk_mb=disk_mb,
             network=network,
+            network_policy=network_policy,
             ttl_seconds=ttl_seconds,
             ssh=ssh or SandboxSshSpec(),
             security=None,

@@ -32,6 +32,7 @@ from inspect_ai.util import (
 )
 from inspect_ai.util._sandbox.environment import SandboxConnection
 
+from ..network_policy import SandboxNetworkPolicy
 from ucloud_sandboxes_sdk import (
     AsyncSandboxClient,
     AsyncSandboxHandle,
@@ -77,6 +78,7 @@ class _InspectSettings:
     start_timeout_seconds: int
     build_timeout_seconds: int
     retry_interval_seconds: float
+    network_policy: SandboxNetworkPolicy = SandboxNetworkPolicy()
     cpus_explicit: bool = False
     memory_mb_explicit: bool = False
 
@@ -168,7 +170,11 @@ class UCloudSandboxEnvironment(SandboxEnvironment):
             sample_id = metadata.get("__sample_id__")
             if sample_id is not None:
                 labels["inspect_sample_id"] = _label_value(sample_id)
-            network = settings.network or launch.network or "none"
+            network = (
+                settings.network
+                or launch.network
+                or ("bridge" if settings.network_policy.egress == "relay" else "none")
+            )
             if settings.ssh_enabled and network == "none":
                 network = "bridge"
             handle = await _create_sandbox_with_wait(
@@ -191,6 +197,7 @@ class UCloudSandboxEnvironment(SandboxEnvironment):
                     ),
                     disk_mb=settings.disk_mb,
                     network=network,
+                    network_policy=settings.network_policy,
                     ttl_seconds=settings.ttl_seconds,
                     ssh=SandboxSshSpec(
                         enabled=settings.ssh_enabled,
@@ -769,6 +776,11 @@ def _settings_from_env() -> _InspectSettings:
         disk_mb=disk_mb or DEFAULT_INSPECT_DISK_MB,
         ttl_seconds=_int_env("UCLOUD_SANDBOX_TTL_SECONDS"),
         network=os.environ.get("UCLOUD_SANDBOX_NETWORK"),
+        network_policy=(
+            SandboxNetworkPolicy.relay_only(os.environ["UCLOUD_SANDBOX_RELAY"])
+            if "UCLOUD_SANDBOX_RELAY" in os.environ
+            else SandboxNetworkPolicy()
+        ),
         ssh_enabled=ssh_enabled,
         ssh_user=os.environ.get("UCLOUD_SANDBOX_SSH_USER", "root"),
         security=_security_from_env(),
