@@ -111,6 +111,12 @@ measured node pressure is temporarily high, and
 the request before its handler ran. Other non-idempotent exec errors are surfaced
 without replay, so an ambiguous command is never run twice.
 
+During sandbox creation, a retryable capacity response's `Retry-After` value is
+the authoritative polling cadence. The SDK adds bounded jitter to spread
+concurrent clients, but does not compound that server-directed delay with
+exponential transport backoff. This lets a cold create use newly ready worker
+capacity promptly while its overall create timeout remains the hard bound.
+
 For a long-lived agent that must survive relay-driven park/wake and migration,
 create a managed-process sandbox without an initial command and use
 `start_agent()`:

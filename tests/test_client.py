@@ -941,6 +941,68 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(sandbox.id, "cold-create-sync")
         self.assertEqual(calls, client_module.UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS + 1)
 
+    def test_gateway_retry_after_does_not_inherit_exponential_create_backoff(
+        self,
+    ) -> None:
+        with patch.object(client_module.random, "random", return_value=0.0):
+            directed_delay = client_module._ucloud_unavailable_retry_delay(
+                12,
+                {"Retry-After": "2"},
+                method="POST",
+                path="/v1/sandboxes",
+            )
+            undirected_delay = client_module._ucloud_unavailable_retry_delay(
+                12,
+                method="POST",
+                path="/v1/sandboxes",
+            )
+
+        self.assertEqual(directed_delay, 2.0)
+        self.assertEqual(
+            undirected_delay,
+            client_module.UCLOUD_CREATE_RETRY_MAX_DELAY_SECONDS,
+        )
+
+    def test_sync_create_capacity_polling_outlives_old_attempt_limit(self) -> None:
+        calls = 0
+        delays: list[float] = []
+
+        def fake_urlopen(req: object, timeout: object = None) -> object:
+            del timeout
+            nonlocal calls
+            calls += 1
+            if calls <= 20:
+                raise client_module.error.HTTPError(
+                    str(getattr(req, "full_url", "")),
+                    503,
+                    "Service Unavailable",
+                    {"Retry-After": "2"},
+                    io.BytesIO(
+                        b'{"error":"no ready node has resources for sandbox request",'
+                        b'"error_code":"no_ready_node","retryable":true}'
+                    ),
+                )
+            return _SyncResponse(
+                b'{"sandbox":{"spec":{"id":"long-cold-create"}}}'
+            )
+
+        client = SandboxClient("http://gateway.invalid")
+        with (
+            patch.object(client_module, "open_no_redirect", fake_urlopen),
+            patch.object(client_module.time, "sleep", delays.append),
+            patch.object(client_module.random, "random", return_value=0.0),
+        ):
+            sandbox = client.create_sandbox(
+                SandboxSpec(
+                    id="long-cold-create",
+                    image=Image.from_registry("busybox:latest"),
+                )
+            )
+
+        self.assertEqual(sandbox.id, "long-cold-create")
+        self.assertEqual(calls, 21)
+        self.assertEqual(delays, [2.0] * 20)
+
     def test_sync_client_does_not_retry_structured_capacity_for_exec(self) -> None:
         calls = 0
 

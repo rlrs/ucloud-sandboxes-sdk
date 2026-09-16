@@ -55,7 +55,11 @@ IMAGE_RESOLUTION_PRE_DISPATCH_PATHS = frozenset(
 )
 UCLOUD_UNAVAILABLE_STATUS = 503
 UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS = 6
-UCLOUD_CREATE_RETRY_ATTEMPTS = 16
+UCLOUD_SANDBOX_OPERATION_RETRY_ATTEMPTS = 16
+# Stable-id sandbox creation is bounded by its request deadline, not an
+# independent attempt count. This permits frequent control-plane polling
+# throughout a slow provider scale-up without weakening the total time bound.
+UCLOUD_CREATE_RETRY_ATTEMPTS: None = None
 UCLOUD_UNAVAILABLE_RETRY_BASE_DELAY_SECONDS = 0.25
 UCLOUD_UNAVAILABLE_RETRY_MAX_DELAY_SECONDS = 4.0
 UCLOUD_CREATE_RETRY_MAX_DELAY_SECONDS = 30.0
@@ -1376,7 +1380,7 @@ class SandboxClient(_DirectSandboxOperations):
         timeout = self.timeout_seconds if timeout_seconds is None else timeout_seconds
         deadline = _deadline(timeout)
         retry_attempts = _ucloud_unavailable_retry_attempts(method, path)
-        for attempt in range(retry_attempts):
+        for attempt in _retry_attempt_numbers(retry_attempts):
             request_timeout = _request_timeout_seconds(
                 _required_remaining_seconds(deadline),
                 timeout,
@@ -1421,7 +1425,7 @@ class SandboxClient(_DirectSandboxOperations):
     def _request_bytes(self, method: str, path: str) -> bytes:
         deadline = _deadline(self.timeout_seconds)
         retry_attempts = _ucloud_unavailable_retry_attempts(method, path)
-        for attempt in range(retry_attempts):
+        for attempt in _retry_attempt_numbers(retry_attempts):
             req = request.Request(
                 self.base_url + path,
                 method=method,
@@ -2442,7 +2446,7 @@ class AsyncSandboxClient(_DirectSandboxOperations):
         client = await self._client()
         deadline = _deadline(timeout)
         retry_attempts = _ucloud_unavailable_retry_attempts(method, path)
-        for attempt in range(retry_attempts):
+        for attempt in _retry_attempt_numbers(retry_attempts):
             if streamed:
                 body.seek(0)
             async with client.request(
@@ -3095,7 +3099,7 @@ def _retry_error(
     *,
     method: str,
     path: str,
-    max_attempts: int,
+    max_attempts: int | None,
 ) -> float | None:
     status = api_error.status_code
     if status is None or not _should_retry_ucloud_unavailable(
@@ -3122,7 +3126,7 @@ def _should_retry_ucloud_unavailable(
     *,
     method: str = "GET",
     path: str = "",
-    max_attempts: int = UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS,
+    max_attempts: int | None = UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS,
 ) -> bool:
     normalized_method = method.upper()
     error_code = body.get("error_code") if isinstance(body, dict) else None
@@ -3149,9 +3153,12 @@ def _should_retry_ucloud_unavailable(
     attempt_limit = (
         max_attempts
         if pre_dispatch_fence or stable_create
-        else min(max_attempts, UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS)
+        else min(
+            max_attempts or UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS,
+            UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS,
+        )
     )
-    if attempt >= attempt_limit - 1:
+    if attempt_limit is not None and attempt >= attempt_limit - 1:
         return False
     if pre_dispatch_fence:
         # The gateway returns these exact fences before downstream work is
@@ -3179,12 +3186,19 @@ def _should_retry_ucloud_unavailable(
     return "job is unavailable" in text and "ucloud" in text
 
 
-def _ucloud_unavailable_retry_attempts(method: str, path: str) -> int:
-    if (method.upper() == "POST" and path == "/v1/sandboxes") or path.startswith(
-        "/v1/sandboxes/"
-    ):
+def _ucloud_unavailable_retry_attempts(method: str, path: str) -> int | None:
+    if method.upper() == "POST" and path == "/v1/sandboxes":
         return UCLOUD_CREATE_RETRY_ATTEMPTS
+    if path.startswith("/v1/sandboxes/"):
+        return UCLOUD_SANDBOX_OPERATION_RETRY_ATTEMPTS
     return UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS
+
+
+def _retry_attempt_numbers(max_attempts: int | None) -> Iterator[int]:
+    attempt = 0
+    while max_attempts is None or attempt < max_attempts:
+        yield attempt
+        attempt += 1
 
 
 def _ucloud_unavailable_error_text(body: object) -> str:
@@ -3218,10 +3232,14 @@ def _ucloud_unavailable_retry_delay(
     )
     retry_after = _retry_after_seconds(headers)
     if retry_after is not None:
+        # A structured gateway retry response describes live control-plane
+        # state (for example, a node scaling up), so Retry-After is the polling
+        # cadence rather than merely a floor beneath transport backoff.  Taking
+        # max(..., client_backoff) made a two-second poll grow to 30 seconds and
+        # left newly ready nodes idle for most of a cold create.
         return min(
             60.0,
-            max(retry_after, client_backoff)
-            * (1.0 + random.random() * UCLOUD_RETRY_AFTER_JITTER_RATIO),
+            retry_after * (1.0 + random.random() * UCLOUD_RETRY_AFTER_JITTER_RATIO),
         )
     return client_backoff
 
