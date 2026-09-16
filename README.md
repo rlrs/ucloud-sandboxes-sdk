@@ -232,32 +232,67 @@ sandbox = client.create_sandbox(
 )
 ```
 
-For host-enforced relay-only networking, add this to the `SandboxSpec` above:
-
-```python
-from ucloud_sandboxes_sdk import SandboxNetworkPolicy
-
-# The relay name is configured by the deployment administrator.
-network_policy = SandboxNetworkPolicy.relay_only("default")
-```
-
-Pass `network_policy` as a keyword argument alongside `network="bridge"`.
-The async client and benchmark factory support the same policy. The gateway
-and worker must support `network-policy-relay-v1:default`; older nodes cannot
-silently run this as unrestricted networking. Relay environment variables alone
-do not restrict networking. This mode blocks all other destinations, guest DNS,
-UDP, IPv6, and inbound SSH. Bake dependencies into the image first.
-
-The administrator configures `sandbox.network_relays`, for example
-`{"default":"relay.example.org:443"}`. Host-side DNS and a stable guest hostname
-mapping preserve TLS names across relay address changes. Clients must honour
-`/etc/hosts`. The endpoint can later be a filtering proxy, with the same host
-rules preventing direct bypass. Inspect AI selects the policy using
-`UCLOUD_SANDBOX_RELAY=default`.
-
 The helper sets `OPENAI_BASE_URL` to
 `https://relay.example.org/rollouts/run-001/v1`, plus `OPENAI_API_KEY` and
 `VF_RELAY_ROLLOUT_ID`.
+
+### Relay-only networking
+
+Requires SDK **0.4.18+** and server **0.5.33+**. Select the policy explicitly when
+creating a sandbox; direct networking remains the default:
+
+```python
+from ucloud_sandboxes_sdk import Image, SandboxNetworkPolicy, SandboxSpec, model_relay_env
+
+restricted = client.create_sandbox(
+    SandboxSpec(
+        id="restricted-run",
+        image=Image.from_registry("registry.example.org/swebench/task:latest"),
+        network="bridge",
+        network_policy=SandboxNetworkPolicy.relay_only("default"),
+        parkable=True,
+        managed_process=True,
+        env=model_relay_env(
+            "https://relay.example.org",  # Must match the configured relay endpoint.
+            "restricted-run",
+            api_key="<sandbox-relay-token>",
+        ),
+    )
+)
+```
+
+The async client and benchmark factory support the same policy. The relay name
+is an administrator-configured policy identity, not a URL. The administrator
+configures `sandbox.network_relays`, for example
+`{"default":"relay.example.org:443"}`, and supplies the corresponding URL to
+sandbox clients. A dedicated private relay address is also supported; use its
+actual protocol, hostname and port in `model_relay_env()`.
+
+Use a dedicated endpoint. The host firewall restricts destination IPs and TCP
+ports; it does not distinguish virtual hosts on a shared HTTPS ingress. Relay
+environment variables alone do not restrict networking, and selecting a policy
+does not automatically proxy arbitrary application traffic through the relay.
+The endpoint can later be a filtering proxy, with the same host rules preventing
+direct bypass.
+
+The gateway and worker must support `network-policy-relay-v1:default`; older
+nodes cannot silently run this as unrestricted networking. This mode blocks
+all other destinations, guest DNS, UDP, IPv6, and inbound SSH. Bake dependencies
+into the image first. Host-side DNS and a stable guest hostname mapping preserve
+TLS names across relay address changes. Clients must honour `/etc/hosts`.
+The policy is preserved through park/wake and migration.
+
+For Inspect AI, select the same named policy before running an evaluation:
+
+```bash
+export UCLOUD_SANDBOX_RELAY=default
+```
+
+Configure the sandbox application's relay URL and token as above. Unset
+`UCLOUD_SANDBOX_RELAY` to use the provider's normal network settings for new
+sandboxes.
+
+### Relay workers
 
 Launch the sandbox-side agent with `start_agent()` as shown above. The managed
 process ledger, relay acceptance, gateway program transition, and checkpoint
