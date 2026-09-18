@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.4.20 - 2026-09-18
+
+- Retry explicit gateway/node startup and restore admission rejections for
+  sync and async operations, including file uploads, with jitter and Retry-After.
+- Let safe pre-dispatch retries use the caller deadline instead of a separate
+  sixteen-attempt cutoff; retain conservative handling of ambiguous timeouts.
+- Bound backoff exponent computation for long-lived startup queues.
+
 ## 0.4.17 - 2026-09-11
 
 - Separate upstream forwarding timeouts from gateway control-call timeouts in

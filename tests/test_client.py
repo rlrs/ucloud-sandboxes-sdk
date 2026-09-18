@@ -1482,6 +1482,78 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertEqual(session_id, "exec-pressure-async")
         self.assertEqual(calls, 2)
 
+    def test_sync_upload_retries_restore_admission_without_losing_body(self) -> None:
+        bodies = []
+
+        def fake_urlopen(req, timeout=None):
+            bodies.append(req.data)
+            if len(bodies) <= 20:
+                raise client_module.error.HTTPError(
+                    req.full_url, 503, "Service Unavailable", {"Retry-After": "0"},
+                    io.BytesIO(b'{"error_code":"node_restore_busy","retryable":true}'),
+                )
+            return _SyncResponse(b'{"ok":true,"sandbox_id":"sandbox","path":"/tmp/test","size":7}')
+
+        with (
+            patch.object(client_module, "open_no_redirect", fake_urlopen),
+            patch.object(client_module.time, "sleep", lambda _: None),
+        ):
+            result = SandboxClient("http://gateway.invalid").upload_file(
+                "sandbox", "/tmp/test", b"payload"
+            )
+        self.assertTrue(result["ok"])
+        self.assertEqual(bodies, [b"payload"] * 21)
+
+    def test_async_upload_retries_restore_admission_but_not_ambiguous_timeout(self) -> None:
+        async def scenario():
+            session = _ScriptedAsyncSession(
+                lambda _method, _url, _kwargs, call: _AsyncResponse(
+                    '{"error_code":"node_restore_busy","retryable":true}'
+                    if call <= 20 else '{"ok":true,"sandbox_id":"sandbox","path":"/tmp/test","size":7}',
+                    status=503 if call <= 20 else 200,
+                    headers={"Retry-After": "0"},
+                )
+            )
+            client = AsyncSandboxClient("http://gateway.invalid", session=session)
+            with patch.object(client_module.asyncio, "sleep", AsyncMock()):
+                result = await client.upload_file("sandbox", "/tmp/test", b"payload")
+            self.assertTrue(result["ok"])
+            self.assertEqual(len(session.requests), 21)
+            self.assertFalse(client_module._should_retry_ucloud_unavailable(
+                504, {"error": "stream timeout", "retryable": True}, 0,
+                method="PUT", path="/v1/sandboxes/sandbox/files?path=/tmp/test",
+            ))
+
+        asyncio.run(scenario())
+
+    def test_startup_backpressure_requires_explicit_safe_rejection(self) -> None:
+        for code in ("gateway_startup_busy", "node_startup_busy"):
+            for method, path in (("PUT", "/v1/sandboxes/one/files?path=/tmp/file"), ("POST", "/v1/sandboxes/one/exec")):
+                with self.subTest(code=code, method=method):
+                    self.assertTrue(client_module._should_retry_ucloud_unavailable(
+                        503, {"error_code": code, "retryable": True}, 50,
+                        method=method, path=path, max_attempts=None,
+                    ))
+                    self.assertFalse(client_module._should_retry_ucloud_unavailable(
+                        503, {"error_code": code, "retryable": False}, 0,
+                        method=method, path=path, max_attempts=None,
+                    ))
+        # A long-lived caller deadline must not overflow exponential backoff.
+        self.assertEqual(client_module._ucloud_unavailable_retry_delay(10000), 4.0)
+
+    def test_startup_retry_stops_at_caller_deadline(self) -> None:
+        def busy(req, timeout=None):
+            raise client_module.error.HTTPError(
+                req.full_url, 503, "Service Unavailable", {"Retry-After": "1"},
+                io.BytesIO(b'{"error_code":"gateway_startup_busy","retryable":true}'),
+            )
+        with patch.object(client_module, "open_no_redirect", side_effect=busy) as calls:
+            with self.assertRaises(SandboxApiError):
+                SandboxClient("http://gateway.invalid", timeout_seconds=0.01).upload_file(
+                    "sandbox", "/tmp/test", b"payload"
+                )
+        self.assertEqual(calls.call_count, 1)
+
 
 def _timeout_total(timeout: object) -> object:
     return getattr(timeout, "total", timeout)

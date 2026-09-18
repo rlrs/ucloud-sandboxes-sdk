@@ -56,7 +56,10 @@ IMAGE_RESOLUTION_PRE_DISPATCH_PATHS = frozenset(
 )
 UCLOUD_UNAVAILABLE_STATUS = 503
 UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS = 6
-UCLOUD_SANDBOX_OPERATION_RETRY_ATTEMPTS = 16
+# Safe pre-dispatch rejections wait within the caller deadline, even when a
+# cold burst needs more than sixteen polling rounds. Other errors retain the
+# small transport attempt limit below.
+UCLOUD_SANDBOX_OPERATION_RETRY_ATTEMPTS: None = None
 # Stable-id sandbox creation is bounded by its request deadline, not an
 # independent attempt count. This permits frequent control-plane polling
 # throughout a slow provider scale-up without weakening the total time bound.
@@ -3163,6 +3166,9 @@ def _should_retry_ucloud_unavailable(
                 "http_request_capacity_exhausted",
                 "snapshot_publication_pending",
                 "node_active_exec_deferred",
+                "node_restore_busy",
+                "node_startup_busy",
+                "gateway_startup_busy",
             }
             or image_resolution_fence
         )
@@ -3246,7 +3252,7 @@ def _ucloud_unavailable_retry_delay(
     )
     client_backoff = min(
         max_delay,
-        UCLOUD_UNAVAILABLE_RETRY_BASE_DELAY_SECONDS * (2**attempt),
+        UCLOUD_UNAVAILABLE_RETRY_BASE_DELAY_SECONDS * (2 ** min(attempt, 16)),
     )
     retry_after = _retry_after_seconds(headers)
     if retry_after is not None:
