@@ -1504,6 +1504,34 @@ class SandboxSdkTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(bodies, [b"payload"] * 21)
 
+    def test_exec_event_reads_retry_explicit_admission_until_deadline(self) -> None:
+        calls = []
+        def reply(req, timeout=None):
+            calls.append(req.full_url)
+            if len(calls) <= 20:
+                raise client_module.error.HTTPError(
+                    req.full_url, 503, "busy", {"Retry-After": "0"},
+                    io.BytesIO(b'{"error_code":"http_request_capacity_exhausted","retryable":true}'),
+                )
+            return _SyncResponse(b'{"events":[]}')
+        with patch.object(client_module, "open_no_redirect", reply):
+            self.assertEqual(SandboxClient("http://gateway.invalid").read_exec_events("one"), {"events": []})
+        self.assertEqual(len(calls), 21)
+
+        async def scenario():
+            session = _ScriptedAsyncSession(
+                lambda _method, _url, _kwargs, call: _AsyncResponse(
+                    '{"error_code":"http_request_capacity_exhausted","retryable":true}'
+                    if call <= 20 else '{"events":[]}',
+                    status=503 if call <= 20 else 200,
+                    headers={"Retry-After": "0"},
+                )
+            )
+            client = AsyncSandboxClient("http://gateway.invalid", session=session)
+            self.assertEqual(await client.read_exec_events("one"), {"events": []})
+            self.assertEqual(len(session.requests), 21)
+        asyncio.run(scenario())
+
     def test_async_upload_retries_restore_admission_but_not_ambiguous_timeout(self) -> None:
         async def scenario():
             session = _ScriptedAsyncSession(

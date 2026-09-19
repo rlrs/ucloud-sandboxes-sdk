@@ -3216,7 +3216,7 @@ def _should_retry_ucloud_unavailable(
 def _ucloud_unavailable_retry_attempts(method: str, path: str) -> int | None:
     if method.upper() == "POST" and path == "/v1/sandboxes":
         return UCLOUD_CREATE_RETRY_ATTEMPTS
-    if path.startswith("/v1/sandboxes/"):
+    if path.startswith(("/v1/sandboxes/", "/v1/exec/")):
         return UCLOUD_SANDBOX_OPERATION_RETRY_ATTEMPTS
     return UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS
 

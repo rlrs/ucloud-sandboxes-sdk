@@ -4,6 +4,8 @@
 
 ## 0.4.21 - 2026-09-19
 
+- Let explicit exec-event admission rejections retry within the caller deadline,
+  matching sandbox operations instead of stopping after sixteen attempts.
 - Keep relay workers running when lease renewal races with a successfully
   committed reply; only the specific already-completed renewal response is
   ignored after a successful commit, preserving other lease failures.
