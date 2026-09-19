@@ -23,6 +23,50 @@ def request_fixture():
     )
 
 
+class RelayCommitRetryTests(unittest.TestCase):
+    def test_commit_retries_same_payload_after_transport_and_proxy_failures(self):
+        for status in (None, 502, 504, 503):
+            with self.subTest(status=status):
+                client = RelayWorkerClient("http://relay.invalid")
+                client.respond_to = Mock(side_effect=[RelayApiError("lost", status_code=status), {"ok": True}])
+                item = request_fixture()
+                result = client.commit_response_bytes_to(item, b"answer", attempts=2, retry_delay_seconds=0)
+                self.assertTrue(result["ok"])
+                self.assertEqual(client.respond_to.call_count, 2)
+                self.assertEqual(client.respond_to.call_args_list[0], client.respond_to.call_args_list[1])
+
+    def test_commit_preserves_terminal_errors_and_attempt_bound(self):
+        cases = [(status, None, 1) for status in (400, 401, 403, 404, 409, 410, 422)]
+        cases += [(503, {"retryable": False}, 1), (None, None, 2)]
+        for status, body, expected_calls in cases:
+            with self.subTest(status=status, body=body):
+                client = RelayWorkerClient("http://relay.invalid")
+                client.respond_to = Mock(side_effect=RelayApiError("lost", status_code=status, body=body))
+                with self.assertRaises(RelayApiError):
+                    client.commit_response_bytes_to(request_fixture(), b"answer", attempts=2, retry_delay_seconds=0)
+                self.assertEqual(client.respond_to.call_count, expected_calls)
+
+
+class AsyncRelayCommitRetryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_commit_retries_same_payload_after_transport_and_proxy_failures(self):
+        for status in (None, 502, 504, 503):
+            with self.subTest(status=status):
+                client = AsyncRelayWorkerClient("http://relay.invalid")
+                client.respond_to = AsyncMock(side_effect=[RelayApiError("lost", status_code=status), {"ok": True}])
+                result = await client.commit_response_bytes_to(request_fixture(), b"answer", attempts=2, retry_delay_seconds=0)
+                self.assertTrue(result["ok"])
+                self.assertEqual(client.respond_to.await_args_list[0], client.respond_to.await_args_list[1])
+
+    async def test_commit_preserves_terminal_errors_and_attempt_bound(self):
+        for status, body, expected_calls in [(410, None, 1), (503, {"retryable": False}, 1), (None, None, 2)]:
+            with self.subTest(status=status, body=body):
+                client = AsyncRelayWorkerClient("http://relay.invalid")
+                client.respond_to = AsyncMock(side_effect=RelayApiError("lost", status_code=status, body=body))
+                with self.assertRaises(RelayApiError):
+                    await client.commit_response_bytes_to(request_fixture(), b"answer", attempts=2, retry_delay_seconds=0)
+                self.assertEqual(client.respond_to.await_count, expected_calls)
+
+
 class RelayForwardingConfigTests(unittest.TestCase):
     def test_sync_and_async_forward_budgets_are_independent_from_control_calls(self):
         for cls in (RelayWorkerClient, AsyncRelayWorkerClient):

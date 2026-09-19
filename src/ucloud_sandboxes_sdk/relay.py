@@ -452,7 +452,7 @@ class RelayWorkerClient(_RelayWorkerState):
         attempts: int = 60,
         retry_delay_seconds: float = 1.0,
     ) -> JsonObject:
-        """Retry the idempotent commit while a committed result awaits wake."""
+        """Retry this same idempotent commit through transport and wake failures."""
 
         attempts = max(1, attempts)
         for attempt in range(attempts):
@@ -465,8 +465,7 @@ class RelayWorkerClient(_RelayWorkerState):
                 )
             except RelayApiError as exc:
                 if (
-                    exc.status_code != 503
-                    or exc.retryable is False
+                    not _relay_error_is_retryable(exc)
                     or attempt + 1 >= attempts
                 ):
                     raise
@@ -869,7 +868,7 @@ class AsyncRelayWorkerClient(_RelayWorkerState):
         attempts: int = 60,
         retry_delay_seconds: float = 1.0,
     ) -> JsonObject:
-        """Retry the idempotent commit while a committed result awaits wake."""
+        """Retry this same idempotent commit through transport and wake failures."""
 
         attempts = max(1, attempts)
         for attempt in range(attempts):
@@ -882,8 +881,7 @@ class AsyncRelayWorkerClient(_RelayWorkerState):
                 )
             except RelayApiError as exc:
                 if (
-                    exc.status_code != 503
-                    or exc.retryable is False
+                    not _relay_error_is_retryable(exc)
                     or attempt + 1 >= attempts
                 ):
                     raise

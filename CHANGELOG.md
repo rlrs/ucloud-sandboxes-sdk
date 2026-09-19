@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.4.21 - 2026-09-19
+
+- Retry idempotent relay response commits after transport failures and transient
+  HTTP errors, retaining the same request/lease identity and response bytes.
+- Preserve attempt bounds, Retry-After, explicit non-retryable responses, and
+  terminal registration/lease/caller failures. Ordinary ambiguous upload or
+  execution failures are still not automatically replayed.
+
 ## 0.4.20 - 2026-09-18
 
 - Retry explicit gateway/node startup and restore admission rejections for
