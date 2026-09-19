@@ -70,6 +70,7 @@ UCLOUD_UNAVAILABLE_RETRY_MAX_DELAY_SECONDS = 4.0
 UCLOUD_CREATE_RETRY_MAX_DELAY_SECONDS = 30.0
 UCLOUD_RETRY_AFTER_JITTER_RATIO = 0.25
 DEFAULT_CREATE_TIMEOUT_SECONDS = 10 * 60.0
+DEFAULT_BUILD_SUBMISSION_TIMEOUT_SECONDS = 10 * 60.0
 DEFAULT_EXEC_EVENT_WAIT_SECONDS = 20.0
 MAX_JSON_BODY_BYTES = 16 * 1024 * 1024
 MAX_FILE_BODY_BYTES = 256 * 1024 * 1024
@@ -1302,7 +1303,7 @@ class SandboxClient(_DirectSandboxOperations):
         timeout_seconds: float | None = None,
     ) -> JsonObject:
         deadline = _deadline(
-            self.timeout_seconds if timeout_seconds is None else timeout_seconds
+            DEFAULT_BUILD_SUBMISSION_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
         )
         with _image_build_request(image) as (payload, archive):
             digest = str(payload["context_archive_digest"])
@@ -2291,7 +2292,7 @@ class AsyncSandboxClient(_DirectSandboxOperations):
         timeout_seconds: float | None = None,
     ) -> JsonObject:
         deadline = _deadline(
-            self.timeout_seconds if timeout_seconds is None else timeout_seconds
+            DEFAULT_BUILD_SUBMISSION_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
         )
         with _image_build_request(image) as (payload, archive):
             digest = str(payload["context_archive_digest"])
@@ -3159,6 +3160,11 @@ def _should_retry_ucloud_unavailable(
         and path in IMAGE_RESOLUTION_PRE_DISPATCH_PATHS
         and error_code in IMAGE_RESOLUTION_PRE_DISPATCH_ERROR_CODES
     )
+    builder_admission_fence = (
+        normalized_method == "POST"
+        and path == "/v1/images/build"
+        and error_code in {"builder_not_ready", "builder_busy", "node_admission_closed"}
+    )
     pre_dispatch_fence = (
         status_code in {408, 425, 429, 500, 502, 503, 504}
         and isinstance(body, dict)
@@ -3174,6 +3180,7 @@ def _should_retry_ucloud_unavailable(
                 "gateway_startup_busy",
             }
             or image_resolution_fence
+            or builder_admission_fence
         )
     )
     stable_create = normalized_method == "POST" and path == "/v1/sandboxes"
@@ -3214,6 +3221,10 @@ def _should_retry_ucloud_unavailable(
 
 
 def _ucloud_unavailable_retry_attempts(method: str, path: str) -> int | None:
+    if method.upper() == "POST" and path == "/v1/images/build":
+        # Only explicit pre-dispatch fences qualify for this deadline-bound
+        # budget. Ambiguous build failures must never be blindly resubmitted.
+        return None
     if method.upper() == "POST" and path == "/v1/sandboxes":
         return UCLOUD_CREATE_RETRY_ATTEMPTS
     if path.startswith(("/v1/sandboxes/", "/v1/exec/")):

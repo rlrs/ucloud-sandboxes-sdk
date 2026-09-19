@@ -645,3 +645,12 @@ uv run --extra inspect python -m unittest
 
 The unit tests use a local fake gateway. Keep live gateway smoke tests in
 separate operational docs.
+
+### Cold builder admission
+
+Build submission waits for explicit gateway `builder_not_ready`, `builder_busy`,
+or `node_admission_closed` responses within its timeout, retaining the same
+image identity and uploaded context. The default submission budget is ten
+minutes, including context upload; `timeout_seconds` overrides it. Ambiguous
+POST failures and build execution failures are not automatically resubmitted.
+This requires gateway 0.5.46 or newer to advertise the admission fence.
