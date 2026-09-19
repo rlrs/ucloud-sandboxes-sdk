@@ -1438,7 +1438,7 @@ def _handle_sync_request(
     finally:
         stop.set()
         renewer.join(timeout=max(1.0, renewal_interval_seconds + 1.0))
-    if renewal_errors:
+    if renewal_errors and not _relay_request_already_completed(renewal_errors[0]):
         raise renewal_errors[0]
 
 
@@ -1490,7 +1490,14 @@ async def _handle_async_request(
         raise
     else:
         stop.set()
-        await renewer
+        try:
+            await renewer
+        except RelayApiError as exc:
+            # A reply can be durable while its commit call still waits for the
+            # caller to wake. Renewal then returns 410. Once this handler's
+            # commit succeeds, that completion must not kill the rollout.
+            if not _relay_request_already_completed(exc):
+                raise
 
 
 def _forward_timeout(value: float) -> float:
@@ -1655,6 +1662,14 @@ def _relay_error_is_retryable(exc: RelayApiError) -> bool:
     if exc.status_code is None:
         return True
     return exc.status_code in {408, 425, 429, 500, 502, 503, 504}
+
+
+def _relay_request_already_completed(exc: RelayApiError) -> bool:
+    return (
+        exc.status_code == 410
+        and isinstance(exc.body, Mapping)
+        and exc.body.get("error") == "request is already completed"
+    )
 
 
 def _relay_retry_delay(exc: RelayApiError, consecutive_errors: int) -> float:

@@ -1,6 +1,7 @@
 import asyncio
 from dataclasses import replace
 from types import SimpleNamespace
+from threading import Event
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 from urllib.error import URLError
@@ -24,6 +25,40 @@ def request_fixture():
 
 
 class RelayCommitRetryTests(unittest.TestCase):
+    def test_sync_completed_renewal_after_successful_commit_keeps_worker_alive(self):
+        for status, message, allowed in (
+            (410, "request is already completed", True),
+            (410, "registration expired", False),
+            (409, "request lease is no longer active", False),
+        ):
+            with self.subTest(status=status, message=message):
+                observed = Event()
+                failure = RelayApiError(message, status_code=status, body={"error": message})
+                client = RelayWorkerClient("http://relay.invalid")
+
+                def renew(*_args, **_kwargs):
+                    observed.set()
+                    raise failure
+
+                def commit(*_args, **_kwargs):
+                    self.assertTrue(observed.wait(2))
+                    return {"ok": True}
+
+                client.renew_request = Mock(side_effect=renew)
+                client.forward_to = Mock(side_effect=commit)
+                def handle():
+                    relay_module._handle_sync_request(
+                        client, request_fixture(), handler=None,
+                        upstream_base_url="http://model.invalid", worker_id="worker",
+                        lease_seconds=120, renewal_interval_seconds=0.001,
+                    )
+                if allowed:
+                    handle()
+                else:
+                    with self.assertRaises(RelayApiError) as raised:
+                        handle()
+                    self.assertIs(raised.exception, failure)
+
     def test_commit_retries_same_payload_after_transport_and_proxy_failures(self):
         for status in (None, 502, 504, 503):
             with self.subTest(status=status):
@@ -145,6 +180,56 @@ class RelayForwardingConfigTests(unittest.TestCase):
 
 
 class RelayWorkerFailureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_completed_renewal_after_successful_commit_keeps_worker_alive(self):
+        for status, message, allowed in (
+            (410, "request is already completed", True),
+            (410, "registration expired", False),
+            (409, "request lease is no longer active", False),
+        ):
+            with self.subTest(status=status, message=message):
+                observed = asyncio.Event()
+                failure = RelayApiError(message, status_code=status, body={"error": message})
+                client = AsyncRelayWorkerClient("http://relay.invalid")
+
+                async def renew(*_args, **_kwargs):
+                    observed.set()
+                    raise failure
+
+                async def commit(*_args, **_kwargs):
+                    await asyncio.wait_for(observed.wait(), 2)
+                    return {"ok": True}
+
+                client.renew_request = AsyncMock(side_effect=renew)
+                client.forward_to = AsyncMock(side_effect=commit)
+                async def handle():
+                    await relay_module._handle_async_request(
+                        client, request_fixture(), handler=None,
+                        upstream_base_url="http://model.invalid", worker_id="worker",
+                        lease_seconds=120, renewal_interval_seconds=0.001,
+                    )
+                if allowed:
+                    await handle()
+                else:
+                    with self.assertRaises(RelayApiError) as raised:
+                        await handle()
+                    self.assertIs(raised.exception, failure)
+
+    async def test_completed_renewal_does_not_mask_commit_failure(self):
+        client = AsyncRelayWorkerClient("http://relay.invalid")
+        primary = RelayApiError("commit failed", status_code=409)
+        client.forward_to = AsyncMock(side_effect=primary)
+        completed = RelayApiError(
+            "completed", status_code=410, body={"error": "request is already completed"}
+        )
+        with patch.object(relay_module, "_renew_async_lease", side_effect=completed):
+            with self.assertRaises(RelayApiError) as raised:
+                await relay_module._handle_async_request(
+                    client, request_fixture(), handler=None,
+                    upstream_base_url="http://model.invalid", worker_id="worker",
+                    lease_seconds=120, renewal_interval_seconds=30,
+                )
+        self.assertIs(raised.exception, primary)
+
     async def test_primary_failure_survives_other_request_cleanup_failure(self):
         primary = RelayApiError("original forwarding failure")
         secondary = RelayApiError("secondary cleanup failure")

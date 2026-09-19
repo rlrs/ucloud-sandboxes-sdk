@@ -4,6 +4,9 @@
 
 ## 0.4.21 - 2026-09-19
 
+- Keep relay workers running when lease renewal races with a successfully
+  committed reply; only the specific already-completed renewal response is
+  ignored after a successful commit, preserving other lease failures.
 - Give async relay polling, upstream forwarding, and control requests separate
   bounded connection pools so many long polls cannot starve reply commits or
   lease renewals. The polling pool supports 512 concurrent polls.
