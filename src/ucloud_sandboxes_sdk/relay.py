@@ -35,6 +35,9 @@ MAX_RELAY_JSON_BYTES = 32 * 1024 * 1024
 MAX_RELAY_HTTP_BODY_BYTES = MAX_RELAY_JSON_BYTES // 2
 RELAY_POLL_TIMEOUT_GRACE_SECONDS = 5.0
 DEFAULT_FORWARD_TIMEOUT_SECONDS = 7200.0
+# Long polls and slow upstream calls must not consume the connections needed
+# to commit replies or renew leases. Keep each pool bounded independently.
+_ASYNC_RELAY_CONNECTION_LIMITS = {"control": 100, "poll": 512, "forward": 100}
 AGENT_LIFECYCLE_METADATA_KEY = "_ucloud_agent_lifecycle"
 MANAGED_AGENT_LIFECYCLE = "managed-process-v1"
 
@@ -637,7 +640,7 @@ class AsyncRelayWorkerClient(_RelayWorkerState):
         if worker_token is not None:
             self.headers["Authorization"] = f"Bearer {worker_token}"
         self._session = session
-        self._owned_session: Any | None = None
+        self._owned_sessions: dict[str, Any] = {}
 
     @classmethod
     def from_env(
@@ -729,9 +732,9 @@ class AsyncRelayWorkerClient(_RelayWorkerState):
         await self.close()
 
     async def close(self) -> None:
-        if self._owned_session is not None:
-            await self._owned_session.close()
-            self._owned_session = None
+        sessions = list(self._owned_sessions.values())
+        self._owned_sessions.clear()
+        await asyncio.gather(*(session.close() for session in sessions))
 
     async def health(self) -> JsonObject:
         return await self._request_json("GET", "/healthz")
@@ -907,7 +910,7 @@ class AsyncRelayWorkerClient(_RelayWorkerState):
         timeout = _forward_timeout(
             self.forward_timeout_seconds if timeout_seconds is None else timeout_seconds
         )
-        client = await self._client()
+        client = await self._client(purpose="forward")
         request_options: dict[str, Any] = {
             "data": relay_request.body_bytes or None,
             "headers": _safe_http_headers(relay_request.headers),
@@ -954,10 +957,10 @@ class AsyncRelayWorkerClient(_RelayWorkerState):
             payload=_error_payload(relay_request, message, status),
         )
 
-    async def _client(self) -> Any:
+    async def _client(self, *, purpose: str = "control") -> Any:
         if self._session is not None:
             return self._session
-        if self._owned_session is None:
+        if purpose not in self._owned_sessions:
             try:
                 from aiohttp import ClientSession, ClientTimeout, TCPConnector
             except ImportError as exc:
@@ -965,11 +968,14 @@ class AsyncRelayWorkerClient(_RelayWorkerState):
                     "AsyncRelayWorkerClient requires aiohttp. Install "
                     "ucloud-sandboxes-sdk[async] or ucloud-sandboxes-sdk[inspect]."
                 ) from exc
-            self._owned_session = ClientSession(
-                connector=TCPConnector(keepalive_timeout=ASYNC_KEEPALIVE_TIMEOUT_SECONDS),
+            self._owned_sessions[purpose] = ClientSession(
+                connector=TCPConnector(
+                    keepalive_timeout=ASYNC_KEEPALIVE_TIMEOUT_SECONDS,
+                    limit=_ASYNC_RELAY_CONNECTION_LIMITS[purpose],
+                ),
                 timeout=ClientTimeout(total=self.timeout_seconds)
             )
-        return self._owned_session
+        return self._owned_sessions[purpose]
 
     async def _request_json(
         self,
@@ -985,7 +991,9 @@ class AsyncRelayWorkerClient(_RelayWorkerState):
                 raise RelayApiError(
                     f"relay request body exceeds the {MAX_RELAY_JSON_BYTES} byte limit"
                 )
-        client = await self._client()
+        client = await self._client(
+            purpose="poll" if path.partition("?")[0] == "/worker/poll" else "control"
+        )
         headers = dict(self.headers)
         try:
             async with client.request(

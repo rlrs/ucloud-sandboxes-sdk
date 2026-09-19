@@ -4,6 +4,9 @@
 
 ## 0.4.21 - 2026-09-19
 
+- Give async relay polling, upstream forwarding, and control requests separate
+  bounded connection pools so many long polls cannot starve reply commits or
+  lease renewals. The polling pool supports 512 concurrent polls.
 - Retire async clients' idle HTTP connections after five seconds, before the
   public proxy's ten-second idle close, to avoid stale-connection POST failures.
   Caller-supplied sessions retain their own connection settings.
