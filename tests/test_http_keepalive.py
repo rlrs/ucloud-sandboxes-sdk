@@ -68,7 +68,7 @@ class AsyncKeepaliveTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(ASYNC_KEEPALIVE_TIMEOUT_SECONDS, 0)
         self.assertLessEqual(ASYNC_KEEPALIVE_TIMEOUT_SECONDS, 5)
 
-    async def test_512_long_polls_and_upstreams_do_not_starve_control(self):
+    async def test_bounded_polls_and_512_upstreams_do_not_starve_control(self):
         from aiohttp import web
 
         polls_ready, upstreams_ready = asyncio.Event(), asyncio.Event()
@@ -78,7 +78,7 @@ class AsyncKeepaliveTests(unittest.IsolatedAsyncioTestCase):
         async def handle(request):
             if request.path == "/worker/poll":
                 counts["poll"] += 1
-                if counts["poll"] == 512:
+                if counts["poll"] == 128:
                     polls_ready.set()
                 await release_polls.wait()
                 return web.json_response({"requests": []})
@@ -106,7 +106,7 @@ class AsyncKeepaliveTests(unittest.IsolatedAsyncioTestCase):
         try:
             tasks.extend(
                 asyncio.create_task(client._request_json("GET", "/worker/poll?wait=10"))
-                for _ in range(512)
+                for _ in range(128)
             )
             await asyncio.wait_for(polls_ready.wait(), 20)
             tasks.extend(
@@ -126,7 +126,7 @@ class AsyncKeepaliveTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(upstreams_ready.wait(), 20)
             self.assertEqual(await asyncio.wait_for(client.health(), 2), {"ok": True})
             release_upstreams.set()
-            await asyncio.wait_for(asyncio.gather(*tasks[512:]), 20)
+            await asyncio.wait_for(asyncio.gather(*tasks[128:]), 20)
             self.assertEqual(counts["commit"], 512)
             self.assertFalse(release_polls.is_set())
         finally:
@@ -164,3 +164,51 @@ class AsyncKeepaliveTests(unittest.IsolatedAsyncioTestCase):
                     AsyncRelayWorkerClient.from_env(env={
                         "UCLOUD_RELAY_URL": "http://relay.invalid", key: value,
                     })
+
+    async def test_512_idle_workers_rotate_through_bounded_poll_pool(self):
+        from aiohttp import web
+
+        seen = set()
+        all_seen = asyncio.Event()
+        active = peak = 0
+        waits = []
+
+        async def poll(request):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            seen.add(request.query["rollout_id"])
+            if len(seen) == 512:
+                all_seen.set()
+            delay = float(request.query["timeout_seconds"])
+            waits.append(delay)
+            try:
+                await asyncio.sleep(delay)
+                return web.json_response({"requests": []})
+            finally:
+                active -= 1
+
+        app = web.Application()
+        app.router.add_get("/worker/poll", poll)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0, backlog=1024)
+        await site.start()
+        url = f"http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}"
+        client = AsyncRelayWorkerClient(url)
+        tasks = [asyncio.create_task(client.run_worker(
+            str(index), handler=lambda request: None,
+            registration_token="a" * 32, poll_timeout_seconds=10,
+        )) for index in range(512)]
+        try:
+            await asyncio.wait_for(all_seen.wait(), 12)
+            self.assertLessEqual(peak, 128)
+            self.assertTrue(all(0 < delay <= 1 for delay in waits))
+            self.assertTrue(all(not task.done() for task in tasks))
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await client.close()
+            await runner.cleanup()
+        self.assertEqual(client._active_workers, 0)

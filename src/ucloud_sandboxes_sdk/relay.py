@@ -37,7 +37,7 @@ RELAY_POLL_TIMEOUT_GRACE_SECONDS = 5.0
 DEFAULT_FORWARD_TIMEOUT_SECONDS = 7200.0
 # Long polls and slow upstream calls must not consume the connections needed
 # to commit replies or renew leases. Keep each pool bounded independently.
-_ASYNC_RELAY_CONNECTION_LIMITS = {"control": 128, "poll": 1024, "forward": 512}
+_ASYNC_RELAY_CONNECTION_LIMITS = {"control": 128, "poll": 128, "forward": 512}
 AGENT_LIFECYCLE_METADATA_KEY = "_ucloud_agent_lifecycle"
 MANAGED_AGENT_LIFECYCLE = "managed-process-v1"
 
@@ -632,7 +632,7 @@ class AsyncRelayWorkerClient(_RelayWorkerState):
         headers: Mapping[str, str] | None = None,
         session: Any | None = None,
         max_forward_connections: int = 512,
-        max_poll_connections: int = 1024,
+        max_poll_connections: int = 128,
     ) -> None:
         super().__init__()
         self.relay_url = relay_url.rstrip("/")
@@ -648,6 +648,8 @@ class AsyncRelayWorkerClient(_RelayWorkerState):
             "poll": _connection_limit(max_poll_connections),
         }
         self._owned_sessions: dict[str, Any] = {}
+        self._active_workers = 0
+        self._worker_poll_slots = asyncio.Semaphore(self._connection_limits["poll"])
 
     @classmethod
     def from_env(
@@ -690,7 +692,7 @@ class AsyncRelayWorkerClient(_RelayWorkerState):
                 if max_forward_connections is None else max_forward_connections
             ),
             max_poll_connections=(
-                _connection_limit_env(values, "UCLOUD_RELAY_MAX_POLL_CONNECTIONS", 1024)
+                _connection_limit_env(values, "UCLOUD_RELAY_MAX_POLL_CONNECTIONS", 128)
                 if max_poll_connections is None else max_poll_connections
             ),
         )
@@ -726,20 +728,34 @@ class AsyncRelayWorkerClient(_RelayWorkerState):
         max_consecutive_poll_errors: int = 8,
         registration_token: str | None = None,
     ) -> None:
-        await _run_async_worker(
-            self,
-            rollout_id,
-            handler=handler,
-            upstream_base_url=upstream_base_url,
-            worker_id=worker_id,
-            cancel=cancel,
-            max_concurrency=max_concurrency,
-            poll_timeout_seconds=poll_timeout_seconds,
-            lease_seconds=lease_seconds,
-            renewal_interval_seconds=renewal_interval_seconds,
-            max_consecutive_poll_errors=max_consecutive_poll_errors,
-            registration_token=registration_token,
-        )
+        self._active_workers += 1
+        try:
+            # Let concurrently started workers register before choosing their
+            # first poll duration; avoid a wave of long idle polls at startup.
+            await asyncio.sleep(0)
+            await _run_async_worker(
+                self,
+                rollout_id,
+                handler=handler,
+                upstream_base_url=upstream_base_url,
+                worker_id=worker_id,
+                cancel=cancel,
+                max_concurrency=max_concurrency,
+                poll_timeout_seconds=poll_timeout_seconds,
+                lease_seconds=lease_seconds,
+                renewal_interval_seconds=renewal_interval_seconds,
+                max_consecutive_poll_errors=max_consecutive_poll_errors,
+                registration_token=registration_token,
+            )
+        finally:
+            self._active_workers -= 1
+
+    def _worker_poll_timeout(self, requested: float) -> float:
+        # Rotate all shared workers through the bounded pool in about four
+        # seconds instead of holding one public connection per idle rollout.
+        # Direct poll() calls retain their caller-specified timeout.
+        rotation_wait = 4.0 * self._connection_limits["poll"] / max(1, self._active_workers)
+        return min(requested, max(0.25, rotation_wait))
 
     async def __aenter__(self) -> "AsyncRelayWorkerClient":
         await self._client()
@@ -1367,14 +1383,17 @@ async def _run_async_worker(
                 await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                 continue
             try:
-                result = await client.poll(
-                    rollout_id,
-                    worker_id=worker,
-                    timeout_seconds=poll_timeout_seconds,
-                    limit=available,
-                    lease_seconds=lease_seconds,
-                    registration_token=registration_token,
-                )
+                # Explicit FIFO admission prevents a worker with a reusable
+                # connection repeatedly bypassing queued rollouts in aiohttp.
+                async with client._worker_poll_slots:
+                    result = await client.poll(
+                        rollout_id,
+                        worker_id=worker,
+                        timeout_seconds=client._worker_poll_timeout(poll_timeout_seconds),
+                        limit=available,
+                        lease_seconds=lease_seconds,
+                        registration_token=registration_token,
+                    )
                 poll_errors = 0
             except RelayApiError as exc:
                 poll_errors += 1
