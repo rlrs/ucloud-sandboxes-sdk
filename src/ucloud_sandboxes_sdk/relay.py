@@ -20,6 +20,7 @@ import uuid
 import warnings
 
 from ._http import (
+    ASYNC_KEEPALIVE_TIMEOUT_SECONDS,
     ResponseTooLargeError,
     open_no_redirect,
     read_async_response,
@@ -958,13 +959,14 @@ class AsyncRelayWorkerClient(_RelayWorkerState):
             return self._session
         if self._owned_session is None:
             try:
-                from aiohttp import ClientSession, ClientTimeout
+                from aiohttp import ClientSession, ClientTimeout, TCPConnector
             except ImportError as exc:
                 raise RuntimeError(
                     "AsyncRelayWorkerClient requires aiohttp. Install "
                     "ucloud-sandboxes-sdk[async] or ucloud-sandboxes-sdk[inspect]."
                 ) from exc
             self._owned_session = ClientSession(
+                connector=TCPConnector(keepalive_timeout=ASYNC_KEEPALIVE_TIMEOUT_SECONDS),
                 timeout=ClientTimeout(total=self.timeout_seconds)
             )
         return self._owned_session

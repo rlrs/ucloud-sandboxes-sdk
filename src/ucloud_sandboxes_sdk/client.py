@@ -31,6 +31,7 @@ import uuid
 
 from .network_policy import SandboxNetworkPolicy
 from ._http import (
+    ASYNC_KEEPALIVE_TIMEOUT_SECONDS,
     ResponseTooLargeError,
     open_no_redirect,
     read_async_response,
@@ -2393,13 +2394,15 @@ class AsyncSandboxClient(_DirectSandboxOperations):
             return self._session
         if self._owned_session is None:
             try:
-                from aiohttp import ClientSession
+                from aiohttp import ClientSession, TCPConnector
             except ImportError as exc:
                 raise RuntimeError(
                     "AsyncSandboxClient requires aiohttp. Install "
                     "ucloud-sandboxes-sdk[async] or ucloud-sandboxes-sdk[inspect]."
                 ) from exc
-            self._owned_session = ClientSession()
+            self._owned_session = ClientSession(
+                connector=TCPConnector(keepalive_timeout=ASYNC_KEEPALIVE_TIMEOUT_SECONDS)
+            )
         return self._owned_session
 
     async def _request_json(

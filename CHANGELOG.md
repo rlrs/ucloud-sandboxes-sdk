@@ -4,6 +4,9 @@
 
 ## 0.4.21 - 2026-09-19
 
+- Retire async clients' idle HTTP connections after five seconds, before the
+  public proxy's ten-second idle close, to avoid stale-connection POST failures.
+  Caller-supplied sessions retain their own connection settings.
 - Retry idempotent relay response commits after transport failures and transient
   HTTP errors, retaining the same request/lease identity and response bytes.
 - Preserve attempt bounds, Retry-After, explicit non-retryable responses, and

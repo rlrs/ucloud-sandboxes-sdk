@@ -3,6 +3,11 @@ from __future__ import annotations
 from typing import Any
 from urllib import request
 
+# Retire idle pooled connections before the public proxy's 10-second timeout.
+# A stale connection can lose a POST before its response is available, and
+# ambiguous sandbox mutations cannot safely be retried.
+ASYNC_KEEPALIVE_TIMEOUT_SECONDS = 5.0
+
 
 class _RejectRedirects(request.HTTPRedirectHandler):
     def redirect_request(
