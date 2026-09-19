@@ -325,6 +325,16 @@ with relay.rollout_session(
 Use `AsyncRelayWorkerClient` for async workers; it exposes the same methods with
 `await`. `from_env()` reads `UCLOUD_RELAY_URL`,
 `UCLOUD_RELAY_WORKER_TOKEN`, and optional `UCLOUD_RELAY_TIMEOUT_SECONDS`.
+Owned async relay sessions use separate bounded connection pools: 512 upstream
+requests, 1024 polls and 128 control requests per shared client. Configure
+`max_forward_connections` and `max_poll_connections` on
+`AsyncRelayWorkerClient`, or set `UCLOUD_RELAY_MAX_FORWARD_CONNECTIONS` and
+`UCLOUD_RELAY_MAX_POLL_CONNECTIONS` when using `from_env()`. Values must be
+positive integers; set a lower forwarding limit if your upstream requires it.
+Caller-supplied sessions retain their own connection policy and ownership.
+These transport limits apply across rollouts, separately from each worker's
+`max_concurrency`.
+
 Upstream forwarding has its own `forward_timeout_seconds` budget (default
 7,200 seconds), also configurable with `UCLOUD_RELAY_FORWARD_TIMEOUT_SECONDS`.
 Gateway control calls retain their separate 30-second default. For example,

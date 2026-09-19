@@ -68,7 +68,7 @@ class AsyncKeepaliveTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(ASYNC_KEEPALIVE_TIMEOUT_SECONDS, 0)
         self.assertLessEqual(ASYNC_KEEPALIVE_TIMEOUT_SECONDS, 5)
 
-    async def test_long_polls_and_slow_upstreams_do_not_starve_control(self):
+    async def test_512_long_polls_and_upstreams_do_not_starve_control(self):
         from aiohttp import web
 
         polls_ready, upstreams_ready = asyncio.Event(), asyncio.Event()
@@ -78,13 +78,13 @@ class AsyncKeepaliveTests(unittest.IsolatedAsyncioTestCase):
         async def handle(request):
             if request.path == "/worker/poll":
                 counts["poll"] += 1
-                if counts["poll"] == 100:
+                if counts["poll"] == 512:
                     polls_ready.set()
                 await release_polls.wait()
                 return web.json_response({"requests": []})
             if request.path == "/upstream":
                 counts["upstream"] += 1
-                if counts["upstream"] == 100:
+                if counts["upstream"] == 512:
                     upstreams_ready.set()
                 await release_upstreams.wait()
                 return web.Response(body=b"reply")
@@ -98,7 +98,7 @@ class AsyncKeepaliveTests(unittest.IsolatedAsyncioTestCase):
         app.router.add_route("*", "/{tail:.*}", handle)
         runner = web.AppRunner(app)
         await runner.setup()
-        site = web.TCPSite(runner, "127.0.0.1", 0)
+        site = web.TCPSite(runner, "127.0.0.1", 0, backlog=1024)
         await site.start()
         url = f"http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}"
         client = AsyncRelayWorkerClient(url)
@@ -106,9 +106,9 @@ class AsyncKeepaliveTests(unittest.IsolatedAsyncioTestCase):
         try:
             tasks.extend(
                 asyncio.create_task(client._request_json("GET", "/worker/poll?wait=10"))
-                for _ in range(100)
+                for _ in range(512)
             )
-            await asyncio.wait_for(polls_ready.wait(), 5)
+            await asyncio.wait_for(polls_ready.wait(), 20)
             tasks.extend(
                 asyncio.create_task(
                     client.forward_to(
@@ -121,13 +121,13 @@ class AsyncKeepaliveTests(unittest.IsolatedAsyncioTestCase):
                         url,
                     )
                 )
-                for index in range(100)
+                for index in range(512)
             )
-            await asyncio.wait_for(upstreams_ready.wait(), 5)
+            await asyncio.wait_for(upstreams_ready.wait(), 20)
             self.assertEqual(await asyncio.wait_for(client.health(), 2), {"ok": True})
             release_upstreams.set()
-            await asyncio.wait_for(asyncio.gather(*tasks[100:]), 5)
-            self.assertEqual(counts["commit"], 100)
+            await asyncio.wait_for(asyncio.gather(*tasks[512:]), 20)
+            self.assertEqual(counts["commit"], 512)
             self.assertFalse(release_polls.is_set())
         finally:
             release_polls.set()
@@ -139,3 +139,28 @@ class AsyncKeepaliveTests(unittest.IsolatedAsyncioTestCase):
             await client.close()
             self.assertTrue(all(session.closed for session in sessions))
             await runner.cleanup()
+
+    async def test_relay_connection_limits_can_be_bounded_by_caller(self):
+        client = AsyncRelayWorkerClient.from_env(env={
+            "UCLOUD_RELAY_URL": "http://relay.invalid",
+            "UCLOUD_RELAY_MAX_FORWARD_CONNECTIONS": "3",
+            "UCLOUD_RELAY_MAX_POLL_CONNECTIONS": "7",
+        }, max_forward_connections=5)
+        try:
+            self.assertEqual((await client._client(purpose="forward")).connector.limit, 5)
+            self.assertEqual((await client._client(purpose="poll")).connector.limit, 7)
+            self.assertEqual((await client._client()).connector.limit, 128)
+        finally:
+            await client.close()
+
+    def test_unbounded_and_invalid_relay_connection_limits_are_rejected(self):
+        for key in ("max_forward_connections", "max_poll_connections"):
+            for value in (0, -1, True, 1.5, "3"):
+                with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                    AsyncRelayWorkerClient("http://relay.invalid", **{key: value})
+        for key in ("UCLOUD_RELAY_MAX_FORWARD_CONNECTIONS", "UCLOUD_RELAY_MAX_POLL_CONNECTIONS"):
+            for value in ("0", "-1", "1.5", "invalid"):
+                with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                    AsyncRelayWorkerClient.from_env(env={
+                        "UCLOUD_RELAY_URL": "http://relay.invalid", key: value,
+                    })

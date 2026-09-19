@@ -37,7 +37,7 @@ RELAY_POLL_TIMEOUT_GRACE_SECONDS = 5.0
 DEFAULT_FORWARD_TIMEOUT_SECONDS = 7200.0
 # Long polls and slow upstream calls must not consume the connections needed
 # to commit replies or renew leases. Keep each pool bounded independently.
-_ASYNC_RELAY_CONNECTION_LIMITS = {"control": 100, "poll": 512, "forward": 100}
+_ASYNC_RELAY_CONNECTION_LIMITS = {"control": 128, "poll": 1024, "forward": 512}
 AGENT_LIFECYCLE_METADATA_KEY = "_ucloud_agent_lifecycle"
 MANAGED_AGENT_LIFECYCLE = "managed-process-v1"
 
@@ -631,6 +631,8 @@ class AsyncRelayWorkerClient(_RelayWorkerState):
         forward_timeout_seconds: float = DEFAULT_FORWARD_TIMEOUT_SECONDS,
         headers: Mapping[str, str] | None = None,
         session: Any | None = None,
+        max_forward_connections: int = 512,
+        max_poll_connections: int = 1024,
     ) -> None:
         super().__init__()
         self.relay_url = relay_url.rstrip("/")
@@ -640,6 +642,11 @@ class AsyncRelayWorkerClient(_RelayWorkerState):
         if worker_token is not None:
             self.headers["Authorization"] = f"Bearer {worker_token}"
         self._session = session
+        self._connection_limits = {
+            **_ASYNC_RELAY_CONNECTION_LIMITS,
+            "forward": _connection_limit(max_forward_connections),
+            "poll": _connection_limit(max_poll_connections),
+        }
         self._owned_sessions: dict[str, Any] = {}
 
     @classmethod
@@ -651,6 +658,8 @@ class AsyncRelayWorkerClient(_RelayWorkerState):
         forward_timeout_seconds: float | None = None,
         headers: Mapping[str, str] | None = None,
         session: Any | None = None,
+        max_forward_connections: int | None = None,
+        max_poll_connections: int | None = None,
     ) -> "AsyncRelayWorkerClient":
         values = os.environ if env is None else env
         return cls(
@@ -676,6 +685,14 @@ class AsyncRelayWorkerClient(_RelayWorkerState):
             ),
             headers=headers,
             session=session,
+            max_forward_connections=(
+                _connection_limit_env(values, "UCLOUD_RELAY_MAX_FORWARD_CONNECTIONS", 512)
+                if max_forward_connections is None else max_forward_connections
+            ),
+            max_poll_connections=(
+                _connection_limit_env(values, "UCLOUD_RELAY_MAX_POLL_CONNECTIONS", 1024)
+                if max_poll_connections is None else max_poll_connections
+            ),
         )
 
     def rollout_session(
@@ -971,7 +988,7 @@ class AsyncRelayWorkerClient(_RelayWorkerState):
             self._owned_sessions[purpose] = ClientSession(
                 connector=TCPConnector(
                     keepalive_timeout=ASYNC_KEEPALIVE_TIMEOUT_SECONDS,
-                    limit=_ASYNC_RELAY_CONNECTION_LIMITS[purpose],
+                    limit=self._connection_limits[purpose],
                 ),
                 timeout=ClientTimeout(total=self.timeout_seconds)
             )
@@ -1691,6 +1708,22 @@ def _required_env(env: Mapping[str, str], name: str) -> str:
     if not value:
         raise ValueError(f"{name} is required")
     return value
+
+
+def _connection_limit(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError("relay connection limits must be positive integers")
+    return value
+
+
+def _connection_limit_env(env: Mapping[str, str], name: str, default: int) -> int:
+    raw = str(env.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return _connection_limit(int(raw))
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
 
 
 def _positive_env_float(
