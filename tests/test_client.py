@@ -98,6 +98,54 @@ class _ScriptedAsyncSession:
 
 
 class SandboxSdkTests(unittest.TestCase):
+    def test_exec_final_watermark_drains_all_pages_without_confirmation_poll(self) -> None:
+        class Pages:
+            timeout_seconds = 10
+
+            def __init__(self, watermark):
+                self.watermark, self.calls = watermark, 0
+
+            def read_exec_events(self, _session, **kwargs):
+                self.calls += 1
+                all_events = [
+                    {"sequence": 1, "stream": "stdout", "data": "out"},
+                    {"sequence": 2, "stream": "stderr", "data": "err"},
+                    {"sequence": 3, "stream": "exit", "data": "", "exit_code": 0},
+                ]
+                return {
+                    "session": {"status": "exited", "exit_code": 0, "final_sequence": self.watermark},
+                    "events": [e for e in all_events if e['sequence'] > kwargs['after']][:2],
+                }
+
+        class AsyncPages(Pages):
+            async def read_exec_events(self, *args, **kwargs):
+                return super().read_exec_events(*args, **kwargs)
+
+        async def async_case(watermark, events_only):
+            client = AsyncPages(watermark)
+            handle = client_module.AsyncExecHandle(client, "exec", "sandbox")
+            if events_only:
+                received = [event async for event in handle.events()]
+                self.assertEqual([e['sequence'] for e in received], [1, 2, 3])
+            else:
+                result = await handle.wait(timeout_seconds=1)
+                self.assertEqual((result.stdout, result.stderr, result.exit_code), ("out", "err", 0))
+            return client.calls
+
+        for watermark in (3, None, True, -1, "3"):
+            for events_only in (False, True):
+                with self.subTest(watermark=watermark, events_only=events_only):
+                    client = Pages(watermark)
+                    handle = client_module.ExecHandle(client, "exec", "sandbox")
+                    if events_only:
+                        self.assertEqual([e['sequence'] for e in handle.events()], [1, 2, 3])
+                    else:
+                        result = handle.wait(timeout_seconds=1)
+                        self.assertEqual((result.stdout, result.stderr, result.exit_code), ("out", "err", 0))
+                    expected = 2 if type(watermark) is int and watermark == 3 else 3
+                    self.assertEqual(client.calls, expected)
+                    self.assertEqual(asyncio.run(async_case(watermark, events_only)), expected)
+
     def test_profiles_benchmark_factory_and_environment_constructors(self) -> None:
         benchmark = SandboxSpec.benchmark(
             id="benchmark-one",

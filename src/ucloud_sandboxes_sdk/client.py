@@ -873,6 +873,17 @@ class _ExecState:
     def _result(self, events: list[JsonObject]) -> SandboxExecResult:
         return _exec_result(self.session_id, self.session, events)
 
+    def _events_drained(self, events: list[JsonObject]) -> bool:
+        if self.session.get("status") not in TERMINAL_EXEC_STATUSES:
+            return False
+        final = self.session.get("final_sequence")
+        if type(final) is int and final >= 0:
+            return self.last_sequence >= final
+        # Older servers, or streams still held by a descendant, require the
+        # existing empty-read confirmation. A terminal status alone does not
+        # establish that paginated output has all arrived.
+        return not events
+
 
 @dataclass
 class _ImageBuildWait:
@@ -963,7 +974,7 @@ class ExecHandle(_ExecState):
             events = self._accept_events(payload)
             for event in events:
                 yield event
-            if self.session.get("status") in TERMINAL_EXEC_STATUSES and not events:
+            if self._events_drained(events):
                 return
 
     def wait(
@@ -996,7 +1007,7 @@ class ExecHandle(_ExecState):
             events.extend(new_events)
             if self.session.get("status") in TERMINAL_EXEC_STATUSES:
                 terminal_seen = True
-                if not new_events:
+                if self._events_drained(new_events):
                     return self._result(events)
 
 
@@ -1661,7 +1672,7 @@ class AsyncExecHandle(_ExecState):
             events = self._accept_events(payload)
             for event in events:
                 yield event
-            if self.session.get("status") in TERMINAL_EXEC_STATUSES and not events:
+            if self._events_drained(events):
                 return
 
     async def wait(
@@ -1694,7 +1705,7 @@ class AsyncExecHandle(_ExecState):
             events.extend(new_events)
             if self.session.get("status") in TERMINAL_EXEC_STATUSES:
                 terminal_seen = True
-                if not new_events:
+                if self._events_drained(new_events):
                     return self._result(events)
 
 

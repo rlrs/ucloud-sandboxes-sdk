@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.4.24 - 2026-09-23
+
+- Finish exec waits and event iteration at the server-proven final output
+  sequence, avoiding an extra confirmation request while preserving paginated
+  stdout/stderr. Older servers retain the existing polling behavior.
+
 ## 0.4.21 - 2026-09-19
 
 - Let explicit exec-event admission rejections retry within the caller deadline,
