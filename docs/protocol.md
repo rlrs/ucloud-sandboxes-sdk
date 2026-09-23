@@ -262,3 +262,14 @@ a fresh timeout for each attempt.
 
 Inspect integration retries transient scale-up and gateway errors. Normal SDK
 methods make one gateway request per method call.
+
+### Initial exec output
+
+`POST /v1/sandboxes/{id}/exec?initial_wait_seconds=0.05` optionally includes
+`events` alongside `session` in the response. The worker waits at most 50 ms
+after process startup for the final output watermark, or until 100 events are
+available. Interactive/TTY commands never wait. The response is an atomic
+snapshot and does not consume server event history. Continue with `after` equal
+to the last returned sequence. A terminal status alone never proves output
+complete; `final_sequence` must be drained. Older servers ignore the query and
+return only the session, so clients fall back to the existing event endpoint.

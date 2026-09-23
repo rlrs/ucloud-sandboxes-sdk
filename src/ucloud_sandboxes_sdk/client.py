@@ -853,6 +853,12 @@ class _ExecState:
     session_id: str
     session: JsonObject
     last_sequence: int
+    _initial_payload: JsonObject | None
+
+    def _take_initial_payload(self) -> JsonObject | None:
+        payload = self._initial_payload
+        self._initial_payload = None
+        return payload
 
     def _accept_session(self, payload: JsonObject) -> None:
         session = payload.get("session")
@@ -934,6 +940,7 @@ class ExecHandle(_ExecState):
     sandbox_id: str
     session: JsonObject = field(default_factory=dict)
     last_sequence: int = 0
+    _initial_payload: JsonObject | None = field(default=None, repr=False)
 
     def get(self) -> JsonObject:
         payload = self.client.get_exec_session(self.session_id)
@@ -965,12 +972,14 @@ class ExecHandle(_ExecState):
     ) -> Iterator[JsonObject]:
         resolved_wait_seconds = _exec_event_wait_seconds(self.client, wait_seconds)
         while True:
-            payload = self.client.read_exec_events(
-                self.session_id,
-                after=self.last_sequence,
-                limit=limit,
-                wait_seconds=resolved_wait_seconds,
-            )
+            payload = self._take_initial_payload()
+            if payload is None:
+                payload = self.client.read_exec_events(
+                    self.session_id,
+                    after=self.last_sequence,
+                    limit=limit,
+                    wait_seconds=resolved_wait_seconds,
+                )
             events = self._accept_events(payload)
             for event in events:
                 yield event
@@ -997,12 +1006,14 @@ class ExecHandle(_ExecState):
             wait_seconds = settle_seconds if terminal_seen else resolved_poll_wait
             if deadline is not None:
                 wait_seconds = min(wait_seconds, max(0.0, deadline - time.monotonic()))
-            payload = self.client.read_exec_events(
-                self.session_id,
-                after=self.last_sequence,
-                limit=100,
-                wait_seconds=wait_seconds,
-            )
+            payload = self._take_initial_payload()
+            if payload is None:
+                payload = self.client.read_exec_events(
+                    self.session_id,
+                    after=self.last_sequence,
+                    limit=100,
+                    wait_seconds=wait_seconds,
+                )
             new_events = self._accept_events(payload)
             events.extend(new_events)
             if self.session.get("status") in TERMINAL_EXEC_STATUSES:
@@ -1166,11 +1177,15 @@ class SandboxClient(_DirectSandboxOperations):
         )
         response = self._request_json(
             "POST",
-            f"/v1/sandboxes/{_quote_segment(sandbox_id)}/exec",
+            f"/v1/sandboxes/{_quote_segment(sandbox_id)}/exec"
+            + ("?initial_wait_seconds=0.05" if not stdin and not tty else ""),
             payload=payload,
         )
         session = _exec_session(response)
-        return ExecHandle(self, session["id"], sandbox_id, session=session)
+        return ExecHandle(
+            self, session["id"], sandbox_id, session=session,
+            _initial_payload=response if "events" in response else None,
+        )
 
     def exec(
         self,
@@ -1632,6 +1647,7 @@ class AsyncExecHandle(_ExecState):
     sandbox_id: str
     session: JsonObject = field(default_factory=dict)
     last_sequence: int = 0
+    _initial_payload: JsonObject | None = field(default=None, repr=False)
 
     async def get(self) -> JsonObject:
         payload = await self.client.get_exec_session(self.session_id)
@@ -1663,12 +1679,14 @@ class AsyncExecHandle(_ExecState):
     ) -> AsyncIterator[JsonObject]:
         resolved_wait_seconds = _exec_event_wait_seconds(self.client, wait_seconds)
         while True:
-            payload = await self.client.read_exec_events(
-                self.session_id,
-                after=self.last_sequence,
-                limit=limit,
-                wait_seconds=resolved_wait_seconds,
-            )
+            payload = self._take_initial_payload()
+            if payload is None:
+                payload = await self.client.read_exec_events(
+                    self.session_id,
+                    after=self.last_sequence,
+                    limit=limit,
+                    wait_seconds=resolved_wait_seconds,
+                )
             events = self._accept_events(payload)
             for event in events:
                 yield event
@@ -1695,12 +1713,14 @@ class AsyncExecHandle(_ExecState):
             wait_seconds = settle_seconds if terminal_seen else resolved_poll_wait
             if deadline is not None:
                 wait_seconds = min(wait_seconds, max(0.0, deadline - time.monotonic()))
-            payload = await self.client.read_exec_events(
-                self.session_id,
-                after=self.last_sequence,
-                limit=100,
-                wait_seconds=wait_seconds,
-            )
+            payload = self._take_initial_payload()
+            if payload is None:
+                payload = await self.client.read_exec_events(
+                    self.session_id,
+                    after=self.last_sequence,
+                    limit=100,
+                    wait_seconds=wait_seconds,
+                )
             new_events = self._accept_events(payload)
             events.extend(new_events)
             if self.session.get("status") in TERMINAL_EXEC_STATUSES:
@@ -2104,11 +2124,15 @@ class AsyncSandboxClient(_DirectSandboxOperations):
         )
         response = await self._request_json(
             "POST",
-            f"/v1/sandboxes/{_quote_segment(sandbox_id)}/exec",
+            f"/v1/sandboxes/{_quote_segment(sandbox_id)}/exec"
+            + ("?initial_wait_seconds=0.05" if not stdin and not tty else ""),
             payload=payload,
         )
         session = _exec_session(response)
-        return AsyncExecHandle(self, session["id"], sandbox_id, session=session)
+        return AsyncExecHandle(
+            self, session["id"], sandbox_id, session=session,
+            _initial_payload=response if "events" in response else None,
+        )
 
     async def open_process(
         self,

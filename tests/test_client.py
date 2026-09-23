@@ -98,6 +98,66 @@ class _ScriptedAsyncSession:
 
 
 class SandboxSdkTests(unittest.TestCase):
+    def test_start_exec_consumes_initial_http_response_without_poll(self):
+        payload = {"session": {"id": "short", "status": "exited", "exit_code": 0, "final_sequence": 1}, "events": [{"sequence": 1, "stream": "stdout", "data": "complete"}]}
+        requests = []
+        def respond(req, **kwargs):
+            requests.append((req.method, req.full_url))
+            return _SyncResponse(json.dumps(payload).encode())
+        with patch.object(client_module, "open_no_redirect", respond):
+            client = SandboxClient("http://gateway.invalid")
+            result = client.exec("one", ["true"])
+        self.assertEqual(result.stdout, "complete")
+        self.assertEqual(requests, [("POST", "http://gateway.invalid/v1/sandboxes/one/exec?initial_wait_seconds=0.05")])
+        async def async_case():
+            client = AsyncSandboxClient("http://gateway.invalid")
+            client._request_json = AsyncMock(return_value=payload)
+            result = await client.exec("one", ["true"])
+            self.assertEqual(result.stdout, "complete")
+            self.assertEqual(client._request_json.await_count, 1)
+            self.assertTrue(client._request_json.call_args.args[1].endswith("?initial_wait_seconds=0.05"))
+        asyncio.run(async_case())
+
+    def test_initial_exec_output_sync_async_wait_and_stream(self):
+        events = [
+            {"sequence": 1, "stream": "stdout", "data": "out"},
+            {"sequence": 2, "stream": "stderr", "data": "err"},
+            {"sequence": 3, "stream": "exit", "data": "", "exit_code": 0},
+        ]
+        class Pages:
+            timeout_seconds = 10
+            def __init__(self): self.calls = 0
+            def read_exec_events(self, _session, **kwargs):
+                self.calls += 1
+                return {"session": {"status": "exited", "exit_code": 0, "final_sequence": 3}, "events": [e for e in events if e["sequence"] > kwargs["after"]]}
+        class AsyncPages(Pages):
+            async def read_exec_events(self, *args, **kwargs):
+                return super().read_exec_events(*args, **kwargs)
+        def payload(size):
+            return {"session": {"status": "exited", "exit_code": 0, "final_sequence": 3}, "events": events[:size]}
+        async def async_case(size, stream):
+            client = AsyncPages()
+            handle = client_module.AsyncExecHandle(client, "exec", "one", _initial_payload=payload(size))
+            if stream:
+                self.assertEqual([e async for e in handle.events()], events)
+            else:
+                result = await handle.wait()
+                self.assertEqual((result.stdout, result.stderr, result.exit_code), ("out", "err", 0))
+            self.assertIsNone(handle._initial_payload)
+            self.assertEqual(client.calls, int(size < 3))
+        for size in (0, 1, 3):
+            for stream in (False, True):
+                client = Pages()
+                handle = client_module.ExecHandle(client, "exec", "one", _initial_payload=payload(size))
+                if stream:
+                    self.assertEqual(list(handle.events()), events)
+                else:
+                    result = handle.wait()
+                    self.assertEqual((result.stdout, result.stderr, result.exit_code), ("out", "err", 0))
+                self.assertEqual(client.calls, int(size < 3))
+                self.assertIsNone(handle._initial_payload)
+                asyncio.run(async_case(size, stream))
+
     def test_exec_final_watermark_drains_all_pages_without_confirmation_poll(self) -> None:
         class Pages:
             timeout_seconds = 10
