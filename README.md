@@ -13,9 +13,9 @@ Install the versioned wheel from the GitHub release (the SDK is not currently
 published on PyPI):
 
 ```bash
-uv add "ucloud-sandboxes-sdk @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.20/ucloud_sandboxes_sdk-0.4.20-py3-none-any.whl"
-uv add "ucloud-sandboxes-sdk[async] @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.20/ucloud_sandboxes_sdk-0.4.20-py3-none-any.whl"
-uv add "ucloud-sandboxes-sdk[inspect] @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.20/ucloud_sandboxes_sdk-0.4.20-py3-none-any.whl"
+uv add "ucloud-sandboxes-sdk @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.25/ucloud_sandboxes_sdk-0.4.25-py3-none-any.whl"
+uv add "ucloud-sandboxes-sdk[async] @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.25/ucloud_sandboxes_sdk-0.4.25-py3-none-any.whl"
+uv add "ucloud-sandboxes-sdk[inspect] @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.25/ucloud_sandboxes_sdk-0.4.25-py3-none-any.whl"
 ```
 
 Use the base package for the synchronous client, the `async` extra for

@@ -1,10 +1,10 @@
-# 0.4.25
-
-Short noninteractive execs request up to 50 ms of initial output in their start response. Completed output avoids a follow-up HTTP poll; partial output retains sequence and final-watermark checks. Older servers continue through the existing event endpoint.
-
 # Changelog
 
 ## Unreleased
+
+## 0.4.25 - 2026-09-23
+
+Short noninteractive execs request up to 50 ms of initial output in their start response. Completed output avoids a follow-up HTTP poll; partial output retains sequence and final-watermark checks. Older servers continue through the existing event endpoint.
 
 ## 0.4.24 - 2026-09-23
 
