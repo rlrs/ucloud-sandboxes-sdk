@@ -13,9 +13,9 @@ Install the versioned wheel from the GitHub release (the SDK is not currently
 published on PyPI):
 
 ```bash
-uv add "ucloud-sandboxes-sdk @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.25/ucloud_sandboxes_sdk-0.4.25-py3-none-any.whl"
-uv add "ucloud-sandboxes-sdk[async] @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.25/ucloud_sandboxes_sdk-0.4.25-py3-none-any.whl"
-uv add "ucloud-sandboxes-sdk[inspect] @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.25/ucloud_sandboxes_sdk-0.4.25-py3-none-any.whl"
+uv add "ucloud-sandboxes-sdk @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.26/ucloud_sandboxes_sdk-0.4.26-py3-none-any.whl"
+uv add "ucloud-sandboxes-sdk[async] @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.26/ucloud_sandboxes_sdk-0.4.26-py3-none-any.whl"
+uv add "ucloud-sandboxes-sdk[inspect] @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.26/ucloud_sandboxes_sdk-0.4.26-py3-none-any.whl"
 ```
 
 Use the base package for the synchronous client, the `async` extra for
@@ -321,6 +321,24 @@ with relay.rollout_session(
         lease_seconds=600,
     )
 ```
+
+`respond_to()` and `commit_response_bytes_to()` acknowledge **durable acceptance**,
+not sandbox wake or receipt. New servers return `committed: true` and
+`delivery_status: "pending"` or `"released"`; released means the caller may receive
+the result, not that it has consumed it. The server retries pending delivery
+independently. A lost acknowledgement retries the identical result and never
+requires a second model invocation. Older servers omit these fields and may
+still wait for wake before acknowledging. Both clients validate the new receipt
+contract when present. Wait for application continuation separately when needed.
+
+`update_resource_phase()` reports optional scheduling advice for a registered
+rollout. Supply a strictly increasing `sequence`, a `phase` (`model_wait`, `tool`,
+`rollout_complete`, `training_pause`, or `training_resume`), and a bounded
+`ttl_seconds`. A model wait may include `expected_remaining_wait_seconds`.
+Identical retries preserve their sequence and payload. The registration token
+fences the rollout incarnation; expired or stale advice cannot authorize parking,
+cancel execution, or delete a sandbox. This optional endpoint requires server
+0.5.114 or newer. Missing hints preserve normal scheduling behavior.
 
 Use `AsyncRelayWorkerClient` for async workers; it exposes the same methods with
 `await`. `from_env()` reads `UCLOUD_RELAY_URL`,
@@ -654,3 +672,14 @@ image identity and uploaded context. The default submission budget is ten
 minutes, including context upload; `timeout_seconds` overrides it. Ambiguous
 POST failures and build execution failures are not automatically resubmitted.
 This requires gateway 0.5.46 or newer to advertise the admission fence.
+
+Relay worker sessions sharing one client also share `max_inflight_requests`
+(default 512; `UCLOUD_RELAY_MAX_INFLIGHT_REQUESTS` for `from_env`). Admission is
+FIFO and reserves one request before each poll, so idle sessions do not hoard
+their per-session concurrency allowance. Empty polls return capacity immediately. A request holds capacity through durable response
+acceptance, independently of sandbox wake. Per-session `max_concurrency` remains
+its local share. This budget queues work instead of rejecting it, and is distinct
+from the async forwarding connection pool. Reply and renewal connections remain
+reserved separately. Share one client across an experiment; different processes
+need a supervisor to divide their total budget. Direct `poll()` callers retain
+responsibility for admitting work before leasing it.

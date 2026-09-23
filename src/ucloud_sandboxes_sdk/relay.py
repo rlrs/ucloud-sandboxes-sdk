@@ -11,7 +11,7 @@ import inspect
 import json
 import math
 import os
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 import time
 from typing import Any, Awaitable, Callable, Mapping
 from urllib import error, parse, request
@@ -28,6 +28,7 @@ from ._http import (
     response_headers,
 )
 from ._agent_contract import require_agent_sandbox_record
+from ._relay_admission import AsyncRequestBudget, SyncRequestBudget
 
 
 JsonObject = dict[str, Any]
@@ -182,6 +183,20 @@ class RelayResponse:
     headers: Mapping[str, str] | None = None
 
 
+def _completion_receipt(payload: JsonObject, request: RelayRequest) -> JsonObject:
+    """Decode one completion contract for both transports and result endpoints."""
+    if payload.get("request_id", request.request_id) != request.request_id:
+        raise RelayApiError("relay completion request_id does not match", body=payload)
+    # Pre-acceptance-boundary servers did not supply delivery metadata. Keep
+    # their receipt unchanged; absence is unknown, never an invented wake proof.
+    if "committed" in payload or "delivery_status" in payload:
+        if (payload.get("ok") is not True or payload.get("committed") is not True
+                or payload.get("request_id") != request.request_id
+                or payload.get("delivery_status") not in ("pending", "released")):
+            raise RelayApiError("relay returned an invalid durable completion receipt", body=payload)
+    return payload
+
+
 class _RelayWorkerState:
     def __init__(self) -> None:
         self._registration_tokens: dict[str, str] = {}
@@ -231,8 +246,12 @@ class RelayWorkerClient(_RelayWorkerState):
         timeout_seconds: float = 30.0,
         forward_timeout_seconds: float = DEFAULT_FORWARD_TIMEOUT_SECONDS,
         headers: Mapping[str, str] | None = None,
+        max_inflight_requests: int = 512,
     ) -> None:
         super().__init__()
+        self._request_budget = SyncRequestBudget(_connection_limit(max_inflight_requests))
+        self._active_workers = 0
+        self._active_workers_lock = Lock()
         self.relay_url = relay_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
         self.forward_timeout_seconds = _forward_timeout(forward_timeout_seconds)
@@ -247,6 +266,7 @@ class RelayWorkerClient(_RelayWorkerState):
         env: Mapping[str, str] | None = None,
         timeout_seconds: float | None = None,
         forward_timeout_seconds: float | None = None,
+        max_inflight_requests: int | None = None,
         headers: Mapping[str, str] | None = None,
     ) -> "RelayWorkerClient":
         values = os.environ if env is None else env
@@ -270,6 +290,10 @@ class RelayWorkerClient(_RelayWorkerState):
                 )
                 if forward_timeout_seconds is None
                 else forward_timeout_seconds
+            ),
+            max_inflight_requests=(
+                _connection_limit_env(values, "UCLOUD_RELAY_MAX_INFLIGHT_REQUESTS", 512)
+                if max_inflight_requests is None else max_inflight_requests
             ),
             headers=headers,
         )
@@ -305,20 +329,31 @@ class RelayWorkerClient(_RelayWorkerState):
         max_consecutive_poll_errors: int = 8,
         registration_token: str | None = None,
     ) -> None:
-        _run_sync_worker(
-            self,
-            rollout_id,
-            handler=handler,
-            upstream_base_url=upstream_base_url,
-            worker_id=worker_id,
-            cancel=cancel,
-            max_concurrency=max_concurrency,
-            poll_timeout_seconds=poll_timeout_seconds,
-            lease_seconds=lease_seconds,
-            renewal_interval_seconds=renewal_interval_seconds,
-            max_consecutive_poll_errors=max_consecutive_poll_errors,
-            registration_token=registration_token,
-        )
+        with self._active_workers_lock:
+            self._active_workers += 1
+        try:
+            _run_sync_worker(
+                self,
+                rollout_id,
+                handler=handler,
+                upstream_base_url=upstream_base_url,
+                worker_id=worker_id,
+                cancel=cancel,
+                max_concurrency=max_concurrency,
+                poll_timeout_seconds=poll_timeout_seconds,
+                lease_seconds=lease_seconds,
+                renewal_interval_seconds=renewal_interval_seconds,
+                max_consecutive_poll_errors=max_consecutive_poll_errors,
+                registration_token=registration_token,
+            )
+        finally:
+            with self._active_workers_lock:
+                self._active_workers -= 1
+
+    def _worker_poll_timeout(self, requested: float) -> float:
+        with self._active_workers_lock:
+            workers = max(1, self._active_workers)
+        return min(requested, max(.25, 4.0 * self._request_budget.capacity / workers))
 
     def health(self) -> JsonObject:
         return self._request_json("GET", "/healthz")
@@ -357,6 +392,30 @@ class RelayWorkerClient(_RelayWorkerState):
             metadata=_agent_rollout_metadata(sandbox, metadata),
         )
 
+    def update_resource_phase(
+        self,
+        rollout_id: str,
+        *,
+        sequence: int,
+        phase: str,
+        ttl_seconds: float = 60.0,
+        expected_remaining_wait_seconds: float | None = None,
+        registration_token: str | None = None,
+    ) -> JsonObject:
+        """Submit an expiring scheduling hint, never an execution command.
+
+        Sequence numbers increase within one registration. Retrying an identical
+        sequence/payload is safe and does not extend its expiry. A new rollout
+        registration starts its own sequence; old tokens cannot update it.
+        """
+        token = self._registration_token(rollout_id, registration_token)
+        return self._request_json(
+            "POST", _unregistration_path(rollout_id) + "/resource-phase",
+            payload={"registration_token": token, "update": _resource_phase_payload(
+                sequence, phase, ttl_seconds, expected_remaining_wait_seconds,
+            )},
+        )
+
     def unregister_rollout(
         self,
         rollout_id: str,
@@ -364,11 +423,19 @@ class RelayWorkerClient(_RelayWorkerState):
         registration_token: str | None = None,
     ) -> JsonObject:
         token = self._registration_token(rollout_id, registration_token)
-        response = self._request_json(
-            "DELETE",
-            _unregistration_path(rollout_id),
-            payload={"registration_token": token},
-        )
+        # The registration token fences this idempotent deletion. Keep it until
+        # an acknowledgement arrives, including when the first one was lost.
+        for attempt in range(3):
+            try:
+                response = self._request_json(
+                    "DELETE", _unregistration_path(rollout_id),
+                    payload={"registration_token": token},
+                )
+                break
+            except RelayApiError as exc:
+                if not _relay_error_is_retryable(exc) or attempt == 2:
+                    raise
+                time.sleep(max(0.0, _relay_retry_delay(exc, attempt + 1)))
         self._forget_registration(rollout_id)
         return response
 
@@ -440,11 +507,12 @@ class RelayWorkerClient(_RelayWorkerState):
         status: int = 200,
         headers: Mapping[str, str] | None = None,
     ) -> JsonObject:
-        return self._request_json(
+        receipt = self._request_json(
             "POST",
             "/worker/respond",
             payload=_response_payload(relay_request, response, status, headers),
         )
+        return _completion_receipt(receipt, relay_request)
 
     def commit_response_bytes_to(
         self,
@@ -456,7 +524,12 @@ class RelayWorkerClient(_RelayWorkerState):
         attempts: int = 60,
         retry_delay_seconds: float = 1.0,
     ) -> JsonObject:
-        """Retry this same idempotent commit through transport and wake failures."""
+        """Retain a response durably, retrying the identical result if needed.
+
+        Success means accepted, not that the caller has resumed. New servers
+        report delivery_status; "released" permits delivery but does not prove
+        receipt by the sandbox. Older servers may still wait for wake here.
+        """
 
         attempts = max(1, attempts)
         for attempt in range(attempts):
@@ -543,11 +616,12 @@ class RelayWorkerClient(_RelayWorkerState):
         *,
         status: int = 502,
     ) -> JsonObject:
-        return self._request_json(
+        receipt = self._request_json(
             "POST",
             "/worker/error",
             payload=_error_payload(relay_request, message, status),
         )
+        return _completion_receipt(receipt, relay_request)
 
     def _request_json(
         self,
@@ -633,8 +707,10 @@ class AsyncRelayWorkerClient(_RelayWorkerState):
         session: Any | None = None,
         max_forward_connections: int = 512,
         max_poll_connections: int = 128,
+        max_inflight_requests: int = 512,
     ) -> None:
         super().__init__()
+        self._request_budget = AsyncRequestBudget(_connection_limit(max_inflight_requests))
         self.relay_url = relay_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
         self.forward_timeout_seconds = _forward_timeout(forward_timeout_seconds)
@@ -658,6 +734,7 @@ class AsyncRelayWorkerClient(_RelayWorkerState):
         env: Mapping[str, str] | None = None,
         timeout_seconds: float | None = None,
         forward_timeout_seconds: float | None = None,
+        max_inflight_requests: int | None = None,
         headers: Mapping[str, str] | None = None,
         session: Any | None = None,
         max_forward_connections: int | None = None,
@@ -684,6 +761,10 @@ class AsyncRelayWorkerClient(_RelayWorkerState):
                 )
                 if forward_timeout_seconds is None
                 else forward_timeout_seconds
+            ),
+            max_inflight_requests=(
+                _connection_limit_env(values, "UCLOUD_RELAY_MAX_INFLIGHT_REQUESTS", 512)
+                if max_inflight_requests is None else max_inflight_requests
             ),
             headers=headers,
             session=session,
@@ -754,7 +835,8 @@ class AsyncRelayWorkerClient(_RelayWorkerState):
         # Rotate all shared workers through the bounded pool in about four
         # seconds instead of holding one public connection per idle rollout.
         # Direct poll() calls retain their caller-specified timeout.
-        rotation_wait = 4.0 * self._connection_limits["poll"] / max(1, self._active_workers)
+        poll_capacity = min(self._connection_limits["poll"], self._request_budget.capacity)
+        rotation_wait = 4.0 * poll_capacity / max(1, self._active_workers)
         return min(requested, max(0.25, rotation_wait))
 
     async def __aenter__(self) -> "AsyncRelayWorkerClient":
@@ -806,6 +888,30 @@ class AsyncRelayWorkerClient(_RelayWorkerState):
             metadata=_agent_rollout_metadata(sandbox, metadata),
         )
 
+    async def update_resource_phase(
+        self,
+        rollout_id: str,
+        *,
+        sequence: int,
+        phase: str,
+        ttl_seconds: float = 60.0,
+        expected_remaining_wait_seconds: float | None = None,
+        registration_token: str | None = None,
+    ) -> JsonObject:
+        """Submit an expiring scheduling hint, never an execution command.
+
+        Sequence numbers increase within one registration. Retrying an identical
+        sequence/payload is safe and does not extend its expiry. A new rollout
+        registration starts its own sequence; old tokens cannot update it.
+        """
+        token = self._registration_token(rollout_id, registration_token)
+        return await self._request_json(
+            "POST", _unregistration_path(rollout_id) + "/resource-phase",
+            payload={"registration_token": token, "update": _resource_phase_payload(
+                sequence, phase, ttl_seconds, expected_remaining_wait_seconds,
+            )},
+        )
+
     async def unregister_rollout(
         self,
         rollout_id: str,
@@ -813,11 +919,17 @@ class AsyncRelayWorkerClient(_RelayWorkerState):
         registration_token: str | None = None,
     ) -> JsonObject:
         token = self._registration_token(rollout_id, registration_token)
-        response = await self._request_json(
-            "DELETE",
-            _unregistration_path(rollout_id),
-            payload={"registration_token": token},
-        )
+        for attempt in range(3):
+            try:
+                response = await self._request_json(
+                    "DELETE", _unregistration_path(rollout_id),
+                    payload={"registration_token": token},
+                )
+                break
+            except RelayApiError as exc:
+                if not _relay_error_is_retryable(exc) or attempt == 2:
+                    raise
+                await asyncio.sleep(max(0.0, _relay_retry_delay(exc, attempt + 1)))
         self._forget_registration(rollout_id)
         return response
 
@@ -889,11 +1001,12 @@ class AsyncRelayWorkerClient(_RelayWorkerState):
         status: int = 200,
         headers: Mapping[str, str] | None = None,
     ) -> JsonObject:
-        return await self._request_json(
+        receipt = await self._request_json(
             "POST",
             "/worker/respond",
             payload=_response_payload(relay_request, response, status, headers),
         )
+        return _completion_receipt(receipt, relay_request)
 
     async def commit_response_bytes_to(
         self,
@@ -905,7 +1018,12 @@ class AsyncRelayWorkerClient(_RelayWorkerState):
         attempts: int = 60,
         retry_delay_seconds: float = 1.0,
     ) -> JsonObject:
-        """Retry this same idempotent commit through transport and wake failures."""
+        """Retain a response durably, retrying the identical result if needed.
+
+        Success means accepted, not that the caller has resumed. New servers
+        report delivery_status; "released" permits delivery but does not prove
+        receipt by the sandbox. Older servers may still wait for wake here.
+        """
 
         attempts = max(1, attempts)
         for attempt in range(attempts):
@@ -984,11 +1102,12 @@ class AsyncRelayWorkerClient(_RelayWorkerState):
         *,
         status: int = 502,
     ) -> JsonObject:
-        return await self._request_json(
+        receipt = await self._request_json(
             "POST",
             "/worker/error",
             payload=_error_payload(relay_request, message, status),
         )
+        return _completion_receipt(receipt, relay_request)
 
     async def _client(self, *, purpose: str = "control") -> Any:
         if self._session is not None:
@@ -1316,17 +1435,23 @@ def _run_sync_worker(
             if available <= 0:
                 stop.wait(0.05)
                 continue
+            reserved = client._request_budget.acquire(stop)
+            if not reserved:
+                break
             try:
                 result = client.poll(
                     rollout_id,
                     worker_id=worker,
-                    timeout_seconds=poll_timeout_seconds,
-                    limit=available,
+                    timeout_seconds=client._worker_poll_timeout(poll_timeout_seconds),
+                    limit=reserved,
                     lease_seconds=lease_seconds,
                     registration_token=registration_token,
                 )
                 poll_errors = 0
-            except RelayApiError as exc:
+            except BaseException as exc:
+                client._request_budget.release(reserved)
+                if not isinstance(exc, RelayApiError):
+                    raise
                 poll_errors += 1
                 if not _relay_error_is_retryable(exc) or poll_errors >= max(
                     1, max_consecutive_poll_errors
@@ -1334,9 +1459,11 @@ def _run_sync_worker(
                     raise
                 stop.wait(_relay_retry_delay(exc, poll_errors))
                 continue
-            for relay_request in result.requests:
-                futures.add(
-                    executor.submit(
+            try:
+                if len(result.requests) > reserved:
+                    raise RelayApiError("relay poll exceeded its requested limit")
+                for relay_request in result.requests:
+                    future = executor.submit(
                         _handle_sync_request,
                         client,
                         relay_request,
@@ -1346,7 +1473,11 @@ def _run_sync_worker(
                         lease_seconds=lease_seconds,
                         renewal_interval_seconds=renewal_interval,
                     )
-                )
+                    reserved -= 1
+                    future.add_done_callback(lambda _future: client._request_budget.release())
+                    futures.add(future)
+            finally:
+                client._request_budget.release(reserved)
         for future in futures:
             future.result()
 
@@ -1382,6 +1513,9 @@ async def _run_async_worker(
             if available <= 0:
                 await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                 continue
+            reserved = await client._request_budget.acquire(stop)
+            if not reserved:
+                break
             try:
                 # Explicit FIFO admission prevents a worker with a reusable
                 # connection repeatedly bypassing queued rollouts in aiohttp.
@@ -1390,12 +1524,15 @@ async def _run_async_worker(
                         rollout_id,
                         worker_id=worker,
                         timeout_seconds=client._worker_poll_timeout(poll_timeout_seconds),
-                        limit=available,
+                        limit=reserved,
                         lease_seconds=lease_seconds,
                         registration_token=registration_token,
                     )
                 poll_errors = 0
-            except RelayApiError as exc:
+            except BaseException as exc:
+                client._request_budget.release(reserved)
+                if not isinstance(exc, RelayApiError):
+                    raise
                 poll_errors += 1
                 if not _relay_error_is_retryable(exc) or poll_errors >= max(
                     1, max_consecutive_poll_errors
@@ -1403,9 +1540,11 @@ async def _run_async_worker(
                     raise
                 await _wait_async_cancel(stop, _relay_retry_delay(exc, poll_errors))
                 continue
-            for relay_request in result.requests:
-                tasks.add(
-                    asyncio.create_task(
+            try:
+                if len(result.requests) > reserved:
+                    raise RelayApiError("relay poll exceeded its requested limit")
+                for relay_request in result.requests:
+                    task = asyncio.create_task(
                         _handle_async_request(
                             client,
                             relay_request,
@@ -1416,7 +1555,11 @@ async def _run_async_worker(
                             renewal_interval_seconds=renewal_interval,
                         )
                     )
-                )
+                    reserved -= 1
+                    task.add_done_callback(lambda _task: client._request_budget.release())
+                    tasks.add(task)
+            finally:
+                client._request_budget.release(reserved)
         if tasks:
             await asyncio.gather(*tasks)
     except BaseException:
@@ -2166,3 +2309,21 @@ def _string_dict(value: object) -> dict[str, str]:
     if not isinstance(value, Mapping):
         return {}
     return {str(key): str(item) for key, item in value.items()}
+
+
+def _resource_phase_payload(sequence, phase, ttl_seconds, expected_remaining_wait_seconds):
+    if type(sequence) is not int or not 0 < sequence < 2**63:
+        raise ValueError("resource phase sequence must be a positive 63-bit integer")
+    if not isinstance(phase, str) or phase not in {"model_wait", "tool", "rollout_complete", "training_pause", "training_resume"}:
+        raise ValueError("unsupported resource phase")
+    if (type(ttl_seconds) not in (int, float) or not math.isfinite(ttl_seconds)
+            or not 0 < ttl_seconds <= 3600):
+        raise ValueError("resource phase ttl_seconds must be in (0, 3600]")
+    update = {"sequence": sequence, "phase": phase, "ttl_seconds": float(ttl_seconds)}
+    if expected_remaining_wait_seconds is not None:
+        wait = expected_remaining_wait_seconds
+        if (phase != "model_wait" or type(wait) not in (int, float)
+                or not math.isfinite(wait) or not 0 <= wait <= 3600):
+            raise ValueError("expected remaining wait requires model_wait and seconds in [0, 3600]")
+        update["expected_remaining_wait_seconds"] = float(wait)
+    return update

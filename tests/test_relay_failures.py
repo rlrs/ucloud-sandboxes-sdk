@@ -238,7 +238,12 @@ class RelayWorkerFailureTests(unittest.IsolatedAsyncioTestCase):
         first = request_fixture()
         second = replace(first, request_id="req-2")
         client = AsyncRelayWorkerClient("http://relay.invalid")
-        client.poll = AsyncMock(return_value=SimpleNamespace(requests=(first, second)))
+        pending = [first, second]
+        async def poll(*_args, limit, **_kwargs):
+            batch = pending[:limit]
+            del pending[:limit]
+            return SimpleNamespace(requests=tuple(batch))
+        client.poll = AsyncMock(side_effect=poll)
 
         async def handle(_client, request, **_kwargs):
             if request.request_id == first.request_id:

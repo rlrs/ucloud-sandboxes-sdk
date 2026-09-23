@@ -101,6 +101,35 @@ class RelayUrlConfigTests(unittest.TestCase):
 
 
 class RelayWorkerClientTests(unittest.TestCase):
+    def test_resource_phase_contract_matches_sync_and_async(self):
+        token = "a" * 32
+        payload = {"registration_token": token, "update": {
+            "sequence": 4, "phase": "model_wait", "ttl_seconds": 60.0,
+            "expected_remaining_wait_seconds": 10.0,
+        }}
+        client = RelayWorkerClient("https://relay.invalid")
+        with patch.object(client, "_request_json", return_value={"accepted": True}) as request:
+            client.update_resource_phase("run", sequence=4, phase="model_wait",
+                                         expected_remaining_wait_seconds=10,
+                                         registration_token=token)
+            request.assert_called_once_with("POST", "/v1/relay/rollouts/run/resource-phase", payload=payload)
+        async def asynchronous():
+            client = AsyncRelayWorkerClient("https://relay.invalid")
+            async def reply(*args, **kwargs):
+                self.assertEqual(args, ("POST", "/v1/relay/rollouts/run/resource-phase"))
+                self.assertEqual(kwargs, {"payload": payload})
+                return {"accepted": True}
+            with patch.object(client, "_request_json", side_effect=reply):
+                await client.update_resource_phase("run", sequence=4, phase="model_wait",
+                                                   expected_remaining_wait_seconds=10,
+                                                   registration_token=token)
+        asyncio.run(asynchronous())
+        for invalid in ({"sequence": True}, {"ttl_seconds": float("nan")},
+                        {"phase": "tool", "expected_remaining_wait_seconds": 1}):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                client.update_resource_phase("run", registration_token=token,
+                                             **{"sequence": 1, "phase": "model_wait", **invalid})
+
     def test_relay_error_and_environment_configuration_match_sandbox_semantics(
         self,
     ) -> None:
@@ -123,6 +152,31 @@ class RelayWorkerClientTests(unittest.TestCase):
         self.assertEqual(client.relay_url, "https://relay.example")
         self.assertEqual(client.timeout_seconds, 45.0)
         self.assertEqual(client.headers["Authorization"], "Bearer worker-secret")
+
+    def test_completion_receipt_is_acceptance_not_wake_for_both_transports(self):
+        request = RelayRequest.from_payload(_relay_request(rollout_id="run", leased_by="worker"))
+        pending = {"ok": True, "request_id": request.request_id, "duplicate": False,
+                   "committed": True, "delivery_status": "pending"}
+        async def asynchronous(payload):
+            client = AsyncRelayWorkerClient("https://relay.invalid")
+            async def reply(*_args, **_kwargs):
+                return payload
+            with patch.object(client, "_request_json", side_effect=reply):
+                return await client.respond_to(request, b"result")
+        client = RelayWorkerClient("https://relay.invalid")
+        for receipt in (pending, {**pending, "delivery_status": "released"}, {"ok": True}):
+            with patch.object(client, "_request_json", return_value=receipt):
+                self.assertEqual(client.respond_to(request, b"result"), receipt)
+                self.assertEqual(client.error_request(request, "failure"), receipt)
+            self.assertEqual(asyncio.run(asynchronous(receipt)), receipt)
+        for receipt in ({**pending, "request_id": "wrong"}, {**pending, "committed": False},
+                        {**pending, "delivery_status": "awake"}, {"committed": True}):
+            with self.subTest(receipt=receipt):
+                with patch.object(client, "_request_json", return_value=receipt):
+                    with self.assertRaises(RelayApiError):
+                        client.respond_to(request, b"result")
+                with self.assertRaises(RelayApiError):
+                    asyncio.run(asynchronous(receipt))
 
     def test_managed_sync_session_renews_and_unregisters(self) -> None:
         cancel = Event()
@@ -392,6 +446,25 @@ class RelayWorkerClientTests(unittest.TestCase):
         self.assertFalse(responded["duplicate"])
         self.assertTrue(unregistered["existed"])
 
+    def test_unregister_recovers_lost_acknowledgement_with_same_fence(self):
+        for asynchronous in (False, True):
+            with self.subTest(asynchronous=asynchronous), running_relay() as relay:
+                relay.state.unregister_lost_ack = True
+                if asynchronous:
+                    async def exercise():
+                        async with AsyncRelayWorkerClient(relay.base_url, worker_token="worker-token") as client:
+                            await client.register_rollout("cleanup")
+                            return await client.unregister_rollout("cleanup")
+                    response = asyncio.run(exercise())
+                else:
+                    client = RelayWorkerClient(relay.base_url, worker_token="worker-token")
+                    client.register_rollout("cleanup")
+                    response = client.unregister_rollout("cleanup")
+                self.assertTrue(response["ok"])
+                self.assertFalse(response["existed"])
+                self.assertEqual(relay.state.unregister_tokens, [REGISTRATION_TOKEN] * 2)
+                self.assertNotIn("cleanup", relay.state.rollouts)
+
     def test_sync_worker_client_forwards_binary_http_request_and_response(self) -> None:
         with running_relay() as relay:
             client = RelayWorkerClient(relay.base_url, worker_token="worker-token")
@@ -561,6 +634,8 @@ class FakeRelayState:
         self.renew_overrides: dict[str, object] = {}
         self.stats_redirect = False
         self.stats_body: bytes | None = None
+        self.unregister_lost_ack = False
+        self.unregister_tokens: list[str] = []
 
 
 class FakeRelayHandler(BaseHTTPRequestHandler):
@@ -681,12 +756,18 @@ class FakeRelayHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if not self._check_authorized():
             return
-        self._read_json()
+        payload = self._read_json()
         prefix = "/v1/relay/rollouts/"
         if parsed.path.startswith(prefix):
             rollout_id = parsed.path.removeprefix(prefix)
             with self.state.lock:
+                self.state.unregister_tokens.append(payload["registration_token"])
                 existed = self.state.rollouts.pop(rollout_id, None) is not None
+                lost_ack = self.state.unregister_lost_ack
+                self.state.unregister_lost_ack = False
+            if lost_ack:
+                self._write_json({"error": "upstream acknowledgement lost"}, status=503)
+                return
             self._write_json({"ok": True, "rollout_id": rollout_id, "existed": existed})
             return
         self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
