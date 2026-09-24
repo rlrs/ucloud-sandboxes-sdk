@@ -1508,8 +1508,10 @@ class SandboxClient(_DirectSandboxOperations):
                     path=path,
                     max_attempts=retry_attempts,
                 )
-                if delay is not None and _sleep_for_retry(delay, deadline):
-                    continue
+                if delay is not None:
+                    if _sleep_for_retry(delay, deadline):
+                        continue
+                    raise _retry_budget_exhausted(api_error, attempt + 1) from exc
                 raise api_error from exc
             except ResponseTooLargeError as exc:
                 raise SandboxApiError(str(exc)) from exc
@@ -1547,8 +1549,10 @@ class SandboxClient(_DirectSandboxOperations):
                     path=path,
                     max_attempts=retry_attempts,
                 )
-                if delay is not None and _sleep_for_retry(delay, deadline):
-                    continue
+                if delay is not None:
+                    if _sleep_for_retry(delay, deadline):
+                        continue
+                    raise _retry_budget_exhausted(api_error, attempt + 1) from exc
                 raise api_error from exc
             except ResponseTooLargeError as exc:
                 raise SandboxApiError(str(exc)) from exc
@@ -2624,11 +2628,10 @@ class AsyncSandboxClient(_DirectSandboxOperations):
                         path=path,
                         max_attempts=retry_attempts,
                     )
-                    if delay is not None and await _async_sleep_for_retry(
-                        delay,
-                        deadline,
-                    ):
-                        continue
+                    if delay is not None:
+                        if await _async_sleep_for_retry(delay, deadline):
+                            continue
+                        raise _retry_budget_exhausted(api_error, attempt + 1) from api_error
                     raise api_error
                 return raw, response.status, response_headers(response)
         raise AssertionError("unreachable UCloud unavailable retry state")
@@ -3412,6 +3415,18 @@ def _retry_after_seconds(headers: object | None) -> float | None:
         retry_at = retry_at.replace(tzinfo=timezone.utc)
     now = datetime.now(timezone.utc)
     return max(0.0, min(60.0, (retry_at - now).total_seconds()))
+
+
+def _retry_budget_exhausted(error: SandboxApiError, attempts: int) -> SandboxApiError:
+    # Preserve the server response for programmatic callers, but distinguish
+    # exhausted retry time from an immediately propagated HTTP failure.
+    return SandboxApiError(
+        f"{error}; retry budget exhausted after {attempts} HTTP attempt(s): "
+        "insufficient time remaining for the next retry",
+        status_code=error.status_code,
+        body=error.body,
+        headers=error.headers,
+    )
 
 
 def _sleep_for_retry(delay_seconds: float, deadline: float | None) -> bool:

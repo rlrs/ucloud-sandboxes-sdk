@@ -39,7 +39,7 @@ from .relay import (
     model_relay_env,
 )
 
-__version__ = "0.4.28"
+__version__ = "0.4.29"
 
 __all__ = [
     "AsyncExecHandle",
