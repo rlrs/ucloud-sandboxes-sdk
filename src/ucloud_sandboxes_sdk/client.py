@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import errno
+import socket
 import base64
 from contextlib import contextmanager
 from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
@@ -1516,6 +1518,12 @@ class SandboxClient(_DirectSandboxOperations):
             except ResponseTooLargeError as exc:
                 raise SandboxApiError(str(exc)) from exc
             except OSError as exc:
+                if _sync_connect_failure(exc):
+                    api_error = _connection_error(exc, attempt + 1)
+                    delay = _connection_retry_delay(attempt, retry_attempts)
+                    if delay is not None and _sleep_for_retry(delay, deadline):
+                        continue
+                    raise api_error from exc
                 raise SandboxApiError(f"node-agent request failed: {exc}") from exc
         raise AssertionError("unreachable UCloud unavailable retry state")
 
@@ -1557,6 +1565,12 @@ class SandboxClient(_DirectSandboxOperations):
             except ResponseTooLargeError as exc:
                 raise SandboxApiError(str(exc)) from exc
             except OSError as exc:
+                if _sync_connect_failure(exc):
+                    api_error = _connection_error(exc, attempt + 1)
+                    delay = _connection_retry_delay(attempt, retry_attempts)
+                    if delay is not None and _sleep_for_retry(delay, deadline):
+                        continue
+                    raise api_error from exc
                 raise SandboxApiError(f"node-agent request failed: {exc}") from exc
         raise AssertionError("unreachable UCloud unavailable retry state")
 
@@ -2580,60 +2594,75 @@ class AsyncSandboxClient(_DirectSandboxOperations):
         streamed: bool,
         success_limit: int,
     ) -> tuple[bytes, int, dict[str, str]]:
+        from aiohttp import (
+            ClientConnectorError, ClientConnectorCertificateError, ClientConnectorSSLError,
+        )
+
         client = await self._client()
         deadline = _deadline(timeout)
         retry_attempts = _ucloud_unavailable_retry_attempts(method, path)
         for attempt in _retry_attempt_numbers(retry_attempts):
             if streamed:
                 body.seek(0)
-            async with client.request(
-                method,
-                self.base_url + path,
-                json=payload,
-                data=_async_file_chunks(body) if streamed else body,
-                headers=headers,
-                timeout=_aiohttp_timeout(
-                    _request_timeout_seconds(
-                        _required_remaining_seconds(deadline),
-                        timeout,
-                    )
-                ),
-                allow_redirects=False,
-            ) as response:
-                try:
-                    raw = await read_async_response(
-                        response,
-                        limit=(
-                            MAX_JSON_RESPONSE_BYTES
-                            if not 200 <= response.status < 300
-                            else success_limit
-                        ),
-                    )
-                except ResponseTooLargeError as exc:
-                    raise SandboxApiError(
-                        str(exc),
-                        status_code=response.status,
-                        headers=response_headers(response),
-                    ) from exc
-                if not 200 <= response.status < 300:
-                    api_error = _node_error(
-                        raw.decode("utf-8", errors="replace"),
-                        status=response.status,
-                        headers=response_headers(response),
-                    )
-                    delay = _retry_error(
-                        api_error,
-                        attempt,
-                        method=method,
-                        path=path,
-                        max_attempts=retry_attempts,
-                    )
-                    if delay is not None:
-                        if await _async_sleep_for_retry(delay, deadline):
-                            continue
-                        raise _retry_budget_exhausted(api_error, attempt + 1) from api_error
-                    raise api_error
-                return raw, response.status, response_headers(response)
+            try:
+                async with client.request(
+                    method,
+                    self.base_url + path,
+                    json=payload,
+                    data=_async_file_chunks(body) if streamed else body,
+                    headers=headers,
+                    timeout=_aiohttp_timeout(
+                        _request_timeout_seconds(
+                            _required_remaining_seconds(deadline),
+                            timeout,
+                        )
+                    ),
+                    allow_redirects=False,
+                ) as response:
+                    try:
+                        raw = await read_async_response(
+                            response,
+                            limit=(
+                                MAX_JSON_RESPONSE_BYTES
+                                if not 200 <= response.status < 300
+                                else success_limit
+                            ),
+                        )
+                    except ResponseTooLargeError as exc:
+                        raise SandboxApiError(
+                            str(exc),
+                            status_code=response.status,
+                            headers=response_headers(response),
+                        ) from exc
+                    if not 200 <= response.status < 300:
+                        api_error = _node_error(
+                            raw.decode("utf-8", errors="replace"),
+                            status=response.status,
+                            headers=response_headers(response),
+                        )
+                        delay = _retry_error(
+                            api_error,
+                            attempt,
+                            method=method,
+                            path=path,
+                            max_attempts=retry_attempts,
+                        )
+                        if delay is not None:
+                            if await _async_sleep_for_retry(delay, deadline):
+                                continue
+                            raise _retry_budget_exhausted(api_error, attempt + 1) from api_error
+                        raise api_error
+                    return raw, response.status, response_headers(response)
+            except ClientConnectorError as exc:
+                # Connector failures precede HTTP dispatch, including TLS setup.
+                # Certificate/configuration errors are not transient failures.
+                if isinstance(exc, (ClientConnectorCertificateError, ClientConnectorSSLError)):
+                    raise
+                api_error = _connection_error(exc, attempt + 1)
+                delay = _connection_retry_delay(attempt, retry_attempts)
+                if delay is not None and await _async_sleep_for_retry(delay, deadline):
+                    continue
+                raise api_error from exc
         raise AssertionError("unreachable UCloud unavailable retry state")
 
 
@@ -3227,6 +3256,31 @@ def _node_error(
     except SandboxApiError as api_error:
         return api_error
     raise AssertionError("HTTP error decoded as success")
+
+
+def _sync_connect_failure(exc: OSError) -> bool:
+    # urllib wraps connection setup errors. A reset/read timeout after dispatch
+    # is ambiguous and must not cause arbitrary mutations to be replayed.
+    reason = exc.reason if isinstance(exc, error.URLError) else None
+    return isinstance(reason, socket.gaierror) or (
+        isinstance(reason, OSError)
+        and reason.errno in {errno.ECONNREFUSED, errno.ENETUNREACH, errno.EHOSTUNREACH}
+    )
+
+
+def _connection_retry_delay(attempt: int, max_attempts: int | None) -> float | None:
+    if attempt + 1 >= min(max_attempts or 5, 5):
+        return None
+    return min(2.0, 0.25 * 2 ** attempt)
+
+
+def _connection_error(exc: Exception, attempts: int) -> SandboxApiError:
+    cause = getattr(exc, "os_error", getattr(exc, "reason", exc))
+    detail = f"{type(cause).__name__}: {cause!s} (errno={getattr(cause, 'errno', None)})"
+    return SandboxApiError(
+        f"node-agent connection failed after {attempts} attempts: {detail}",
+        body={"error_code": "client_connection_failed", "attempts": attempts},
+    )
 
 
 def _retry_error(

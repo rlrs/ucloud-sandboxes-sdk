@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.30 - 2026-09-25
+
+- Retry transient connection-establishment failures up to five times within the
+  original request deadline. Async connector failures and synchronous DNS,
+  connection-refused and unreachable-host errors qualify; ambiguous post-dispatch
+  failures, certificate errors and cancellation do not. Streaming bodies rewind
+  before retry. Exhaustion reports attempts and the underlying exception type.
+
 ## 0.4.28 - 2026-09-24
 
 - Retry transient image-build status polling failures in both clients without
