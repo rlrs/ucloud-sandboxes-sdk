@@ -92,9 +92,14 @@ finally:
     sandbox.delete()
 ```
 
-`exec()` returns stdout, stderr, exit status, and the ordered event stream. For
-long-lived or interactive commands, call `start_exec()`, then use the returned
-exec handle to write stdin, read events, close stdin, or wait for completion.
+`exec()` returns stdout, stderr, exit status, and the ordered event stream.
+The client feeds stdin and drains output concurrently. For long-lived or
+interactive commands, call `start_exec()`, then use the returned exec handle
+to write stdin, read events, close stdin, or wait for completion. Feed input and
+drain output concurrently: the server applies output backpressure to slow readers.
+Keep the event cursor when reconnecting; already acknowledged history is not a
+durable replay log.
+
 When `parkable=True`, a direct-runtime node may checkpoint an idle sandbox and
 release its live runsc backend. Exec and file operations transparently wake it;
 its filesystem and process state remain intact. Parking is opt-in because its

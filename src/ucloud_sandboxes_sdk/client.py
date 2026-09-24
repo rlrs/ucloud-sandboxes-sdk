@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from contextlib import contextmanager
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 import hashlib
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -1206,9 +1207,26 @@ class SandboxClient(_DirectSandboxOperations):
             stdin=input is not None,
             tty=tty,
         )
-        if input is not None:
-            handle.write_stdin(input, eof=True)
-        return handle.wait(timeout_seconds=timeout_seconds)
+        if input is None:
+            return handle.wait(timeout_seconds=timeout_seconds)
+        # Drain output while feeding stdin, as with subprocess.communicate().
+        # Otherwise bounded server output can deadlock a bidirectional command.
+        pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="exec-io")
+        try:
+            writing = pool.submit(handle.write_stdin, input, eof=True)
+            reading = pool.submit(handle.wait, timeout_seconds=timeout_seconds)
+            done, _ = wait((writing, reading), return_when=FIRST_EXCEPTION)
+            for future in done:
+                future.result()
+            return reading.result()
+        except BaseException:
+            try:
+                handle.kill()
+            except Exception:
+                pass  # Preserve the original transport/input/timeout failure.
+            raise
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
 
     def start_job(
         self,
@@ -2171,9 +2189,23 @@ class AsyncSandboxClient(_DirectSandboxOperations):
             stdin=input is not None,
             tty=tty,
         )
-        if input is not None:
-            await handle.write_stdin(input, eof=True)
-        return await handle.wait(timeout_seconds=timeout_seconds)
+        if input is None:
+            return await handle.wait(timeout_seconds=timeout_seconds)
+        writing = asyncio.create_task(handle.write_stdin(input, eof=True))
+        reading = asyncio.create_task(handle.wait(timeout_seconds=timeout_seconds))
+        try:
+            _, result = await asyncio.gather(writing, reading)
+            return result
+        except BaseException:
+            try:
+                await handle.kill()
+            except Exception:
+                pass
+            raise
+        finally:
+            writing.cancel()
+            reading.cancel()
+            await asyncio.gather(writing, reading, return_exceptions=True)
 
     async def start_job(
         self,

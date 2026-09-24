@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.27
+
+Sync and async exec(input=...) send stdin and consume output concurrently, avoiding deadlocks with bounded server output. Failures and cancellation stop the command and clean up peer I/O while preserving the original error.
+
 ## Unreleased
 
 ## 0.4.25 - 2026-09-23
