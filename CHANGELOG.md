@@ -1,10 +1,16 @@
 # Changelog
 
+## 0.4.28 - 2026-09-24
+
+- Retry transient image-build status polling failures in both clients without
+  resubmitting the build. Read timeouts, disconnects, and transient HTTP errors
+  use jittered backoff within the original build deadline. Authentication,
+  missing-build, protocol errors, and cancellation still propagate. Waiting
+  without a deadline permits six consecutive poll retries.
+
 ## 0.4.27
 
 Sync and async exec(input=...) send stdin and consume output concurrently, avoiding deadlocks with bounded server output. Failures and cancellation stop the command and clean up peer I/O while preserving the original error.
-
-## Unreleased
 
 ## 0.4.25 - 2026-09-23
 

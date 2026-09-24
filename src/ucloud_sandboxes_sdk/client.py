@@ -898,6 +898,7 @@ class _ImageBuildWait:
     deadline: float | None
     build: JsonObject | None = None
     last_seen: tuple[object, object, object] | None = None
+    consecutive_poll_failures: int = 0
 
     def request_timeout(self, default_timeout: float) -> float:
         remaining = self._remaining()
@@ -909,6 +910,7 @@ class _ImageBuildWait:
         on_status: Callable[[JsonObject], object] | None,
     ) -> bool:
         self.build = build
+        self.consecutive_poll_failures = 0
         seen = (
             build.get("status"),
             build.get("updated_at"),
@@ -918,6 +920,24 @@ class _ImageBuildWait:
             on_status(build)
         self.last_seen = seen
         return build.get("status") in {"succeeded", "failed"}
+
+    def retry_delay(self, exc: BaseException) -> float | None:
+        # Only the read-only status observation is replayed, never submission.
+        if isinstance(exc, SandboxApiError):
+            transient = exc.status_code in {408, 429, 500, 502, 503, 504} or (
+                exc.status_code is None and isinstance(exc.__cause__, OSError)
+            )
+            if not transient or exc.retryable is False:
+                return None
+        self.consecutive_poll_failures += 1
+        if self.deadline is None and self.consecutive_poll_failures > 6:
+            return None
+        remaining = self._remaining()
+        delay = min(5.0, 0.5 * 2 ** min(self.consecutive_poll_failures - 1, 4))
+        if isinstance(exc, SandboxApiError) and exc.retry_after_seconds is not None:
+            delay = max(delay, exc.retry_after_seconds)
+        delay *= 1.0 + random.random() * 0.2
+        return delay if remaining is None else min(delay, remaining)
 
     def delay(self, poll_interval: float) -> float:
         remaining = self._remaining()
@@ -1395,10 +1415,18 @@ class SandboxClient(_DirectSandboxOperations):
     ) -> JsonObject:
         state = _ImageBuildWait(build_id_or_image_id, _deadline(timeout_seconds))
         while True:
-            build = self.get_image_build(
-                build_id_or_image_id,
-                timeout_seconds=state.request_timeout(self.timeout_seconds),
-            )
+            request_timeout = state.request_timeout(self.timeout_seconds)
+            try:
+                build = self.get_image_build(
+                    build_id_or_image_id,
+                    timeout_seconds=request_timeout,
+                )
+            except (SandboxApiError, OSError) as exc:
+                delay = state.retry_delay(exc)
+                if delay is None:
+                    raise
+                time.sleep(delay)
+                continue
             if state.accept(build, on_status):
                 return build
             time.sleep(state.delay(poll_interval_seconds))
@@ -2405,12 +2433,25 @@ class AsyncSandboxClient(_DirectSandboxOperations):
         poll_interval_seconds: float = 5.0,
         on_status: Callable[[JsonObject], object] | None = None,
     ) -> JsonObject:
+        from aiohttp import ClientConnectionError, ClientPayloadError
+
         state = _ImageBuildWait(build_id_or_image_id, _deadline(timeout_seconds))
         while True:
-            build = await self.get_image_build(
-                build_id_or_image_id,
-                timeout_seconds=state.request_timeout(self.timeout_seconds),
-            )
+            request_timeout = state.request_timeout(self.timeout_seconds)
+            try:
+                build = await self.get_image_build(
+                    build_id_or_image_id,
+                    timeout_seconds=request_timeout,
+                )
+            except (
+                SandboxApiError, OSError, asyncio.TimeoutError,
+                ClientConnectionError, ClientPayloadError,
+            ) as exc:
+                delay = state.retry_delay(exc)
+                if delay is None:
+                    raise
+                await asyncio.sleep(delay)
+                continue
             if state.accept(build, on_status):
                 return build
             await asyncio.sleep(state.delay(poll_interval_seconds))
