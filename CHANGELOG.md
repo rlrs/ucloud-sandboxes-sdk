@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.31 - 2026-09-26
+
+- The synchronous client keeps HTTP/1.1 connections for reuse instead of
+  opening a TCP and TLS connection per request, and builds its TLS context
+  once. A connection returns to the pool only after its response body is fully
+  read. Idle connections retire after 5 seconds, as in the async client, and a
+  connection the peer has closed is discarded before reuse. Only GET and HEAD
+  are resent after a reused connection fails. Proxied requests still use
+  urllib. On Hetzner, a sequential exec from a laptop took 81 ms instead of
+  196 ms, and client CPU for 50 concurrent execs fell from 17 s to 0.6 s.
+
 ## 0.4.30 - 2026-09-25
 
 - Retry transient connection-establishment failures up to five times within the

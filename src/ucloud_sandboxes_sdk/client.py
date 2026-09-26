@@ -36,7 +36,8 @@ from .network_policy import SandboxNetworkPolicy
 from ._http import (
     ASYNC_KEEPALIVE_TIMEOUT_SECONDS,
     ResponseTooLargeError,
-    open_no_redirect,
+    # Node requests reuse connections; tests patch this module-level name.
+    open_reusing as open_no_redirect,
     read_async_response,
     read_sync_response,
     response_headers,
