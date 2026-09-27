@@ -3344,6 +3344,9 @@ def _should_retry_ucloud_unavailable(
                 "node_restore_busy",
                 "node_startup_busy",
                 "gateway_startup_busy",
+                # A parked sandbox found no wake capacity (for example a
+                # CPU-saturated node); the gateway refused before dispatching.
+                "wake_destination_unavailable",
             }
             or image_resolution_fence
             or builder_admission_fence

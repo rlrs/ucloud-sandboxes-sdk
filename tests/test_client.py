@@ -1663,7 +1663,7 @@ class SandboxSdkTests(unittest.TestCase):
         asyncio.run(scenario())
 
     def test_startup_backpressure_requires_explicit_safe_rejection(self) -> None:
-        for code in ("gateway_startup_busy", "node_startup_busy"):
+        for code in ("gateway_startup_busy", "node_startup_busy", "wake_destination_unavailable"):
             for method, path in (("PUT", "/v1/sandboxes/one/files?path=/tmp/file"), ("POST", "/v1/sandboxes/one/exec")):
                 with self.subTest(code=code, method=method):
                     self.assertTrue(client_module._should_retry_ucloud_unavailable(
