@@ -3326,6 +3326,14 @@ def _should_retry_ucloud_unavailable(
         and path in IMAGE_RESOLUTION_PRE_DISPATCH_PATHS
         and error_code in IMAGE_RESOLUTION_PRE_DISPATCH_ERROR_CODES
     )
+    # Deleting a sandbox is idempotent (the gateway reuses the route's delete
+    # operation id), so a node still draining a memory publication is replayed.
+    delete_drain = (
+        normalized_method == "DELETE"
+        and path.startswith("/v1/sandboxes/")
+        and "/" not in path[len("/v1/sandboxes/"):].split("?", 1)[0]
+        and error_code == "memory_publication_draining"
+    )
     builder_admission_fence = (
         normalized_method == "POST"
         and path == "/v1/images/build"
@@ -3347,9 +3355,11 @@ def _should_retry_ucloud_unavailable(
                 # A parked sandbox found no wake capacity (for example a
                 # CPU-saturated node); the gateway refused before dispatching.
                 "wake_destination_unavailable",
+                "migration_destination_unavailable",
             }
             or image_resolution_fence
             or builder_admission_fence
+            or delete_drain
         )
     )
     stable_create = normalized_method == "POST" and path == "/v1/sandboxes"

@@ -1663,7 +1663,8 @@ class SandboxSdkTests(unittest.TestCase):
         asyncio.run(scenario())
 
     def test_startup_backpressure_requires_explicit_safe_rejection(self) -> None:
-        for code in ("gateway_startup_busy", "node_startup_busy", "wake_destination_unavailable"):
+        for code in ("gateway_startup_busy", "node_startup_busy", "wake_destination_unavailable",
+                     "migration_destination_unavailable"):
             for method, path in (("PUT", "/v1/sandboxes/one/files?path=/tmp/file"), ("POST", "/v1/sandboxes/one/exec")):
                 with self.subTest(code=code, method=method):
                     self.assertTrue(client_module._should_retry_ucloud_unavailable(
@@ -1676,6 +1677,21 @@ class SandboxSdkTests(unittest.TestCase):
                     ))
         # A long-lived caller deadline must not overflow exponential backoff.
         self.assertEqual(client_module._ucloud_unavailable_retry_delay(10000), 4.0)
+
+    def test_delete_is_replayed_while_the_node_drains_a_memory_publication(self) -> None:
+        draining = {"error_code": "memory_publication_draining", "retryable": True}
+        self.assertTrue(client_module._should_retry_ucloud_unavailable(
+            503, draining, 50, method="DELETE", path="/v1/sandboxes/one", max_attempts=None,
+        ))
+        for method, path, body in (
+            ("DELETE", "/v1/sandboxes/one", dict(draining, retryable=False)),
+            ("POST", "/v1/sandboxes/one/exec", draining),
+            ("DELETE", "/v1/sandboxes/one/files", draining),
+        ):
+            with self.subTest(method=method, path=path):
+                self.assertFalse(client_module._should_retry_ucloud_unavailable(
+                    503, body, 0, method=method, path=path, max_attempts=None,
+                ))
 
     def test_startup_retry_stops_at_caller_deadline(self) -> None:
         def busy(req, timeout=None):

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.32 - 2026-09-27
+
+- Retry capacity waits that the gateway reports before dispatching anything,
+  until the operation's deadline: `wake_destination_unavailable` (a parked
+  sandbox found no wake capacity, for example on a CPU-saturated node) and
+  `migration_destination_unavailable`. Before, an exec that woke a parked
+  sandbox gave up after 6 attempts; in a 500-sandbox load test 12 sandboxes
+  failed a turn this way.
+- Retry `DELETE /v1/sandboxes/<id>` while the node reports
+  `memory_publication_draining` (a just-parked sandbox is still uploading its
+  memory). Deletes are idempotent.
+
 ## 0.4.31 - 2026-09-26
 
 - The synchronous client keeps HTTP/1.1 connections for reuse instead of
