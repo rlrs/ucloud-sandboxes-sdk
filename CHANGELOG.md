@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.33 - 2026-09-28
+
+- Add `list_sandbox_statuses(sandbox_ids=...)` and
+  `get_sandbox_status(sandbox_id)` to both synchronous and asynchronous clients.
+  They request the compact `view=status` inventory endpoint, with exact ID
+  filtering, for polling that does not need full sandbox specifications.
+- Preserve existing `list_sandboxes()` and `get_sandbox()` full-record behavior.
+  Compact methods require a gateway that supports and identifies the status
+  view; unsupported responses raise an error. An explicit empty ID filter
+  returns an empty list without fetching the fleet.
+
 ## 0.4.32 - 2026-09-27
 
 - Retry capacity waits that the gateway reports before dispatching anything,

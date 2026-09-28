@@ -1140,6 +1140,26 @@ class SandboxClient(_DirectSandboxOperations):
     def list_sandboxes(self) -> list[JsonObject]:
         return _records(self._request_json("GET", "/v1/sandboxes"), "sandboxes")
 
+    def list_sandbox_statuses(
+        self, *, sandbox_ids: Sequence[str] | None = None,
+    ) -> list[JsonObject]:
+        """Read compact current state; None selects all and an empty list none.
+
+        Requires a gateway supporting view=status. Full specifications, labels,
+        resource requirements and snapshot descriptors are omitted.
+        """
+        ids = _sandbox_status_ids(sandbox_ids)
+        if ids == ():
+            return []
+        return _sandbox_status_records(
+            self._request_json("GET", _sandbox_status_path(ids)), ids,
+        )
+
+    def get_sandbox_status(self, sandbox_id: str) -> JsonObject | None:
+        """Read compact state for one exact ID, or None when it is absent."""
+        records = self.list_sandbox_statuses(sandbox_ids=[sandbox_id])
+        return records[0] if records else None
+
     def get_sandbox(self, sandbox_id: str) -> JsonObject | None:
         for record in self.list_sandboxes():
             spec = record.get("spec")
@@ -2056,6 +2076,26 @@ class AsyncSandboxClient(_DirectSandboxOperations):
             "sandboxes",
         )
 
+    async def list_sandbox_statuses(
+        self, *, sandbox_ids: Sequence[str] | None = None,
+    ) -> list[JsonObject]:
+        """Read compact current state; None selects all and an empty list none.
+
+        Requires a gateway supporting view=status. Full specifications, labels,
+        resource requirements and snapshot descriptors are omitted.
+        """
+        ids = _sandbox_status_ids(sandbox_ids)
+        if ids == ():
+            return []
+        return _sandbox_status_records(
+            await self._request_json("GET", _sandbox_status_path(ids)), ids,
+        )
+
+    async def get_sandbox_status(self, sandbox_id: str) -> JsonObject | None:
+        """Read compact state for one exact ID, or None when it is absent."""
+        records = await self.list_sandbox_statuses(sandbox_ids=[sandbox_id])
+        return records[0] if records else None
+
     async def list_prepared_capacity(self) -> JsonObject:
         return await super().list_prepared_capacity()
 
@@ -2665,6 +2705,61 @@ class AsyncSandboxClient(_DirectSandboxOperations):
                     continue
                 raise api_error from exc
         raise AssertionError("unreachable UCloud unavailable retry state")
+
+
+def _sandbox_status_ids(values: Sequence[str] | None) -> tuple[str, ...] | None:
+    if values is None:
+        return None
+    if (
+        isinstance(values, (str, bytes)) or not isinstance(values, Sequence)
+        or len(values) > 256
+        or any(not isinstance(value, str) or not value or len(value) > 512
+               or "\0" in value for value in values)
+    ):
+        raise ValueError("sandbox_ids must be a sequence of at most 256 nonempty IDs, each at most 512 characters without NUL")
+    ids = tuple(sorted(set(values)))
+    # Match the gateway's bounded worker command, including Unicode escaping.
+    if len(b"status:" + json.dumps(ids).encode("utf-8")) > 256 * 1024:
+        raise ValueError("sandbox_ids exceed the compact status filter size limit")
+    return ids
+
+
+def _sandbox_status_path(ids: tuple[str, ...] | None) -> str:
+    return "/v1/sandboxes?" + parse.urlencode(
+        [("view", "status"), *(("id", value) for value in ids or ())],
+    )
+
+
+def _sandbox_status_records(
+    payload: JsonObject, ids: tuple[str, ...] | None,
+) -> list[JsonObject]:
+    # Older gateways can ignore unknown query parameters. Never mistake a
+    # full, unfiltered inventory for successful compact/filter support.
+    if payload.get("view") != "status":
+        raise SandboxApiError(
+            "gateway did not return compact sandbox status; view=status support is required",
+            body=payload,
+        )
+    records = payload.get("sandboxes")
+    if not isinstance(records, list):
+        raise SandboxApiError("gateway returned invalid compact sandbox statuses", body=payload)
+    requested = set(ids) if ids is not None else None
+    seen: set[str] = set()
+    for record in records:
+        sid = record.get("id") if isinstance(record, dict) else None
+        spec = record.get("spec") if isinstance(record, dict) else None
+        if (
+            not isinstance(sid, str) or not sid
+            or not isinstance(spec, dict) or spec.get("id") != sid
+            or type(record.get("generation")) is not int or record["generation"] < 1
+            or not isinstance(record.get("state"), str) or not record["state"]
+            or not isinstance(record.get("cached_state"), str) or not record["cached_state"]
+            or not isinstance(record.get("node"), dict)
+            or sid in seen or (requested is not None and sid not in requested)
+        ):
+            raise SandboxApiError("gateway returned invalid or unrequested compact sandbox status", body=payload)
+        seen.add(sid)
+    return records
 
 
 def _records(payload: JsonObject, field: str) -> list[JsonObject]:

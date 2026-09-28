@@ -13,9 +13,9 @@ Install the versioned wheel from the GitHub release (the SDK is not currently
 published on PyPI):
 
 ```bash
-uv add "ucloud-sandboxes-sdk @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.26/ucloud_sandboxes_sdk-0.4.26-py3-none-any.whl"
-uv add "ucloud-sandboxes-sdk[async] @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.26/ucloud_sandboxes_sdk-0.4.26-py3-none-any.whl"
-uv add "ucloud-sandboxes-sdk[inspect] @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.26/ucloud_sandboxes_sdk-0.4.26-py3-none-any.whl"
+uv add "ucloud-sandboxes-sdk @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.33/ucloud_sandboxes_sdk-0.4.33-py3-none-any.whl"
+uv add "ucloud-sandboxes-sdk[async] @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.33/ucloud_sandboxes_sdk-0.4.33-py3-none-any.whl"
+uv add "ucloud-sandboxes-sdk[inspect] @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.33/ucloud_sandboxes_sdk-0.4.33-py3-none-any.whl"
 ```
 
 Use the base package for the synchronous client, the `async` extra for
@@ -60,6 +60,45 @@ client = SandboxClient(
 ```
 
 ## Sandboxes
+
+For status polling, SDK 0.4.33 adds compact inventory methods in both clients:
+
+```python
+from ucloud_sandboxes_sdk import SandboxClient
+
+client = SandboxClient.from_env()
+statuses = client.list_sandbox_statuses()  # All sandbox statuses.
+statuses = client.list_sandbox_statuses(sandbox_ids=["agent-1", "agent-2"])
+status = client.get_sandbox_status("agent-1")  # None if absent.
+if status is not None:
+    print(status["id"], status["state"])
+```
+
+```python
+from ucloud_sandboxes_sdk import AsyncSandboxClient
+
+async with AsyncSandboxClient.from_env() as client:
+    statuses = await client.list_sandbox_statuses(sandbox_ids=["agent-1", "agent-2"])
+    status = await client.get_sandbox_status("agent-1")
+```
+
+These methods opt in to `GET /v1/sandboxes?view=status`, with repeated `id`
+parameters for exact ID filtering. Each record contains `id`, `spec` with only
+the ID, `state`, `cached_state`, `node`, `created_at`, `updated_at`, and
+`generation`. Omitting full specifications, images, resource requirements, and
+snapshot descriptors reduces response size and gateway read/render work for
+status-only callers. The view uses the same route and heartbeat observations
+and freshness rules as the default inventory; it does not refresh workers.
+
+Omit `sandbox_ids` or pass `None` for the whole fleet. An explicit empty list
+returns `[]` without an HTTP request. A filter accepts at most 256 IDs, each a
+nonempty string of at most 512 characters without a NUL character.
+
+The gateway must support the compact status view and identify its response with
+`view: "status"`; unsupported or malformed responses raise `SandboxApiError`.
+Installing this SDK alone does not change existing `list_sandboxes()` or
+`get_sandbox()` calls: they continue returning full records. Keep using those
+methods when you need specifications or labels, including Inspect CLI cleanup.
 
 ```python
 from ucloud_sandboxes_sdk import Image, SandboxClient, SandboxSpec

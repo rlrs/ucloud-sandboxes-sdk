@@ -37,6 +37,22 @@ def main() -> None:
         "/health",
     ).endswith("/tunnels/rollout-one/health")
 
+    class StatusClient(SandboxClient):
+        def _request_json(self, method, path, **kwargs):
+            assert (method, path) == (
+                "GET", "/v1/sandboxes?view=status&id=wheel-smoke",
+            )
+            return {"view": "status", "sandboxes": [{
+                "id": "wheel-smoke", "spec": {"id": "wheel-smoke"},
+                "generation": 1, "state": "unknown", "cached_state": "running",
+                "node": {"fresh": False},
+            }]}
+
+    status_client = StatusClient("https://gateway.example")
+    assert status_client.list_sandbox_statuses(sandbox_ids=[]) == []
+    status = status_client.get_sandbox_status("wheel-smoke")
+    assert status["state"] == "unknown" and status["node"]["fresh"] is False
+
 
 if __name__ == "__main__":
     main()
