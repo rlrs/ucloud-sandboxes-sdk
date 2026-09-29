@@ -4,7 +4,7 @@ import asyncio
 import errno
 import socket
 import base64
-from contextlib import contextmanager
+from contextlib import ExitStack, asynccontextmanager, contextmanager
 from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 import hashlib
 from dataclasses import asdict, dataclass, field
@@ -18,6 +18,7 @@ import random
 import re
 import tarfile
 import tempfile
+from threading import Lock
 import time
 from typing import (
     Any,
@@ -31,6 +32,7 @@ from typing import (
 )
 from urllib import error, parse, request
 import uuid
+import weakref
 
 from .network_policy import SandboxNetworkPolicy
 from ._http import (
@@ -82,6 +84,32 @@ MAX_JSON_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_FILE_RESPONSE_BYTES = 256 * 1024 * 1024
 BUILD_CONTEXT_SPOOL_MEMORY_BYTES = 8 * 1024 * 1024
 BUILD_CONTEXT_STREAM_CHUNK_BYTES = 1024 * 1024
+# Context packaging must not stall unrelated async sandbox/relay requests. The
+# executor is shared by clients; loop-local admission bounds submitted work
+# without binding an asyncio semaphore to a previously closed event loop.
+_BUILD_CONTEXT_WORKERS = 2
+_BUILD_CONTEXT_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_BUILD_CONTEXT_WORKERS, thread_name_prefix="ucloud-build-context"
+)
+_BUILD_CONTEXT_LIMITERS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_BUILD_CONTEXT_LIMITERS_LOCK = Lock()
+
+
+def _reset_build_context_after_fork() -> None:
+    # Only the forking thread survives. Never acquire inherited locks or shut
+    # down an inherited executor whose workers cannot complete in this child.
+    global _BUILD_CONTEXT_EXECUTOR, _BUILD_CONTEXT_LIMITERS, _BUILD_CONTEXT_LIMITERS_LOCK
+    _BUILD_CONTEXT_EXECUTOR = ThreadPoolExecutor(
+        max_workers=_BUILD_CONTEXT_WORKERS, thread_name_prefix="ucloud-build-context"
+    )
+    _BUILD_CONTEXT_LIMITERS = weakref.WeakKeyDictionary()
+    _BUILD_CONTEXT_LIMITERS_LOCK = Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_build_context_after_fork)
+
+
 SANDBOX_PROFILES = {"container", "linux_host"}
 DEFAULT_LINUX_HOST_WRITABLE_PATHS = (
     "/run",
@@ -2448,7 +2476,7 @@ class AsyncSandboxClient(_DirectSandboxOperations):
         deadline = _deadline(
             DEFAULT_BUILD_SUBMISSION_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
         )
-        with _image_build_request(image) as (payload, archive):
+        async with _async_image_build_request(image, deadline=deadline) as (payload, archive):
             digest = str(payload["context_archive_digest"])
             size = int(payload["context_archive_size"])
             context_path = f"/v1/image-contexts/{_quote_segment(digest)}"
@@ -2807,6 +2835,90 @@ def _checked_job(
     if record.sandbox_id != sandbox_id or record.job_id != job_id:
         raise SandboxApiError("gateway returned another sandbox job", body=response)
     return record
+
+
+def _build_context_limiter() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    with _BUILD_CONTEXT_LIMITERS_LOCK:
+        reference = _BUILD_CONTEXT_LIMITERS.get(loop)
+        limiter = reference() if reference is not None else None
+        if limiter is None:
+            limiter = asyncio.Semaphore(_BUILD_CONTEXT_WORKERS)
+            # A contended semaphore retains its loop. Weak values prevent the
+            # weak-key mapping from indirectly keeping that same loop alive.
+            _BUILD_CONTEXT_LIMITERS[loop] = weakref.ref(limiter)
+        return limiter
+
+
+def _prepare_image_build_request(image: Image):
+    with ExitStack() as stack:
+        payload, archive = stack.enter_context(_image_build_request(image))
+        return payload, archive, stack.pop_all()
+
+
+def _discard_image_build_request(future) -> None:
+    # A concurrent-future callback runs even after the async caller's loop has
+    # closed. The worker owns its files until it finishes, including on cancel.
+    if future.cancelled():
+        return
+    try:
+        _payload, _archive, owner = future.result()
+    except BaseException:
+        return
+    owner.close()
+
+
+async def _await_build_context_step(future, deadline):
+    # Unlike wait_for on supported Python 3.10, wait does not swallow caller
+    # cancellation when the inner future completes in the same loop turn.
+    done, _pending = await asyncio.wait((future,), timeout=_required_remaining_seconds(deadline))
+    if not done:
+        raise TimeoutError("image build context preparation deadline expired")
+    return future.result()
+
+
+@asynccontextmanager
+async def _async_image_build_request(
+    image: Image, *, deadline: float | None,
+) -> AsyncIterator[tuple[JsonObject, BinaryIO]]:
+    limiter = _build_context_limiter()
+    admission = asyncio.create_task(limiter.acquire())
+    try:
+        await _await_build_context_step(admission, deadline)
+    except BaseException:
+        if admission.done() and not admission.cancelled() and admission.exception() is None:
+            limiter.release()
+        else:
+            admission.cancel()
+        raise
+    loop = asyncio.get_running_loop()
+    try:
+        _required_remaining_seconds(deadline)
+        future = _BUILD_CONTEXT_EXECUTOR.submit(_prepare_image_build_request, image)
+    except BaseException:
+        limiter.release()
+        raise
+
+    def finished(_future):
+        try:
+            loop.call_soon_threadsafe(limiter.release)
+        except RuntimeError:
+            pass  # A closed loop has no remaining admission waiters.
+
+    future.add_done_callback(finished)
+    wrapped = asyncio.wrap_future(future)
+    # Retrieve late errors if cancellation means nobody can await this wrapper.
+    wrapped.add_done_callback(lambda value: None if value.cancelled() else value.exception())
+    try:
+        payload, archive, owner = await _await_build_context_step(wrapped, deadline)
+    except BaseException:
+        future.add_done_callback(_discard_image_build_request)
+        future.cancel()  # Queued work can be canceled; running work owns cleanup.
+        raise
+    try:
+        yield payload, archive
+    finally:
+        owner.close()
 
 
 @contextmanager

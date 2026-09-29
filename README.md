@@ -562,6 +562,21 @@ references the immutable archive, and polls until it succeeds or fails.
 The same lower-level flow is available as `submit_image_build(...)`,
 `get_image_build(...)`, `list_image_builds()`, and `wait_for_image_build(...)`.
 
+The async client packages contexts in two shared worker threads, with at most
+two submitted preparations per event loop. Waiting for a packaging slot counts
+against the submission deadline; it does not block other async SDK operations.
+Each submission creates one archive and reuses it across admission retries.
+Keep the source directory unchanged until submission finishes: packaging is a
+file-by-file snapshot, not an atomic filesystem snapshot. Separate submissions
+read the directory again; the SDK does not cache archives by path.
+
+Cancellation prevents queued packaging from starting. Running packaging cannot
+be interrupted safely, so it finishes in its worker and closes its temporary
+archive without submitting a build. Cancellation during an HTTP request remains
+ambiguous if the gateway already accepted it; use the same stable image identity
+to inspect or retry that build. Canceling the client does not cancel an accepted
+server build.
+
 Managed builds are always pushed by the gateway because the builder and sandbox
 node Docker daemons are different machines. `tag` remains optional for explicit
 external or advanced registry workflows, but normal SDK and integration code

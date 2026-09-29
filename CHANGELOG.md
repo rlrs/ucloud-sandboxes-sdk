@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.34 - 2026-09-29
+
+- Move asynchronous image-build context archiving, compression and hashing off
+  the event loop. Two shared packaging threads and two submitted preparations
+  per event loop bound this work while other sandbox requests remain responsive.
+- Include packaging admission in the submission deadline. Canceled queued work
+  does not start; a running packager closes its temporary archive when finished,
+  even if the caller's event loop has closed. Admission retries reuse the same
+  archive. Archive bytes and the synchronous build protocol are unchanged.
+- Reinitialize packaging workers after a POSIX fork, so child processes can
+  submit builds after the parent has already prepared a context.
+
 ## 0.4.33 - 2026-09-28
 
 - Add `list_sandbox_statuses(sandbox_ids=...)` and
