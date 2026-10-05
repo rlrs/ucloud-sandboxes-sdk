@@ -278,7 +278,39 @@ data = sandbox.download_file("/workspace/output.txt")
 sandbox.upload_file_from_path("local-input.txt", "/workspace/input.txt")
 ```
 
-An upload creates missing parent directories.
+An upload creates missing parent directories and writes a private (0600) file.
+
+To write many files, such as an agent harness, send them in one request with
+`upload_files`. The sandbox extracts them with one exec instead of one per file:
+
+```python
+sandbox.upload_files(
+    {
+        "harness/run.py": run_py,                # relative to base_dir
+        "/workspace/harness/lib/util.py": util,  # absolute, under base_dir
+    },
+    base_dir="/workspace",
+    mode=0o644,
+)
+# {"ok": True, "sandbox_id": ..., "path": "/workspace", "files": 2,
+#  "directories": 0, "bytes": ..., "size": ...}
+```
+
+Every file is created or replaced with `mode` (default `0o600`, as `upload_file`
+writes); missing parent directories are created and existing directories are
+left unchanged. Paths are checked before anything is sent: `base_dir` must be
+absolute, no path may contain `..` or control characters, name `base_dir` itself,
+repeat another path, or be the parent of another file. At most 10,000 files and
+256 MiB, both of file content and of the compressed archive, go in one call. An
+empty mapping sends nothing and returns `files` and `bytes` of 0. The upload is
+not atomic: a failure can leave some files written, and repeating the call is
+safe.
+
+A gateway, worker or sandbox that cannot extract archives (an older release, or
+an image without `tar`) answers 403, 404, 405 or 501; `upload_files` then
+uploads each file with `upload_file`, in path order, and returns the same
+`ok`, `sandbox_id`, `path`, `files` and `bytes` with `"fallback": "per_file"`.
+Those files are 0600 whatever `mode` is. Each call tries the archive first.
 
 The same methods are available on `SandboxClient` and `AsyncSandboxClient` when
 you already have a sandbox id.

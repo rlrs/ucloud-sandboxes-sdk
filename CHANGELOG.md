@@ -1,6 +1,22 @@
 # Changelog
 
-## 0.4.35 - 2026-10-05
+## 0.4.36 - 2026-10-05
+
+- Add `upload_files(sandbox_id, files, *, base_dir="/", mode=0o600)` to both
+  synchronous and asynchronous clients and `upload_files(files, ...)` to both
+  sandbox handles. One `PUT /v1/sandboxes/<id>/archive` request carries every
+  file as a gzip-compressed tar, which the sandbox extracts with one exec,
+  instead of one request and one exec per file: an agent harness of 40 small
+  files is one request. Keys are absolute paths under `base_dir` or paths
+  relative to it; every file gets `mode`.
+- Paths are checked before anything is sent: `..`, control characters,
+  duplicates, a file that is another file's parent, and more than 10,000 files
+  or 256 MiB raise `ValueError`. An empty mapping sends nothing.
+- The archive request retries retryable `503` answers as a file upload does.
+  When the gateway, worker or sandbox cannot extract archives (`403`, `404`,
+  `405` or `501` `archive_upload_unsupported`), each call falls back to one
+  `upload_file` per file, which writes 0600 files whatever `mode` is, and
+  reports `"fallback": "per_file"`.
 
 - Add `create_sandbox_group(group_id, spec, count=...)`,
   `get_sandbox_group(group_id)` and `delete_sandbox_group(group_id)` to both

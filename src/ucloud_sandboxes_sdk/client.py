@@ -7,6 +7,7 @@ import base64
 from contextlib import ExitStack, asynccontextmanager, contextmanager
 from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 import hashlib
+import io
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -20,6 +21,7 @@ import tarfile
 import tempfile
 from threading import Lock
 import time
+import unicodedata
 from typing import (
     Any,
     AsyncIterator,
@@ -92,6 +94,16 @@ MAX_JSON_BODY_BYTES = 16 * 1024 * 1024
 MAX_FILE_BODY_BYTES = 256 * 1024 * 1024
 MAX_JSON_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_FILE_RESPONSE_BYTES = 256 * 1024 * 1024
+# upload_files writes many files with one archive request, which the sandbox
+# extracts with one exec. The gateway bounds an archive's members as well as its
+# compressed and extracted bytes (MAX_FILE_BODY_BYTES).
+MAX_ARCHIVE_FILES = 10_000
+# A gateway or worker without the archive route answers 404 (403 to a sandbox
+# API key, or 405); a worker or sandbox that cannot extract archives answers 501
+# archive_upload_unsupported. upload_files then uploads each file singly.
+ARCHIVE_UPLOAD_FALLBACK_STATUSES = frozenset({403, 404, 405, 501})
+# The async client archives larger file sets off the event loop.
+_INLINE_ARCHIVE_BYTES = 1024 * 1024
 BUILD_CONTEXT_SPOOL_MEMORY_BYTES = 8 * 1024 * 1024
 BUILD_CONTEXT_STREAM_CHUNK_BYTES = 1024 * 1024
 # Context packaging must not stall unrelated async sandbox/relay requests. The
@@ -1106,6 +1118,16 @@ class SandboxHandle:
     def upload_file(self, container_path: str, content: bytes | str) -> JsonObject:
         return self.client.upload_file(self.id, container_path, content)
 
+    def upload_files(
+        self,
+        files: Mapping[str, bytes | str],
+        *,
+        base_dir: str = "/",
+        mode: int = 0o600,
+    ) -> JsonObject:
+        """Write many files with one archive request; see SandboxClient.upload_files."""
+        return self.client.upload_files(self.id, files, base_dir=base_dir, mode=mode)
+
     def upload_file_from_path(
         self,
         local_path: str | Path,
@@ -1519,6 +1541,55 @@ class SandboxClient(_DirectSandboxOperations):
             sandbox_id=sandbox_id,
             container_path=container_path,
             expected_size=expected_size,
+        )
+
+    def upload_files(
+        self,
+        sandbox_id: str,
+        files: Mapping[str, bytes | str],
+        *,
+        base_dir: str = "/",
+        mode: int = 0o600,
+    ) -> JsonObject:
+        """Write many files with one request, which the sandbox extracts with one exec.
+
+        Keys are container paths: absolute ones must lie under ``base_dir``,
+        relative ones are relative to it. Every file is created or replaced with
+        ``mode`` (default 0o600, as ``upload_file`` writes); missing parent
+        directories are created and existing directories are left unchanged.
+        A failed request can leave some files written; repeating it is safe.
+
+        Returns the gateway's acknowledgement: ``ok``, ``sandbox_id``, ``path``
+        (the normalized ``base_dir``), ``files``, ``directories``, ``bytes`` (file
+        content bytes) and ``size`` (the compressed request body). An empty
+        ``files`` sends nothing and returns ``ok``, ``sandbox_id``, ``path``,
+        ``files`` (0) and ``bytes`` (0).
+
+        A gateway, worker or sandbox without archive extraction (403, 404, 405
+        or 501) is not an error: each file is then uploaded with ``upload_file``
+        in path order, as a private 0600 file whatever ``mode`` is, and the
+        result has ``ok``, ``sandbox_id``, ``path``, ``files``, ``bytes`` and
+        ``"fallback": "per_file"``. Each call tries the archive first.
+        """
+        archive = _file_archive(files, base_dir=base_dir, mode=mode)
+        if not archive.members:
+            return archive.summary(sandbox_id)
+        body = archive.body()
+        try:
+            response = self._request_json(
+                "PUT",
+                _archive_path(sandbox_id, archive.base_dir),
+                body=body,
+                content_type="application/gzip",
+            )
+        except SandboxApiError as exc:
+            if exc.status_code not in ARCHIVE_UPLOAD_FALLBACK_STATUSES:
+                raise
+            for name, content in archive.members:
+                self.upload_file(sandbox_id, archive.container_path(name), content)
+            return archive.summary(sandbox_id, fallback="per_file")
+        return _validate_archive_upload_response(
+            response, sandbox_id=sandbox_id, archive=archive, size=len(body),
         )
 
     def start_exec(
@@ -2030,6 +2101,18 @@ class AsyncSandboxHandle:
         self, container_path: str, content: bytes | str
     ) -> JsonObject:
         return await self.client.upload_file(self.id, container_path, content)
+
+    async def upload_files(
+        self,
+        files: Mapping[str, bytes | str],
+        *,
+        base_dir: str = "/",
+        mode: int = 0o600,
+    ) -> JsonObject:
+        """Write many files with one archive request; see SandboxClient.upload_files."""
+        return await self.client.upload_files(
+            self.id, files, base_dir=base_dir, mode=mode
+        )
 
     async def upload_file_from_path(
         self,
@@ -2573,6 +2656,44 @@ class AsyncSandboxClient(_DirectSandboxOperations):
             sandbox_id=sandbox_id,
             container_path=container_path,
             expected_size=expected_size,
+        )
+
+    async def upload_files(
+        self,
+        sandbox_id: str,
+        files: Mapping[str, bytes | str],
+        *,
+        base_dir: str = "/",
+        mode: int = 0o600,
+    ) -> JsonObject:
+        """Write many files with one request; see SandboxClient.upload_files.
+
+        Archives of more than 1 MiB of file content are built off the event loop.
+        """
+        archive = _file_archive(files, base_dir=base_dir, mode=mode)
+        if not archive.members:
+            return archive.summary(sandbox_id)
+        if archive.total_bytes <= _INLINE_ARCHIVE_BYTES:
+            body = archive.body()
+        else:
+            body = await asyncio.to_thread(archive.body)
+        try:
+            response = await self._request_json(
+                "PUT",
+                _archive_path(sandbox_id, archive.base_dir),
+                body=body,
+                content_type="application/gzip",
+            )
+        except SandboxApiError as exc:
+            if exc.status_code not in ARCHIVE_UPLOAD_FALLBACK_STATUSES:
+                raise
+            for name, content in archive.members:
+                await self.upload_file(
+                    sandbox_id, archive.container_path(name), content
+                )
+            return archive.summary(sandbox_id, fallback="per_file")
+        return _validate_archive_upload_response(
+            response, sandbox_id=sandbox_id, archive=archive, size=len(body),
         )
 
     async def upload_file_from_path(
@@ -3714,6 +3835,145 @@ def _validate_file_upload_response(
     ):
         raise SandboxApiError(
             "gateway returned an invalid file upload acknowledgement",
+            body=response,
+        )
+    return response
+
+
+@dataclass(frozen=True)
+class _FileArchive:
+    """Validated upload_files input: sorted member names relative to base_dir."""
+
+    base_dir: str
+    members: tuple[tuple[str, bytes], ...]
+    mode: int
+    total_bytes: int
+
+    def container_path(self, name: str) -> str:
+        return f"{self.base_dir.rstrip('/')}/{name}"
+
+    def body(self) -> bytes:
+        """A deterministic gzip-compressed PAX tar of the regular files."""
+        raw = io.BytesIO()
+        with tarfile.open(fileobj=raw, mode="w", format=tarfile.PAX_FORMAT) as tar:
+            for name, content in self.members:
+                info = tarfile.TarInfo(name)
+                info.size = len(content)
+                info.mode = self.mode
+                # The sandbox sets owner and mtime at extraction.
+                info.mtime = 0
+                info.uid = info.gid = 0
+                info.uname = info.gname = ""
+                tar.addfile(info, io.BytesIO(content))
+        body = gzip.compress(raw.getvalue(), compresslevel=6, mtime=0)
+        if len(body) > MAX_FILE_BODY_BYTES:
+            raise ValueError(
+                f"compressed archive exceeds the {MAX_FILE_BODY_BYTES} byte upload limit"
+            )
+        return body
+
+    def summary(self, sandbox_id: str, **extra: Any) -> JsonObject:
+        return {
+            "ok": True,
+            "sandbox_id": sandbox_id,
+            "path": self.base_dir,
+            "files": len(self.members),
+            "bytes": self.total_bytes,
+            **extra,
+        }
+
+
+def _file_archive(
+    files: Mapping[str, bytes | str],
+    *,
+    base_dir: str,
+    mode: int,
+) -> _FileArchive:
+    if not isinstance(base_dir, str) or not base_dir.startswith("/"):
+        raise ValueError(f"base_dir must be an absolute container path: {base_dir!r}")
+    base_parts = _container_path_parts(base_dir, "base_dir")
+    if isinstance(mode, bool) or not isinstance(mode, int) or not 0 <= mode <= 0o777:
+        raise ValueError(f"mode must be a permission mode from 0 to 0o777: {mode!r}")
+    if len(files) > MAX_ARCHIVE_FILES:
+        raise ValueError(f"upload_files accepts at most {MAX_ARCHIVE_FILES} files")
+    named: dict[str, tuple[str, bytes]] = {}
+    total = 0
+    for path, content in files.items():
+        if not isinstance(path, str):
+            raise TypeError(f"file paths must be strings: {path!r}")
+        if not isinstance(content, (bytes, str)):
+            raise TypeError(f"file content must be bytes or str: {path!r}")
+        if not path:
+            raise ValueError("file path is empty")
+        if path.endswith("/"):
+            raise ValueError(f"file path ends with '/': {path!r}")
+        parts = _container_path_parts(path, "file path")
+        if path.startswith("/"):
+            if parts[: len(base_parts)] != base_parts:
+                raise ValueError(f"file path {path!r} is not under base_dir {base_dir!r}")
+            parts = parts[len(base_parts):]
+        if not parts:
+            raise ValueError(f"file path {path!r} names base_dir itself")
+        name = "/".join(parts)
+        if name in named:
+            raise ValueError(
+                f"file paths {named[name][0]!r} and {path!r} name the same file"
+            )
+        data = _bytes_payload(content)
+        total += len(data)
+        named[name] = (path, data)
+    if total > MAX_FILE_BODY_BYTES:
+        raise ValueError(f"files exceed the {MAX_FILE_BODY_BYTES} byte upload limit")
+    for name in named:
+        parts = name.split("/")
+        for depth in range(1, len(parts)):
+            parent = "/".join(parts[:depth])
+            if parent in named:
+                raise ValueError(
+                    f"file path {named[parent][0]!r} is a parent directory of "
+                    f"{named[name][0]!r}"
+                )
+    return _FileArchive(
+        base_dir="/" + "/".join(base_parts),
+        members=tuple((name, named[name][1]) for name in sorted(named)),
+        mode=mode,
+        total_bytes=total,
+    )
+
+
+def _container_path_parts(path: str, what: str) -> list[str]:
+    if any(unicodedata.category(char) == "Cc" for char in path):
+        raise ValueError(f"{what} contains a control character: {path!r}")
+    parts = [part for part in path.split("/") if part not in ("", ".")]
+    if ".." in parts:
+        raise ValueError(f"{what} has a '..' component: {path!r}")
+    return parts
+
+
+def _archive_path(sandbox_id: str, base_dir: str) -> str:
+    return (
+        f"/v1/sandboxes/{_quote_segment(sandbox_id)}/archive?"
+        f"{parse.urlencode({'path': base_dir})}"
+    )
+
+
+def _validate_archive_upload_response(
+    response: JsonObject,
+    *,
+    sandbox_id: str,
+    archive: _FileArchive,
+    size: int,
+) -> JsonObject:
+    if (
+        response.get("ok") is not True
+        or response.get("sandbox_id") != sandbox_id
+        or response.get("path") != archive.base_dir
+        or response.get("files") != len(archive.members)
+        or response.get("bytes") != archive.total_bytes
+        or response.get("size") != size
+    ):
+        raise SandboxApiError(
+            "gateway returned an invalid archive upload acknowledgement",
             body=response,
         )
     return response

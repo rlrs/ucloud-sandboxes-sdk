@@ -13,6 +13,7 @@ with `src/ucloud_sandboxes_sdk/client.py` when endpoints are added.
 - `GET /v1/sandboxes:batch/<group-id>`
 - `DELETE /v1/sandboxes:batch/<group-id>`
 - `PUT /v1/sandboxes/<sandbox-id>/files?path=<absolute-container-path>`
+- `PUT /v1/sandboxes/<sandbox-id>/archive?path=<absolute-container-directory>`
 - `GET /v1/sandboxes/<sandbox-id>/files?path=<absolute-container-path>`
 - `GET /v1/sandboxes/<sandbox-id>/ssh`
 - `POST /v1/sandboxes/<sandbox-id>/exec`
@@ -220,9 +221,30 @@ raw request body to a file in the sandbox.
 `GET /v1/sandboxes/<sandbox-id>/files?path=/absolute/container/path` downloads
 the raw file bytes.
 
+`PUT /v1/sandboxes/<sandbox-id>/archive?path=/absolute/destination/directory`
+extracts a tar archive, plain (`application/x-tar`) or gzip-compressed
+(`application/gzip`, detected by its magic bytes), with one exec in the sandbox.
+Members are regular files and directories with relative names (a leading `./`
+is tolerated) and no `..` or control characters; links, devices, FIFOs, sparse
+files, duplicate paths and a file that is another member's parent answer `400`.
+The body, and the extracted bytes, are bounded like a file upload (256 MiB),
+with at most 10,000 members. Each file is created or replaced under the
+destination with its member mode & 0777, owned by the sandbox's exec identity,
+with the extraction time as mtime; missing parents are created and existing
+directories are left unchanged. Extraction is not atomic, and repeating a
+request is safe. The answer is
+`{"ok": true, "sandbox_id": ..., "path": ..., "files": ..., "directories": ..., "bytes": ..., "size": ...}`
+(`bytes` sums the file sizes, `size` is the request body length). A worker or
+sandbox that cannot extract archives answers `501` with `archive_upload_unsupported`;
+a gateway without the route answers `404` (`403` to a sandbox API key, or `405`).
+Retryable `503` answers are the same as for a file upload.
+
 The SDK exposes these as:
 
 - `upload_file(...)`
+- `upload_files(...)`, which sends a deterministic gzip-compressed PAX tar of
+  regular files only and, on `403`, `404`, `405` or `501`, uploads each file
+  with `upload_file` instead (`"fallback": "per_file"` in its result)
 - `upload_file_from_path(...)`
 - `download_file(...)`
 

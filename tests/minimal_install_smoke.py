@@ -65,6 +65,22 @@ def main() -> None:
     )
     assert member.id == "wheel-0000"
 
+    class ArchiveClient(SandboxClient):
+        def _request_json(self, method, path, **kwargs):
+            assert (method, path) == (
+                "PUT", "/v1/sandboxes/wheel-smoke/archive?path=%2Fworkspace",
+            )
+            assert kwargs["content_type"] == "application/gzip"
+            return {"ok": True, "sandbox_id": "wheel-smoke", "path": "/workspace",
+                    "files": 2, "directories": 0, "bytes": 5,
+                    "size": len(kwargs["body"])}
+
+    uploaded = ArchiveClient("https://gateway.example").upload_files(
+        "wheel-smoke", {"run.py": b"123", "/workspace/lib/a.py": "45"},
+        base_dir="/workspace",
+    )
+    assert uploaded["files"] == 2
+
 
 if __name__ == "__main__":
     main()
