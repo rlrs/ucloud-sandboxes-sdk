@@ -232,6 +232,41 @@ process.terminate()
 returncode = await process.wait()
 ```
 
+### Sandbox groups
+
+SDK 0.4.35 adds group create to both clients. One request creates `count`
+sandboxes of one spec, `<group_id>-0000` onward, packed onto few workers so each
+attaches the image once:
+
+```python
+from dataclasses import replace
+
+from ucloud_sandboxes_sdk import SandboxGroupUnavailableError
+
+spec = SandboxSpec.benchmark(id="unused", image=Image.from_registry("ubuntu:24.04"))
+try:
+    members = client.create_sandbox_group("rollouts-7", spec, count=8)
+except SandboxGroupUnavailableError:
+    members = [
+        client.create_sandbox(replace(spec, id=f"rollouts-7-{index:04d}"))
+        for index in range(8)
+    ]
+for sandbox in members:
+    sandbox.exec(["true"])
+    sandbox.delete()
+```
+
+The spec's `id` is not sent. Members are ordinary sandboxes, deleted one by one
+or together with `delete_sandbox_group(group_id)`; `get_sandbox_group(group_id)`
+reports each member's state (`None` for an unknown group). While some members
+wait for capacity the call repeats the identical request, as the gateway asks,
+until the deadline (`request_timeout_seconds`, 10 minutes by default).
+`on_progress` receives each answer as a `SandboxGroupStatus`, so members already
+placed can be used before the rest. A gateway in ranked placement does not
+create groups: the call raises `SandboxGroupUnavailableError` and creates
+nothing. Other failures raise `SandboxGroupError`, whose `group` lists the
+members the gateway placed.
+
 ## Files
 
 Upload and download files as raw bytes through the gateway:
@@ -242,6 +277,8 @@ data = sandbox.download_file("/workspace/output.txt")
 
 sandbox.upload_file_from_path("local-input.txt", "/workspace/input.txt")
 ```
+
+An upload creates missing parent directories.
 
 The same methods are available on `SandboxClient` and `AsyncSandboxClient` when
 you already have a sandbox id.

@@ -15,6 +15,10 @@ from .client import (
     SandboxClient,
     SandboxExecResult,
     SandboxFilesystemSpec,
+    SandboxGroupError,
+    SandboxGroupMember,
+    SandboxGroupStatus,
+    SandboxGroupUnavailableError,
     SandboxHandle,
     SandboxJobLogChunk,
     SandboxJobRecord,
@@ -39,7 +43,7 @@ from .relay import (
     model_relay_env,
 )
 
-__version__ = "0.4.34"
+__version__ = "0.4.35"
 
 __all__ = [
     "AsyncExecHandle",
@@ -57,6 +61,10 @@ __all__ = [
     "SandboxClient",
     "SandboxExecResult",
     "SandboxFilesystemSpec",
+    "SandboxGroupError",
+    "SandboxGroupMember",
+    "SandboxGroupStatus",
+    "SandboxGroupUnavailableError",
     "SandboxHandle",
     "SandboxJobLogChunk",
     "SandboxJobRecord",

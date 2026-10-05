@@ -78,6 +78,16 @@ UCLOUD_RETRY_AFTER_JITTER_RATIO = 0.25
 DEFAULT_CREATE_TIMEOUT_SECONDS = 10 * 60.0
 DEFAULT_BUILD_SUBMISSION_TIMEOUT_SECONDS = 10 * 60.0
 DEFAULT_EXEC_EVENT_WAIT_SECONDS = 20.0
+# Group create (C3.2): one request places count sandboxes <group_id>-<i:04d>
+# of one spec. The gateway bounds a group id so its member ids stay sandbox ids.
+SANDBOX_GROUP_PATH = "/v1/sandboxes:batch"
+MAX_SANDBOX_GROUP_SIZE = 512
+SANDBOX_GROUP_PLACEMENTS = frozenset({"pack", "spread"})
+_SANDBOX_GROUP_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,58}$")
+# Member states that are not (yet) a usable sandbox, as the gateway reports them.
+SANDBOX_GROUP_UNPLACED_STATES = frozenset(
+    {"pending", "creating", "failed", "conflict", "deleted"}
+)
 MAX_JSON_BODY_BYTES = 16 * 1024 * 1024
 MAX_FILE_BODY_BYTES = 256 * 1024 * 1024
 MAX_JSON_RESPONSE_BYTES = 16 * 1024 * 1024
@@ -190,6 +200,37 @@ class ExecEventHistoryLostError(SandboxApiError):
         self.session_id = session_id
         self.expected_sequence = expected_sequence
         self.received_sequence = received_sequence
+
+
+class SandboxGroupError(SandboxApiError):
+    """A group create that did not place every member.
+
+    ``group`` holds the gateway's last per-member answer when it sent one:
+    members it already placed are ordinary sandboxes the caller owns.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        group: "SandboxGroupStatus | None" = None,
+        status_code: int | None = None,
+        body: object | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
+        super().__init__(
+            message, status_code=status_code, body=body, headers=headers,
+        )
+        self.group = group
+
+
+class SandboxGroupUnavailableError(SandboxGroupError):
+    """The gateway does not create groups; create the sandboxes one by one.
+
+    A gateway in ranked placement answers 501
+    ``sandbox_group_create_unavailable``; a gateway without the route answers
+    404 or 405. Nothing was created.
+    """
 
 
 def sandbox_auth_headers(api_token: str | None) -> dict[str, str]:
@@ -589,6 +630,188 @@ class SandboxJobLogChunk:
         )
 
 
+@dataclass(frozen=True)
+class SandboxGroupMember:
+    id: str
+    status: str
+    generation: int | None = None
+    node_id: str | None = None
+    error_code: str | None = None
+    # The sandbox record, only in the answer that created the member.
+    record: JsonObject = field(default_factory=dict)
+    payload: JsonObject = field(default_factory=dict)
+
+    @property
+    def placed(self) -> bool:
+        return self.status not in SANDBOX_GROUP_UNPLACED_STATES
+
+
+@dataclass(frozen=True)
+class SandboxGroupStatus:
+    id: str
+    count: int
+    state: str
+    members: tuple[SandboxGroupMember, ...]
+    payload: JsonObject = field(default_factory=dict)
+
+    @property
+    def counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for member in self.members:
+            counts[member.status] = counts.get(member.status, 0) + 1
+        return counts
+
+    @property
+    def complete(self) -> bool:
+        return all(
+            member.placed or member.status == "deleted" for member in self.members
+        )
+
+    @classmethod
+    def from_payload(cls, payload: object) -> "SandboxGroupStatus":
+        group = payload.get("group") if isinstance(payload, dict) else None
+        members = payload.get("sandboxes") if isinstance(payload, dict) else None
+        if not isinstance(group, dict) or not isinstance(members, list):
+            raise SandboxApiError(
+                "gateway returned an invalid sandbox group payload", body=payload
+            )
+        parsed = []
+        for item in members:
+            if (
+                not isinstance(item, dict)
+                or not isinstance(item.get("id"), str)
+                or not item["id"]
+                or not isinstance(item.get("status"), str)
+            ):
+                raise SandboxApiError(
+                    "gateway returned an invalid sandbox group member", body=payload
+                )
+            generation = item.get("generation")
+            record = item.get("sandbox")
+            parsed.append(
+                SandboxGroupMember(
+                    id=item["id"],
+                    status=item["status"],
+                    generation=(
+                        generation
+                        if isinstance(generation, int)
+                        and not isinstance(generation, bool)
+                        else None
+                    ),
+                    node_id=(
+                        item["node_id"]
+                        if isinstance(item.get("node_id"), str)
+                        else None
+                    ),
+                    error_code=(
+                        item["error_code"]
+                        if isinstance(item.get("error_code"), str)
+                        and item["error_code"]
+                        else None
+                    ),
+                    record=record if isinstance(record, dict) else {},
+                    payload=item,
+                )
+            )
+        count = group.get("count")
+        return cls(
+            id=str(group.get("id") or ""),
+            count=count if isinstance(count, int) else len(parsed),
+            state=str(group.get("state") or ""),
+            members=tuple(parsed),
+            payload=payload,
+        )
+
+
+class _SandboxGroupCreate:
+    """One group create: the identical request repeated until every member is
+    placed, as the gateway asks, within one deadline."""
+
+    def __init__(
+        self,
+        group_id: str,
+        spec: SandboxSpec,
+        count: int,
+        placement: str,
+        timeout_seconds: float,
+        on_progress: Callable[[SandboxGroupStatus], object] | None,
+    ) -> None:
+        self.payload = _sandbox_group_payload(group_id, spec, count, placement)
+        self.headers = _image_reference_headers(spec.image)
+        self.timeout = timeout_seconds
+        self.deadline = _deadline(timeout_seconds)
+        self.on_progress = on_progress
+        self.attempt = 0
+        # A member's record arrives only in the answer that created it.
+        self.records: dict[str, JsonObject] = {}
+        self.last: SandboxGroupStatus | None = None
+
+    def request_timeout(self) -> float:
+        return _request_timeout_seconds(
+            _required_remaining_seconds(self.deadline), self.timeout
+        )
+
+    def accept(self, payload: object) -> SandboxGroupStatus:
+        status = SandboxGroupStatus.from_payload(payload)
+        for member in status.members:
+            if member.record:
+                self.records[member.id] = member.record
+        self.last = status
+        if self.on_progress is not None:
+            self.on_progress(status)
+        return status
+
+    def retry_delay(self, exc: SandboxApiError) -> float | None:
+        """Raise unless the identical request may be repeated; else the delay.
+
+        A repeat places only unplaced members, so a group is retried exactly
+        as a stable-id single create is.
+        """
+        if exc.status_code in {404, 405, 501}:
+            raise SandboxGroupUnavailableError(
+                str(exc), status_code=exc.status_code, body=exc.body,
+                headers=exc.headers,
+            ) from exc
+        group = None
+        if isinstance(exc.body, dict) and "sandboxes" in exc.body:
+            group = self.accept(exc.body)
+        if exc.status_code is None or not _should_retry_ucloud_unavailable(
+            exc.status_code, exc.body, self.attempt, method="POST",
+            path="/v1/sandboxes", max_attempts=UCLOUD_CREATE_RETRY_ATTEMPTS,
+        ):
+            raise self.error(exc, group=group) from exc
+        delay = _ucloud_unavailable_retry_delay(
+            self.attempt, exc.headers, method="POST", path="/v1/sandboxes",
+        )
+        remaining = _remaining_seconds(self.deadline)
+        if remaining is not None and remaining <= delay:
+            raise self.error(
+                _retry_budget_exhausted(exc, self.attempt + 1), group=group,
+            ) from exc
+        self.attempt += 1
+        return delay
+
+    def error(
+        self, exc: SandboxApiError, *, group: SandboxGroupStatus | None,
+    ) -> SandboxGroupError:
+        return SandboxGroupError(
+            str(exc), group=group or self.last, status_code=exc.status_code,
+            body=exc.body, headers=exc.headers,
+        )
+
+    def handles(self, status: SandboxGroupStatus, make: Callable[..., Any]) -> list:
+        if not status.complete:
+            raise SandboxGroupError(
+                "gateway answered a group create with unplaced members",
+                group=status, body=status.payload,
+            )
+        return [
+            make(member.id, self.records.get(member.id, {}), status.payload)
+            for member in status.members
+            if member.status != "deleted"
+        ]
+
+
 class _DirectSandboxOperations:
     def health(self) -> JsonObject:
         return self._request_json("GET", "/healthz")
@@ -665,6 +888,19 @@ class _DirectSandboxOperations:
     def delete_sandbox(self, sandbox_id: str) -> JsonObject:
         return self._request_json(
             "DELETE", f"/v1/sandboxes/{_quote_segment(sandbox_id)}"
+        )
+
+    def delete_sandbox_group(
+        self,
+        group_id: str,
+        *,
+        request_timeout_seconds: float | None = None,
+    ) -> JsonObject:
+        """Refuse the group new members, then delete each of its members."""
+        return self._request_json(
+            "DELETE",
+            _sandbox_group_path(group_id),
+            timeout_seconds=request_timeout_seconds,
         )
 
     def upload_file(
@@ -1214,6 +1450,61 @@ class SandboxClient(_DirectSandboxOperations):
         )
         sandbox_id, record = _sandbox_record(response)
         return SandboxHandle(self, sandbox_id, record=record, create_response=response)
+
+    def create_sandbox_group(
+        self,
+        group_id: str,
+        spec: SandboxSpec,
+        *,
+        count: int,
+        placement: str = "pack",
+        request_timeout_seconds: float | None = None,
+        on_progress: Callable[[SandboxGroupStatus], object] | None = None,
+    ) -> list[SandboxHandle]:
+        """Create ``count`` sandboxes ``<group_id>-<i:04d>`` of ``spec`` at once.
+
+        ``spec.id`` is not sent. Members are ordinary sandboxes; each is deleted
+        with ``delete_sandbox``. The request is repeated, as the gateway asks,
+        until every member is placed or the deadline passes; ``on_progress``
+        sees each answer, so placed members can be used before the rest.
+        Returns a handle per member that has not been deleted, in member order.
+        Raises ``SandboxGroupUnavailableError`` when the gateway does not create
+        groups (nothing was created), and ``SandboxGroupError`` otherwise.
+        """
+        state = _SandboxGroupCreate(
+            group_id, spec, count, placement,
+            DEFAULT_CREATE_TIMEOUT_SECONDS
+            if request_timeout_seconds is None else request_timeout_seconds,
+            on_progress,
+        )
+        while True:
+            try:
+                response = self._request_json(
+                    "POST",
+                    SANDBOX_GROUP_PATH,
+                    payload=state.payload,
+                    extra_headers=state.headers,
+                    timeout_seconds=state.request_timeout(),
+                )
+            except SandboxApiError as exc:
+                time.sleep(state.retry_delay(exc))
+                continue
+            return state.handles(
+                state.accept(response),
+                lambda sid, record, payload: SandboxHandle(
+                    self, sid, record=record, create_response=payload,
+                ),
+            )
+
+    def get_sandbox_group(self, group_id: str) -> SandboxGroupStatus | None:
+        """Each member's state, or None when the group does not exist."""
+        try:
+            payload = self._request_json("GET", _sandbox_group_path(group_id))
+        except SandboxApiError as exc:
+            if exc.status_code == 404:
+                return None
+            raise
+        return SandboxGroupStatus.from_payload(payload)
 
     def _finish_file_upload(
         self,
@@ -2199,8 +2490,67 @@ class AsyncSandboxClient(_DirectSandboxOperations):
             self, sandbox_id, record=record, create_response=response
         )
 
+    async def create_sandbox_group(
+        self,
+        group_id: str,
+        spec: SandboxSpec,
+        *,
+        count: int,
+        placement: str = "pack",
+        request_timeout_seconds: float | None = None,
+        on_progress: Callable[[SandboxGroupStatus], object] | None = None,
+    ) -> list[AsyncSandboxHandle]:
+        """Create ``count`` sandboxes ``<group_id>-<i:04d>`` of ``spec`` at once.
+
+        As ``SandboxClient.create_sandbox_group``.
+        """
+        state = _SandboxGroupCreate(
+            group_id, spec, count, placement,
+            DEFAULT_CREATE_TIMEOUT_SECONDS
+            if request_timeout_seconds is None else request_timeout_seconds,
+            on_progress,
+        )
+        while True:
+            try:
+                response = await self._request_json(
+                    "POST",
+                    SANDBOX_GROUP_PATH,
+                    payload=state.payload,
+                    extra_headers=state.headers,
+                    timeout_seconds=state.request_timeout(),
+                )
+            except SandboxApiError as exc:
+                await asyncio.sleep(state.retry_delay(exc))
+                continue
+            return state.handles(
+                state.accept(response),
+                lambda sid, record, payload: AsyncSandboxHandle(
+                    self, sid, record=record, create_response=payload,
+                ),
+            )
+
+    async def get_sandbox_group(self, group_id: str) -> SandboxGroupStatus | None:
+        """Each member's state, or None when the group does not exist."""
+        try:
+            payload = await self._request_json("GET", _sandbox_group_path(group_id))
+        except SandboxApiError as exc:
+            if exc.status_code == 404:
+                return None
+            raise
+        return SandboxGroupStatus.from_payload(payload)
+
     async def delete_sandbox(self, sandbox_id: str) -> JsonObject:
         return await super().delete_sandbox(sandbox_id)
+
+    async def delete_sandbox_group(
+        self,
+        group_id: str,
+        *,
+        request_timeout_seconds: float | None = None,
+    ) -> JsonObject:
+        return await super().delete_sandbox_group(
+            group_id, request_timeout_seconds=request_timeout_seconds
+        )
 
     async def upload_file(
         self,
@@ -2814,6 +3164,38 @@ def _sandbox_record(response: JsonObject) -> tuple[str, JsonObject]:
             body=response,
         )
     return sandbox_id, record
+
+
+def _sandbox_group_path(group_id: str) -> str:
+    return f"{SANDBOX_GROUP_PATH}/{_quote_segment(_sandbox_group_id(group_id))}"
+
+
+def _sandbox_group_id(group_id: str) -> str:
+    if not isinstance(group_id, str) or not _SANDBOX_GROUP_ID_RE.match(group_id):
+        raise ValueError(
+            "group_id must be 1-59 characters of [A-Za-z0-9_.-], starting alphanumeric"
+        )
+    return group_id
+
+
+def _sandbox_group_payload(
+    group_id: str, spec: SandboxSpec, count: int, placement: str,
+) -> JsonObject:
+    if isinstance(count, bool) or not isinstance(count, int) or not (
+        1 <= count <= MAX_SANDBOX_GROUP_SIZE
+    ):
+        raise ValueError(f"count must be an integer from 1 to {MAX_SANDBOX_GROUP_SIZE}")
+    if placement not in SANDBOX_GROUP_PLACEMENTS:
+        raise ValueError("placement must be pack or spread")
+    template = spec.to_dict()
+    # Members take their ids from the group; the spec's own id is not sent.
+    template.pop("id")
+    return {
+        "group_id": _sandbox_group_id(group_id),
+        "count": count,
+        "spec": template,
+        "placement": placement,
+    }
 
 
 def _exec_session(response: JsonObject) -> JsonObject:
@@ -3527,6 +3909,10 @@ def _should_retry_ucloud_unavailable(
     max_attempts: int | None = UCLOUD_UNAVAILABLE_RETRY_ATTEMPTS,
 ) -> bool:
     normalized_method = method.upper()
+    if normalized_method == "POST" and path == SANDBOX_GROUP_PATH:
+        # create_sandbox_group repeats the request itself, so that every
+        # answer's placed members reach the caller.
+        return False
     error_code = body.get("error_code") if isinstance(body, dict) else None
     image_resolution_fence = (
         normalized_method == "POST"
@@ -3540,6 +3926,10 @@ def _should_retry_ucloud_unavailable(
         and path.startswith("/v1/sandboxes/")
         and "/" not in path[len("/v1/sandboxes/"):].split("?", 1)[0]
         and error_code == "memory_publication_draining"
+    )
+    # A group delete is idempotent too: a repeat deletes the members left.
+    group_delete = (
+        normalized_method == "DELETE" and path.startswith(SANDBOX_GROUP_PATH + "/")
     )
     builder_admission_fence = (
         normalized_method == "POST"
@@ -3567,6 +3957,7 @@ def _should_retry_ucloud_unavailable(
             or image_resolution_fence
             or builder_admission_fence
             or delete_drain
+            or group_delete
         )
     )
     stable_create = normalized_method == "POST" and path == "/v1/sandboxes"
@@ -3611,7 +4002,7 @@ def _ucloud_unavailable_retry_attempts(method: str, path: str) -> int | None:
         # Only explicit pre-dispatch fences qualify for this deadline-bound
         # budget. Ambiguous build failures must never be blindly resubmitted.
         return None
-    if method.upper() == "POST" and path == "/v1/sandboxes":
+    if method.upper() == "POST" and path in {"/v1/sandboxes", SANDBOX_GROUP_PATH}:
         return UCLOUD_CREATE_RETRY_ATTEMPTS
     if path.startswith(("/v1/sandboxes/", "/v1/exec/")):
         return UCLOUD_SANDBOX_OPERATION_RETRY_ATTEMPTS

@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.4.35 - 2026-10-05
+
+- Add `create_sandbox_group(group_id, spec, count=...)`,
+  `get_sandbox_group(group_id)` and `delete_sandbox_group(group_id)` to both
+  synchronous and asynchronous clients, for the gateway's
+  `/v1/sandboxes:batch` group create. One request creates `count` (at most
+  512) sandboxes `<group_id>-<i:04d>` of one spec; members are ordinary
+  sandboxes with ordinary handles.
+- A group create is retried as a stable-id create is: a retryable answer
+  repeats the identical request, which places only the members still
+  unplaced, within one deadline (10 minutes by default) and at the gateway's
+  `Retry-After` cadence. `on_progress` receives every answer, so placed members
+  are usable while the rest wait for capacity.
+- `SandboxGroupUnavailableError` (501 `sandbox_group_create_unavailable` from a
+  gateway in ranked placement, or 404/405 from one without the route) means
+  nothing was created and the caller should create singly.
+  `SandboxGroupError` carries the last member list for other failures.
+- Retry a group delete that answers a retryable 503; deletes are idempotent.
+
 ## 0.4.34 - 2026-09-29
 
 - Move asynchronous image-build context archiving, compression and hashing off

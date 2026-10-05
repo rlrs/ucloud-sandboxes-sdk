@@ -53,6 +53,18 @@ def main() -> None:
     status = status_client.get_sandbox_status("wheel-smoke")
     assert status["state"] == "unknown" and status["node"]["fresh"] is False
 
+    class GroupClient(SandboxClient):
+        def _request_json(self, method, path, **kwargs):
+            assert (method, path) == ("POST", "/v1/sandboxes:batch")
+            assert "id" not in kwargs["payload"]["spec"]
+            return {"group": {"id": "wheel", "count": 1, "state": "active"},
+                    "sandboxes": [{"id": "wheel-0000", "status": "running"}]}
+
+    (member,) = GroupClient("https://gateway.example").create_sandbox_group(
+        "wheel", spec, count=1,
+    )
+    assert member.id == "wheel-0000"
+
 
 if __name__ == "__main__":
     main()

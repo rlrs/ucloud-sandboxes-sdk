@@ -9,6 +9,9 @@ with `src/ucloud_sandboxes_sdk/client.py` when endpoints are added.
 - `GET /v1/sandboxes`
 - `POST /v1/sandboxes`
 - `DELETE /v1/sandboxes/<sandbox-id>`
+- `POST /v1/sandboxes:batch`
+- `GET /v1/sandboxes:batch/<group-id>`
+- `DELETE /v1/sandboxes:batch/<group-id>`
 - `PUT /v1/sandboxes/<sandbox-id>/files?path=<absolute-container-path>`
 - `GET /v1/sandboxes/<sandbox-id>/files?path=<absolute-container-path>`
 - `GET /v1/sandboxes/<sandbox-id>/ssh`
@@ -79,6 +82,46 @@ The gateway owns placement and may return `503` while nodes are scaling up.
 
 The Inspect AI provider reads `UCLOUD_SANDBOX_SECURITY` as a JSON object and
 passes it as `security` on `POST /v1/sandboxes`.
+
+## Sandbox Groups
+
+`POST /v1/sandboxes:batch` creates `count` (1 to 512) sandboxes of one spec:
+
+```json
+{
+  "group_id": "rollouts-7",
+  "count": 8,
+  "spec": {"image": "python:3.12-slim", "cpus": 1, "memory_mb": 2048},
+  "placement": "pack"
+}
+```
+
+`spec` is a create request without `id`. Members are `<group-id>-0000`,
+`<group-id>-0001`, and so on; a group id is 1 to 59 characters of
+`[A-Za-z0-9_.-]`, starting alphanumeric. `pack` places members on few workers,
+so each worker attaches the image once; `spread` caps each worker at an even
+share. Members are ordinary sandboxes: exec, files, park, wake and
+`DELETE /v1/sandboxes/<member-id>` work per member.
+
+Every answer lists the members in order as `sandboxes`, each with `id` and
+`status`; `generation` and `node_id` once it has a route, and the `sandbox`
+record in the answer that created it. `201` means every member is placed
+(`200` for a repeat that placed none). `503` with `retryable: true` means some
+members are `pending` or `creating`: repeating the identical request is the
+retry, and places only those. `502` is a worker failure and `409` a member or
+group id held by another request; neither is retryable. A gateway in ranked
+placement answers `501` with `sandbox_group_create_unavailable`; create the
+sandboxes singly instead.
+
+`GET /v1/sandboxes:batch/<group-id>` lists the members and their states.
+`DELETE /v1/sandboxes:batch/<group-id>` refuses the group further members and
+deletes each member; a `503` repeat deletes the rest.
+
+`create_sandbox_group()` repeats the request while the gateway asks, within one
+deadline (10 minutes by default), and calls `on_progress` with each answer, so
+placed members are usable before the rest. It raises
+`SandboxGroupUnavailableError` on `501`, `404` or `405` (nothing was created)
+and `SandboxGroupError` otherwise; `error.group` holds the last member list.
 
 ## Images
 
