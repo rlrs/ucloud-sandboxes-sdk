@@ -27,6 +27,7 @@ from typing import (
     AsyncIterator,
     BinaryIO,
     Callable,
+    Iterable,
     Iterator,
     Literal,
     Mapping,
@@ -520,6 +521,42 @@ class Image:
                 "before calling build_image()"
             )
         return self.build_spec
+
+
+IMAGE_RECIPE_RETENTIONS = ("pinned", "cached")
+IMAGE_RECIPE_BATCH = 1000  # The gateway's limit per registration or ensure request.
+IMAGE_STATES_SETTLED = frozenset({"ready", "failed", "unknown"})
+
+
+@dataclass(frozen=True)
+class ImageRecipe:
+    """A name a trainer will ask for, and the Dockerfile build that makes it.
+
+    Registered with ``register_image_recipes``; ``ensure_images`` then builds
+    the missing ones, and a sandbox created with ``image=name`` waits for (or
+    starts) its build. ``retention``: ``"pinned"`` keeps the built image (a
+    corpus built ahead); ``"cached"`` lets it age out and be rebuilt on demand.
+    """
+
+    name: str
+    context_path: str | Path
+    dockerfile: str = "Dockerfile"
+    build_args: Mapping[str, str] = field(default_factory=dict)
+    retention: str = "cached"
+
+    def __post_init__(self) -> None:
+        _non_empty_string("name", self.name)
+        if self.retention not in IMAGE_RECIPE_RETENTIONS:
+            raise ValueError(f"retention must be one of {IMAGE_RECIPE_RETENTIONS}")
+
+    def _image(self) -> Image:
+        return Image.from_dockerfile(name=self.name, context_path=self.context_path, dockerfile=self.dockerfile,
+                                     build_args=self.build_args)
+
+    def _registration(self, payload: JsonObject) -> JsonObject:
+        return {"name": self.name, "context_archive_digest": payload["context_archive_digest"],
+                "context_archive_size": payload["context_archive_size"], "dockerfile": self.dockerfile,
+                "build_args": dict(self.build_args), "retention": self.retention}
 
 
 @dataclass(frozen=True)
@@ -1792,32 +1829,7 @@ class SandboxClient(_DirectSandboxOperations):
             DEFAULT_BUILD_SUBMISSION_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
         )
         with _image_build_request(image) as (payload, archive):
-            digest = str(payload["context_archive_digest"])
-            size = int(payload["context_archive_size"])
-            context_path = f"/v1/image-contexts/{_quote_segment(digest)}"
-            try:
-                existing = self._request_json(
-                    "GET",
-                    context_path,
-                    timeout_seconds=_remaining_seconds(deadline),
-                )
-            except SandboxApiError as exc:
-                if exc.status_code != 404:
-                    raise
-                existing = None
-            if not _build_context_reference_matches(
-                existing,
-                digest=digest,
-                size=size,
-            ):
-                self._request_json(
-                    "PUT",
-                    context_path,
-                    body=archive,
-                    body_size=size,
-                    content_type="application/gzip",
-                    timeout_seconds=_remaining_seconds(deadline),
-                )
+            self._upload_build_context(payload, archive, deadline)
             payload["wait"] = False
             submitted = self._request_json(
                 "POST",
@@ -1852,6 +1864,96 @@ class SandboxClient(_DirectSandboxOperations):
             if state.accept(build, on_status):
                 return build
             time.sleep(state.delay(poll_interval_seconds))
+
+    def _upload_build_context(self, payload: JsonObject, archive: BinaryIO, deadline: float | None) -> None:
+        """Upload a build context unless the gateway already holds it."""
+        digest = str(payload["context_archive_digest"])
+        size = int(payload["context_archive_size"])
+        context_path = f"/v1/image-contexts/{_quote_segment(digest)}"
+        try:
+            existing = self._request_json("GET", context_path, timeout_seconds=_remaining_seconds(deadline))
+        except SandboxApiError as exc:
+            if exc.status_code != 404:
+                raise
+            existing = None
+        if not _build_context_reference_matches(existing, digest=digest, size=size):
+            self._request_json("PUT", context_path, body=archive, body_size=size, content_type="application/gzip",
+                               timeout_seconds=_remaining_seconds(deadline))
+
+    def register_image_recipes(
+        self,
+        recipes: Iterable[ImageRecipe],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> JsonObject:
+        """Upload each recipe's context and register its name with the gateway.
+        Returns ``{"registered", "changed", "recipes": [{name, image_id, changed}]}``.
+        Re-registering an unchanged recipe is a no-op."""
+        recipes = _image_recipes(recipes)
+        deadline = _deadline(DEFAULT_BUILD_SUBMISSION_TIMEOUT_SECONDS if timeout_seconds is None
+                             else timeout_seconds)
+        rows = []
+        for recipe in recipes:
+            with _image_build_request(recipe._image()) as (payload, archive):
+                self._upload_build_context(payload, archive, deadline)
+                rows.append(recipe._registration(payload))
+        registered: list[JsonObject] = []
+        for start in range(0, len(rows), IMAGE_RECIPE_BATCH):
+            result = self._request_json("POST", "/v1/image-recipes", payload={"recipes": rows[start:start + IMAGE_RECIPE_BATCH]},
+                                        timeout_seconds=_remaining_seconds(deadline))
+            registered.extend(result.get("recipes") or [])
+        return _image_recipe_registration(registered)
+
+    def ensure_images(
+        self,
+        names: Iterable[str],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, JsonObject]:
+        """Each registered name's state: ``ready`` (with ``reference``),
+        ``building``, ``queued``, ``failed`` (with ``error``) or ``unknown``.
+        Missing images are submitted for building; calling again only polls."""
+        names = _image_names(names)
+        deadline = _deadline(timeout_seconds)
+        statuses: dict[str, JsonObject] = {}
+        for start in range(0, len(names), IMAGE_RECIPE_BATCH):
+            result = self._request_json("POST", "/v1/images/ensure",
+                                        payload={"names": names[start:start + IMAGE_RECIPE_BATCH]},
+                                        timeout_seconds=_remaining_seconds(deadline))
+            statuses.update(_image_statuses(result))
+        return statuses
+
+    def wait_for_images(
+        self,
+        names: Iterable[str],
+        *,
+        timeout_seconds: float | None = None,
+        poll_interval_seconds: float = 10.0,
+        on_status: Callable[[dict[str, JsonObject]], object] | None = None,
+    ) -> dict[str, JsonObject]:
+        """Ensure and poll until every name is ready, failed or unknown; returns
+        the final statuses (check ``state``). Raises TimeoutError at the deadline."""
+        names = _image_names(names)
+        deadline = _deadline(timeout_seconds)
+        settled: dict[str, JsonObject] = {}
+        while True:
+            pending = [name for name in names if name not in settled]
+            try:
+                current = self.ensure_images(pending, timeout_seconds=_remaining_seconds(deadline))
+            except SandboxApiError as exc:
+                if not _transient_image_poll_error(exc):
+                    raise
+                current = {}
+            settled.update({name: status for name, status in current.items()
+                            if status.get("state") in IMAGE_STATES_SETTLED})
+            if on_status is not None:
+                on_status({**current, **settled})
+            if len(settled) == len(names):
+                return {name: settled[name] for name in names}
+            remaining = _remaining_seconds(deadline)
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError(f"{len(names) - len(settled)} of {len(names)} images are not built yet")
+            time.sleep(poll_interval_seconds if remaining is None else min(poll_interval_seconds, remaining))
 
     def build_image(
         self,
@@ -2957,32 +3059,7 @@ class AsyncSandboxClient(_DirectSandboxOperations):
             DEFAULT_BUILD_SUBMISSION_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
         )
         async with _async_image_build_request(image, deadline=deadline) as (payload, archive):
-            digest = str(payload["context_archive_digest"])
-            size = int(payload["context_archive_size"])
-            context_path = f"/v1/image-contexts/{_quote_segment(digest)}"
-            try:
-                existing = await self._request_json(
-                    "GET",
-                    context_path,
-                    timeout_seconds=_remaining_seconds(deadline),
-                )
-            except SandboxApiError as exc:
-                if exc.status_code != 404:
-                    raise
-                existing = None
-            if not _build_context_reference_matches(
-                existing,
-                digest=digest,
-                size=size,
-            ):
-                await self._request_json(
-                    "PUT",
-                    context_path,
-                    body=archive,
-                    body_size=size,
-                    content_type="application/gzip",
-                    timeout_seconds=_remaining_seconds(deadline),
-                )
+            await self._upload_build_context(payload, archive, deadline)
             payload["wait"] = False
             submitted = await self._request_json(
                 "POST",
@@ -3022,6 +3099,92 @@ class AsyncSandboxClient(_DirectSandboxOperations):
             if state.accept(build, on_status):
                 return build
             await asyncio.sleep(state.delay(poll_interval_seconds))
+
+    async def _upload_build_context(self, payload: JsonObject, archive: BinaryIO, deadline: float | None) -> None:
+        """Upload a build context unless the gateway already holds it."""
+        digest = str(payload["context_archive_digest"])
+        size = int(payload["context_archive_size"])
+        context_path = f"/v1/image-contexts/{_quote_segment(digest)}"
+        try:
+            existing = await self._request_json("GET", context_path, timeout_seconds=_remaining_seconds(deadline))
+        except SandboxApiError as exc:
+            if exc.status_code != 404:
+                raise
+            existing = None
+        if not _build_context_reference_matches(existing, digest=digest, size=size):
+            await self._request_json("PUT", context_path, body=archive, body_size=size,
+                                     content_type="application/gzip", timeout_seconds=_remaining_seconds(deadline))
+
+    async def register_image_recipes(
+        self,
+        recipes: Iterable[ImageRecipe],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> JsonObject:
+        """See SandboxClient.register_image_recipes."""
+        recipes = _image_recipes(recipes)
+        deadline = _deadline(DEFAULT_BUILD_SUBMISSION_TIMEOUT_SECONDS if timeout_seconds is None
+                             else timeout_seconds)
+        rows = []
+        for recipe in recipes:
+            async with _async_image_build_request(recipe._image(), deadline=deadline) as (payload, archive):
+                await self._upload_build_context(payload, archive, deadline)
+                rows.append(recipe._registration(payload))
+        registered: list[JsonObject] = []
+        for start in range(0, len(rows), IMAGE_RECIPE_BATCH):
+            result = await self._request_json("POST", "/v1/image-recipes",
+                                              payload={"recipes": rows[start:start + IMAGE_RECIPE_BATCH]},
+                                              timeout_seconds=_remaining_seconds(deadline))
+            registered.extend(result.get("recipes") or [])
+        return _image_recipe_registration(registered)
+
+    async def ensure_images(
+        self,
+        names: Iterable[str],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, JsonObject]:
+        """See SandboxClient.ensure_images."""
+        names = _image_names(names)
+        deadline = _deadline(timeout_seconds)
+        statuses: dict[str, JsonObject] = {}
+        for start in range(0, len(names), IMAGE_RECIPE_BATCH):
+            result = await self._request_json("POST", "/v1/images/ensure",
+                                              payload={"names": names[start:start + IMAGE_RECIPE_BATCH]},
+                                              timeout_seconds=_remaining_seconds(deadline))
+            statuses.update(_image_statuses(result))
+        return statuses
+
+    async def wait_for_images(
+        self,
+        names: Iterable[str],
+        *,
+        timeout_seconds: float | None = None,
+        poll_interval_seconds: float = 10.0,
+        on_status: Callable[[dict[str, JsonObject]], object] | None = None,
+    ) -> dict[str, JsonObject]:
+        """See SandboxClient.wait_for_images."""
+        names = _image_names(names)
+        deadline = _deadline(timeout_seconds)
+        settled: dict[str, JsonObject] = {}
+        while True:
+            pending = [name for name in names if name not in settled]
+            try:
+                current = await self.ensure_images(pending, timeout_seconds=_remaining_seconds(deadline))
+            except SandboxApiError as exc:
+                if not _transient_image_poll_error(exc):
+                    raise
+                current = {}
+            settled.update({name: status for name, status in current.items()
+                            if status.get("state") in IMAGE_STATES_SETTLED})
+            if on_status is not None:
+                on_status({**current, **settled})
+            if len(settled) == len(names):
+                return {name: settled[name] for name in names}
+            remaining = _remaining_seconds(deadline)
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError(f"{len(names) - len(settled)} of {len(names)} images are not built yet")
+            await asyncio.sleep(poll_interval_seconds if remaining is None else min(poll_interval_seconds, remaining))
 
     async def build_image(
         self,
@@ -3463,6 +3626,41 @@ def _image_build_request(
             }
         )
         yield payload, archive
+
+
+def _image_recipes(recipes: Iterable[ImageRecipe]) -> list[ImageRecipe]:
+    recipes = list(recipes)
+    if not recipes or not all(isinstance(recipe, ImageRecipe) for recipe in recipes):
+        raise ValueError("register_image_recipes() needs one or more ImageRecipe values")
+    if len({recipe.name for recipe in recipes}) != len(recipes):
+        raise ValueError("image recipe names must be unique")
+    return recipes
+
+
+def _image_names(names: Iterable[str]) -> list[str]:
+    if isinstance(names, str):
+        raise TypeError("pass an iterable of image names, not one string")
+    names = list(dict.fromkeys(names))
+    if not names or not all(isinstance(name, str) and name for name in names):
+        raise ValueError("image names must be non-empty strings")
+    return names
+
+
+def _image_recipe_registration(registered: list[JsonObject]) -> JsonObject:
+    return {"registered": len(registered), "changed": sum(1 for row in registered if row.get("changed")),
+            "recipes": registered}
+
+
+def _image_statuses(result: object) -> dict[str, JsonObject]:
+    images = result.get("images") if isinstance(result, dict) else None
+    if not isinstance(images, dict):
+        raise SandboxApiError("gateway returned an invalid image ensure payload", body=result)
+    return images
+
+
+def _transient_image_poll_error(exc: SandboxApiError) -> bool:
+    return exc.status_code in {408, 429, 500, 502, 503, 504} or (
+        exc.status_code is None and isinstance(exc.__cause__, OSError))
 
 
 def _image_build_response(payload: JsonObject) -> JsonObject:
