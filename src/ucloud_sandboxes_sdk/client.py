@@ -353,8 +353,13 @@ class SandboxSpec:
     managed_process: bool = False
     profile: SandboxProfile = "container"
     linux_host: SandboxLinuxHostSpec = SandboxLinuxHostSpec()
+    # Read-only toolkits under /opt/ucloud/toolkits/<name>, stacked on the image
+    # by the gateway: "name:tag" or "name@sha256:<root>" (at most 4).
+    toolkits: Sequence[str] = ()
 
     def __post_init__(self) -> None:
+        if isinstance(self.toolkits, str):
+            raise TypeError("toolkits must be a sequence of toolkit references")
         if not isinstance(self.network_policy, SandboxNetworkPolicy):
             raise TypeError("network_policy must be a SandboxNetworkPolicy")
         if self.profile not in SANDBOX_PROFILES:
@@ -406,6 +411,10 @@ class SandboxSpec:
             payload.pop("parkable")
         if not self.managed_process:
             payload.pop("managed_process")
+        if self.toolkits:
+            payload["toolkits"] = [str(item) for item in self.toolkits]
+        else:
+            payload.pop("toolkits")  # Requests without toolkits are unchanged.
         return payload
 
     @classmethod
