@@ -232,6 +232,13 @@ process.terminate()
 returncode = await process.wait()
 ```
 
+### Toolkits
+
+`SandboxSpec(toolkits=["vf-harness:latest"])` asks the gateway to stack up to
+four read-only toolkits on the image, each under `/opt/ucloud/toolkits/<name>`.
+A toolkit is named `name:tag` (pinned to a root when the sandbox is created) or
+`name@sha256:<root>`. The sandbox's environment is otherwise unchanged.
+
 ### Sandbox groups
 
 SDK 0.4.35 adds group create to both clients. One request creates `count`
@@ -683,6 +690,29 @@ client.pull_image(
 )
 
 ```
+
+### Image recipes
+
+A trainer names task images it may never have built. Register each name with
+the Dockerfile build that makes it; the gateway builds missing images on demand
+or ahead of time:
+
+```python
+from ucloud_sandboxes_sdk import ImageRecipe
+
+client.register_image_recipes([
+    ImageRecipe("tmax:task_000001", "./tasks/000001", retention="pinned"),
+])
+client.ensure_images(["tmax:task_000001"])   # {name: {"state": "building", ...}}
+client.wait_for_images(["tmax:task_000001"]) # until ready, failed or unknown
+```
+
+`ensure_images` is cheap and idempotent: call it with the next step's names so
+their builds overlap the current step. A sandbox created with
+`Image.from_name(name)` before its build finishes waits for it (the SDK retries
+the gateway's `503 image_building`); a recipe that cannot build fails the
+create with `409 image_build_failed`. `pinned` keeps the built image;
+`cached` lets it age out and be rebuilt when asked for again.
 
 ## Async Client
 

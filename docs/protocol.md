@@ -185,6 +185,20 @@ builder/control-plane Docker daemon and should not be treated as portable.
 }
 ```
 
+### Image recipes
+
+```text
+POST /v1/image-recipes   {"recipes": [{name, context_archive_digest, context_archive_size,
+                                      dockerfile, build_args, retention}]}   # at most 1,000
+POST /v1/images/ensure   {"names": [...]}                                    # at most 1,000
+```
+
+Contexts are uploaded first (`PUT /v1/image-contexts/<digest>`). Ensure answers
+each name's `state`: `ready` with `reference`, `building` with `build_id`,
+`queued`, `failed` with `error` and `attempts`, or `unknown`; it submits missing
+builds. A create naming an unbuilt recipe answers `503 image_building` with
+`Retry-After`, or `409 image_build_failed`.
+
 ## Exec Events
 
 Exec is session based. `POST /v1/sandboxes/<id>/exec` starts a session and

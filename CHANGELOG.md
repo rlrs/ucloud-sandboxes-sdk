@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.4.37 - 2026-10-08
+
+- Add image recipes: names a trainer asks for, with the Dockerfile builds that
+  make them. `ImageRecipe(name, context_path, dockerfile="Dockerfile",
+  build_args={}, retention="cached")` and, on both clients:
+  - `register_image_recipes(recipes)` uploads each context once (as
+    `build_image` does) and registers the names in batches of 1,000
+    (`POST /v1/image-recipes`). Re-registering an unchanged recipe is a no-op.
+  - `ensure_images(names)` returns each name's state: `ready` (with
+    `reference`), `building`, `queued`, `failed` (with `error`) or `unknown`.
+    Missing images are submitted for building; calling again only polls
+    (`POST /v1/images/ensure`).
+  - `wait_for_images(names)` polls until every name is ready, failed or
+    unknown, through transient errors.
+  A sandbox created with `image=Image.from_name(name)` of a registered recipe
+  waits for its build (the gateway's retryable `503 image_building`) and fails
+  with `409 image_build_failed` when the recipe cannot build.
+- Add `SandboxSpec.toolkits`: up to 4 read-only toolkits (`"name:tag"` or
+  `"name@sha256:<root>"`) the gateway stacks on the image under
+  `/opt/ucloud/toolkits/<name>`. Sent only when set, so every existing request
+  is unchanged.
+
 ## 0.4.36 - 2026-10-05
 
 - Add `upload_files(sandbox_id, files, *, base_dir="/", mode=0o600)` to both
