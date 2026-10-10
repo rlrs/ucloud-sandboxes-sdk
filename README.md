@@ -721,6 +721,20 @@ the gateway's `503 image_building`); a recipe that cannot build fails the
 create with `409 image_build_failed`. `pinned` keeps the built image;
 `cached` lets it age out and be rebuilt when asked for again.
 
+### Image index
+
+The gateway's image index holds the training image names it serves, each with
+its environment, the dataset tasks that use it and its state. A trainer samples
+only the tasks whose names are in it:
+
+```python
+client.image_index_summary()                     # names and tasks per environment
+answer = client.image_index_task_ids("tmax")     # {"task_ids": [...], "excluded": {...}}
+json.dump(answer["task_ids"], open("tmax.task-ids.json", "w"))  # a task_ids_file
+for row in client.image_index_names(environment="tmax", state="failed"):
+    print(row["name"], client.image_index_name(row["name"])["error"])
+```
+
 ## Async Client
 
 ```python

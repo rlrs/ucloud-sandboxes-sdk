@@ -1976,6 +1976,49 @@ class SandboxClient(_DirectSandboxOperations):
         )
         return _successful_image_build(build)
 
+    def image_index_summary(self) -> JsonObject:
+        """The gateway's image index: the training image names it serves, counted
+        per environment and state (``{"environments": {...}, "totals": {...}}``)."""
+        return self._request_json("GET", "/v1/image-index")
+
+    def image_index_names(
+        self,
+        *,
+        environment: str | None = None,
+        state: str | None = None,
+        page_size: int = 500,
+    ) -> Iterator[JsonObject]:
+        """Each indexed name (``{name, environment, kind, state}``), optionally of
+        one environment or one state, fetched a page at a time."""
+        after = ""
+        while True:
+            page = self._request_json("GET", _image_index_path(
+                "/v1/image-index/names", environment=environment, state=state, after=after,
+                limit=_image_index_page_size(page_size)))
+            yield from page.get("names") or []
+            after = page.get("next")
+            if not after:
+                return
+
+    def image_index_name(self, name: str) -> JsonObject | None:
+        """One indexed name in full (environment, tasks, source, image, state), or
+        None when the name is not registered."""
+        try:
+            return self._request_json("GET", _image_index_path("/v1/image-index/name", name=name))
+        except SandboxApiError as exc:
+            if exc.status_code == 404:
+                return None
+            raise
+
+    def image_index_task_ids(self, environment: str) -> JsonObject:
+        """The tasks a trainer may sample in ``environment``: ``{"environment",
+        "task_ids", "excluded"}``, where ``task_ids`` is a taskset's
+        ``task_ids_file`` (tasks whose image name has not failed) and ``excluded``
+        counts the tasks left out, by state."""
+        return _image_index_task_ids(self._request_json(
+            "GET", _image_index_path("/v1/image-index/task-ids", environment=_non_empty_string(
+                "environment", environment))), environment)
+
     def _request_json(
         self,
         method: str,
@@ -3244,6 +3287,44 @@ class AsyncSandboxClient(_DirectSandboxOperations):
             )
         return self._owned_session
 
+    async def image_index_summary(self) -> JsonObject:
+        """See SandboxClient.image_index_summary."""
+        return await self._request_json("GET", "/v1/image-index")
+
+    async def image_index_names(
+        self,
+        *,
+        environment: str | None = None,
+        state: str | None = None,
+        page_size: int = 500,
+    ) -> AsyncIterator[JsonObject]:
+        """See SandboxClient.image_index_names."""
+        after = ""
+        while True:
+            page = await self._request_json("GET", _image_index_path(
+                "/v1/image-index/names", environment=environment, state=state, after=after,
+                limit=_image_index_page_size(page_size)))
+            for row in page.get("names") or []:
+                yield row
+            after = page.get("next")
+            if not after:
+                return
+
+    async def image_index_name(self, name: str) -> JsonObject | None:
+        """See SandboxClient.image_index_name."""
+        try:
+            return await self._request_json("GET", _image_index_path("/v1/image-index/name", name=name))
+        except SandboxApiError as exc:
+            if exc.status_code == 404:
+                return None
+            raise
+
+    async def image_index_task_ids(self, environment: str) -> JsonObject:
+        """See SandboxClient.image_index_task_ids."""
+        return _image_index_task_ids(await self._request_json(
+            "GET", _image_index_path("/v1/image-index/task-ids", environment=_non_empty_string(
+                "environment", environment))), environment)
+
     async def _request_json(
         self,
         method: str,
@@ -3644,6 +3725,26 @@ def _image_names(names: Iterable[str]) -> list[str]:
     if not names or not all(isinstance(name, str) and name for name in names):
         raise ValueError("image names must be non-empty strings")
     return names
+
+
+
+def _image_index_path(path: str, **query: object) -> str:
+    query = {key: value for key, value in query.items() if value not in (None, "")}
+    return path + ("?" + parse.urlencode(query) if query else "")
+
+
+def _image_index_page_size(page_size: int) -> int:
+    if isinstance(page_size, bool) or not isinstance(page_size, int) or not 1 <= page_size <= 5000:
+        raise ValueError("page_size must be an integer from 1 to 5000")
+    return page_size
+
+
+def _image_index_task_ids(payload: JsonObject, environment: str) -> JsonObject:
+    task_ids = payload.get("task_ids")
+    if not isinstance(task_ids, list) or not all(isinstance(task, str) for task in task_ids):
+        raise SandboxApiError("gateway returned an invalid task id list", body=payload)
+    return {"environment": payload.get("environment", environment), "task_ids": task_ids,
+            "excluded": dict(payload.get("excluded") or {})}
 
 
 def _image_recipe_registration(registered: list[JsonObject]) -> JsonObject:

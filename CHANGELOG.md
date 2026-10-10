@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.38 - 2026-10-10
+
+- Add the gateway's image index (the training image names it serves) to both
+  clients, readable with the SDK key:
+  - `image_index_summary()`: names and tasks per environment, by state
+    (`GET /v1/image-index`).
+  - `image_index_names(environment=None, state=None, page_size=500)`: each name
+    (`{name, environment, kind, state}`), paged through
+    `GET /v1/image-index/names` (an async iterator on the async client).
+  - `image_index_name(name)`: one name in full, or None when it is not
+    registered (`GET /v1/image-index/name`).
+  - `image_index_task_ids(environment)`: `{environment, task_ids, excluded}`,
+    where `task_ids` is the taskset `task_ids_file` a trainer samples from
+    (`GET /v1/image-index/task-ids`).
+
 ## 0.4.37 - 2026-10-08
 
 - Add image recipes: names a trainer asks for, with the Dockerfile builds that

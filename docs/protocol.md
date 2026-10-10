@@ -199,6 +199,15 @@ each name's `state`: `ready` with `reference`, `building` with `build_id`,
 builds. A create naming an unbuilt recipe answers `503 image_building` with
 `Retry-After`, or `409 image_build_failed`.
 
+### Image index
+
+```text
+GET /v1/image-index                                        # {environments, totals}
+GET /v1/image-index/names?environment=&state=&after=&limit=  # {names, next}; limit <= 5,000
+GET /v1/image-index/name?name=                             # one name; 404 image_name_unknown
+GET /v1/image-index/task-ids?environment=                  # {environment, task_ids, excluded}
+```
+
 ## Exec Events
 
 Exec is session based. `POST /v1/sandboxes/<id>/exec` starts a session and
