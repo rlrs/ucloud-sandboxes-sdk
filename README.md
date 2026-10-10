@@ -9,7 +9,7 @@ near-term capacity needs through a deployed UCloud sandbox gateway.
 
 > **Training with verifiers?** Install
 > [`verifiers-ucloud`](https://github.com/rlrs/verifiers-ucloud) at a tag instead
-> (`uv add "verifiers-ucloud @ git+https://github.com/rlrs/verifiers-ucloud@v0.3.1"`).
+> (`uv add "verifiers-ucloud @ git+https://github.com/rlrs/verifiers-ucloud@v0.3.2"`).
 > It pins a tested release of this SDK; do not install the SDK separately next
 > to it. Use the SDK directly only for code that drives sandboxes without
 > verifiers, and then always from a release wheel, never from a branch.
