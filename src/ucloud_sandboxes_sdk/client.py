@@ -8,7 +8,7 @@ from contextlib import ExitStack, asynccontextmanager, contextmanager
 from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 import hashlib
 import io
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import gzip
@@ -622,6 +622,11 @@ class SandboxJobRecord:
     # same computed locally when an older gateway does not send one. Pass it as
     # get_job(after=...) to wait for the record to change.
     cursor: str = ""
+    # Whether the server sent the cursor. Gateways that do (0.9.72 and later)
+    # hold reads that ask to wait; older ones answer at once.
+    cursor_from_server: bool = field(default=False, compare=False)
+    # Seconds from the answer's Retry-After (a parked sandbox), else None.
+    retry_after: float | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         if not self.cursor:
@@ -660,6 +665,7 @@ class SandboxJobRecord:
                 sequence=max(0, int(payload.get("sequence") or 0)),
                 updated_at=str(payload.get("updated_at") or ""),
                 cursor=_server_job_cursor(payload),
+                cursor_from_server=bool(_server_job_cursor(payload)),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise SandboxApiError(
@@ -696,6 +702,8 @@ class SandboxJobLogChunk:
     eof: bool
     # The job's record as of this read; None from gateways older than 0.9.72.
     job: SandboxJobRecord | None = None
+    # Seconds from the answer's Retry-After (a parked sandbox), else None.
+    retry_after: float | None = field(default=None, compare=False)
 
     @classmethod
     def from_payload(cls, payload: object) -> "SandboxJobLogChunk":
@@ -1448,23 +1456,23 @@ class JobHandle:
         while True:
             requested = _job_wait_request_seconds(deadline)
             started = time.monotonic()
-            read = self.client._read_job_status(
+            record = self.client.get_job(
                 self.sandbox_id, self.job_id, wait_seconds=requested, after=after
             )
             elapsed = time.monotonic() - started
-            self.record = read.record
-            if read.record.terminal:
-                return read.record
+            self.record = record
+            if record.terminal:
+                return record
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(f"sandbox job timed out: {self.job_id}")
-            delay = _job_wait_delay(
-                read,
-                after,
-                requested=requested,
-                elapsed=elapsed,
+            delay = job_read_delay(
+                record,
+                requested_seconds=requested,
+                elapsed_seconds=elapsed,
                 poll_seconds=poll_seconds,
-            )
-            after = read.record.cursor
+                after=after,
+            ) or 0.0
+            after = record.cursor
             if deadline is not None:
                 delay = min(delay, max(0.0, deadline - time.monotonic()))
             if delay > 0:
@@ -1510,7 +1518,7 @@ class JobHandle:
         while True:
             requested = DEFAULT_JOB_READ_WAIT_SECONDS
             started = time.monotonic()
-            read = self.client._read_job_log_chunk(
+            chunk = self.client.read_job_logs(
                 self.sandbox_id,
                 self.job_id,
                 stream=stream,
@@ -1519,24 +1527,18 @@ class JobHandle:
                 wait_seconds=requested,
             )
             elapsed = time.monotonic() - started
-            chunk = read.chunk
             offset = chunk.next_offset
             record = chunk.job
-            if record is None and len(chunk.data) < limit:
-                # An older gateway carries no record: read the status.
+            if _job_log_needs_status(chunk):
                 record = self.client.get_job(self.sandbox_id, self.job_id)
             if record is not None:
                 self.record = record
-            delay = _job_follow_delay(
+            delay = job_read_delay(
                 chunk,
-                record,
-                read.retry_after,
-                stream=stream,
-                offset=offset,
-                limit=limit,
-                requested=requested,
-                elapsed=elapsed,
+                requested_seconds=requested,
+                elapsed_seconds=elapsed,
                 poll_seconds=poll_seconds,
+                record=record,
             )
             if chunk.data:
                 yield chunk.data
@@ -1890,26 +1892,16 @@ class SandboxClient(_DirectSandboxOperations):
     ) -> SandboxJobRecord:
         """The job's record. With ``wait_seconds`` (at most 25 s), the server
         answers once the record's cursor differs from ``after``, the job is
-        terminal, or the wait passes. Gateways before 0.9.72 answer at once."""
-        return self._read_job_status(
-            sandbox_id, job_id, wait_seconds=wait_seconds, after=after
-        ).record
-
-    def _read_job_status(
-        self,
-        sandbox_id: str,
-        job_id: str,
-        *,
-        wait_seconds: float | None = None,
-        after: str | None = None,
-    ) -> "_JobStatusRead":
+        terminal, or the wait passes. Gateways before 0.9.72 answer at once.
+        ``record.retry_after`` is the answer's Retry-After (a parked sandbox);
+        ``job_read_delay`` paces a caller that waits in a loop."""
         wait_seconds = _job_read_wait_seconds(wait_seconds)
         response, headers = self._request_json_response(
             "GET",
             _job_status_path(sandbox_id, job_id, wait_seconds, after),
             timeout_seconds=_job_read_timeout(self, wait_seconds),
         )
-        return _job_status_read(response, headers, sandbox_id, job_id)
+        return _job_status_answer(response, headers, sandbox_id, job_id)
 
     def read_job_logs(
         self,
@@ -1925,33 +1917,15 @@ class SandboxClient(_DirectSandboxOperations):
         ``wait_seconds`` (at most 25 s), the server answers once the stream has
         bytes beyond ``offset``, the job is terminal, or the wait passes (with
         no data). ``chunk.job`` is the job's record as of the read, or None from
-        gateways before 0.9.72, which also answer at once."""
-        return self._read_job_log_chunk(
-            sandbox_id,
-            job_id,
-            stream=stream,
-            offset=offset,
-            limit=limit,
-            wait_seconds=wait_seconds,
-        ).chunk
-
-    def _read_job_log_chunk(
-        self,
-        sandbox_id: str,
-        job_id: str,
-        *,
-        stream: str,
-        offset: int,
-        limit: int,
-        wait_seconds: float | None = None,
-    ) -> "_JobLogRead":
+        gateways before 0.9.72, which also answer at once. ``chunk.retry_after``
+        is the answer's Retry-After; ``job_read_delay`` paces a follower."""
         wait_seconds = _job_read_wait_seconds(wait_seconds)
         response, headers = self._request_json_response(
             "GET",
             _job_logs_path(sandbox_id, job_id, stream, offset, limit, wait_seconds),
             timeout_seconds=_job_read_timeout(self, wait_seconds),
         )
-        return _job_log_read(response, headers, sandbox_id, job_id)
+        return _job_log_answer(response, headers, sandbox_id, job_id)
 
     def signal_job(
         self,
@@ -2731,23 +2705,23 @@ class AsyncJobHandle:
         while True:
             requested = _job_wait_request_seconds(deadline)
             started = time.monotonic()
-            read = await self.client._read_job_status(
+            record = await self.client.get_job(
                 self.sandbox_id, self.job_id, wait_seconds=requested, after=after
             )
             elapsed = time.monotonic() - started
-            self.record = read.record
-            if read.record.terminal:
-                return read.record
+            self.record = record
+            if record.terminal:
+                return record
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(f"sandbox job timed out: {self.job_id}")
-            delay = _job_wait_delay(
-                read,
-                after,
-                requested=requested,
-                elapsed=elapsed,
+            delay = job_read_delay(
+                record,
+                requested_seconds=requested,
+                elapsed_seconds=elapsed,
                 poll_seconds=poll_seconds,
-            )
-            after = read.record.cursor
+                after=after,
+            ) or 0.0
+            after = record.cursor
             if deadline is not None:
                 delay = min(delay, max(0.0, deadline - time.monotonic()))
             if delay > 0:
@@ -2793,7 +2767,7 @@ class AsyncJobHandle:
         while True:
             requested = DEFAULT_JOB_READ_WAIT_SECONDS
             started = time.monotonic()
-            read = await self.client._read_job_log_chunk(
+            chunk = await self.client.read_job_logs(
                 self.sandbox_id,
                 self.job_id,
                 stream=stream,
@@ -2802,24 +2776,18 @@ class AsyncJobHandle:
                 wait_seconds=requested,
             )
             elapsed = time.monotonic() - started
-            chunk = read.chunk
             offset = chunk.next_offset
             record = chunk.job
-            if record is None and len(chunk.data) < limit:
-                # An older gateway carries no record: read the status.
+            if _job_log_needs_status(chunk):
                 record = await self.client.get_job(self.sandbox_id, self.job_id)
             if record is not None:
                 self.record = record
-            delay = _job_follow_delay(
+            delay = job_read_delay(
                 chunk,
-                record,
-                read.retry_after,
-                stream=stream,
-                offset=offset,
-                limit=limit,
-                requested=requested,
-                elapsed=elapsed,
+                requested_seconds=requested,
+                elapsed_seconds=elapsed,
                 poll_seconds=poll_seconds,
+                record=record,
             )
             if chunk.data:
                 yield chunk.data
@@ -3279,28 +3247,16 @@ class AsyncSandboxClient(_DirectSandboxOperations):
     ) -> SandboxJobRecord:
         """The job's record. With ``wait_seconds`` (at most 25 s), the server
         answers once the record's cursor differs from ``after``, the job is
-        terminal, or the wait passes. Gateways before 0.9.72 answer at once."""
-        return (
-            await self._read_job_status(
-                sandbox_id, job_id, wait_seconds=wait_seconds, after=after
-            )
-        ).record
-
-    async def _read_job_status(
-        self,
-        sandbox_id: str,
-        job_id: str,
-        *,
-        wait_seconds: float | None = None,
-        after: str | None = None,
-    ) -> "_JobStatusRead":
+        terminal, or the wait passes. Gateways before 0.9.72 answer at once.
+        ``record.retry_after`` is the answer's Retry-After (a parked sandbox);
+        ``job_read_delay`` paces a caller that waits in a loop."""
         wait_seconds = _job_read_wait_seconds(wait_seconds)
         response, headers = await self._request_json_response(
             "GET",
             _job_status_path(sandbox_id, job_id, wait_seconds, after),
             timeout_seconds=_job_read_timeout(self, wait_seconds),
         )
-        return _job_status_read(response, headers, sandbox_id, job_id)
+        return _job_status_answer(response, headers, sandbox_id, job_id)
 
     async def read_job_logs(
         self,
@@ -3316,35 +3272,15 @@ class AsyncSandboxClient(_DirectSandboxOperations):
         ``wait_seconds`` (at most 25 s), the server answers once the stream has
         bytes beyond ``offset``, the job is terminal, or the wait passes (with
         no data). ``chunk.job`` is the job's record as of the read, or None from
-        gateways before 0.9.72, which also answer at once."""
-        return (
-            await self._read_job_log_chunk(
-                sandbox_id,
-                job_id,
-                stream=stream,
-                offset=offset,
-                limit=limit,
-                wait_seconds=wait_seconds,
-            )
-        ).chunk
-
-    async def _read_job_log_chunk(
-        self,
-        sandbox_id: str,
-        job_id: str,
-        *,
-        stream: str,
-        offset: int,
-        limit: int,
-        wait_seconds: float | None = None,
-    ) -> "_JobLogRead":
+        gateways before 0.9.72, which also answer at once. ``chunk.retry_after``
+        is the answer's Retry-After; ``job_read_delay`` paces a follower."""
         wait_seconds = _job_read_wait_seconds(wait_seconds)
         response, headers = await self._request_json_response(
             "GET",
             _job_logs_path(sandbox_id, job_id, stream, offset, limit, wait_seconds),
             timeout_seconds=_job_read_timeout(self, wait_seconds),
         )
-        return _job_log_read(response, headers, sandbox_id, job_id)
+        return _job_log_answer(response, headers, sandbox_id, job_id)
 
     async def signal_job(
         self,
@@ -4003,47 +3939,35 @@ def _job_logs_path(
     )
 
 
-@dataclass(frozen=True)
-class _JobStatusRead:
-    record: SandboxJobRecord
-    retry_after: float | None
-    # The server sent the record's cursor, so it is new enough to hold reads.
-    server_cursor: bool
-
-
-@dataclass(frozen=True)
-class _JobLogRead:
-    chunk: SandboxJobLogChunk
-    retry_after: float | None
-
-
-def _job_status_read(
+def _job_status_answer(
     response: JsonObject,
     headers: Mapping[str, str],
     sandbox_id: str,
     job_id: str,
-) -> _JobStatusRead:
-    record = _checked_job(response, sandbox_id, job_id)
-    job = response.get("job")
-    return _JobStatusRead(
-        record=record,
+) -> SandboxJobRecord:
+    return replace(
+        _checked_job(response, sandbox_id, job_id),
         retry_after=_retry_after_seconds(headers),
-        server_cursor=isinstance(job, dict) and bool(_server_job_cursor(job)),
     )
 
 
-def _job_log_read(
+def _job_log_answer(
     response: JsonObject,
     headers: Mapping[str, str],
     sandbox_id: str,
     job_id: str,
-) -> _JobLogRead:
+) -> SandboxJobLogChunk:
     chunk = SandboxJobLogChunk.from_payload(response)
     if chunk.job is not None and (
         chunk.job.sandbox_id != sandbox_id or chunk.job.job_id != job_id
     ):
         raise SandboxApiError("gateway returned another sandbox job", body=response)
-    return _JobLogRead(chunk=chunk, retry_after=_retry_after_seconds(headers))
+    retry_after = _retry_after_seconds(headers)
+    return replace(
+        chunk,
+        retry_after=retry_after,
+        job=None if chunk.job is None else replace(chunk.job, retry_after=retry_after),
+    )
 
 
 def _job_wait_request_seconds(deadline: float | None) -> float:
@@ -4053,68 +3977,76 @@ def _job_wait_request_seconds(deadline: float | None) -> float:
     return min(DEFAULT_JOB_READ_WAIT_SECONDS, remaining)
 
 
-def _answered_early(elapsed: float, requested: float) -> bool:
-    """Answered much sooner than asked: a server that does not hold reads."""
-    return elapsed < requested / 2
+def _job_log_needs_status(chunk: SandboxJobLogChunk) -> bool:
+    """An older gateway's log chunk carries no record: once a read reaches the
+    end of the log, a follower reads the status to learn whether the job
+    ended."""
+    return chunk.job is None and (not chunk.data or chunk.eof)
 
 
-def _job_wait_delay(
-    read: _JobStatusRead,
-    after: str,
+def job_read_delay(
+    read: SandboxJobLogChunk | SandboxJobRecord,
     *,
-    requested: float,
-    elapsed: float,
-    poll_seconds: float,
-) -> float:
-    """The pause before wait()'s next status read.
+    requested_seconds: float,
+    elapsed_seconds: float,
+    poll_seconds: float = 1.0,
+    after: str | None = None,
+    record: SandboxJobRecord | None = None,
+) -> float | None:
+    """How long to pause before the next job read, or None when there is none.
 
-    A Retry-After (a parked sandbox) is followed. An answer that came back much
-    sooner than asked without a change, or from a gateway that sends no cursor
-    and so does not hold reads, means polling: pause ``poll_seconds``. Otherwise
-    the server held the read until something changed, so read again at once.
+    ``read`` is the answer to a status read (``get_job``) or a log read
+    (``read_job_logs``) that asked to wait ``requested_seconds`` and took
+    ``elapsed_seconds``. For a status read, ``after`` is the cursor it sent. For
+    a log read from an older gateway (``chunk.job`` is None), ``record`` is the
+    job's record from a status read made after it, if any.
+
+    - None: the job is terminal and, for a log read, its stream is read to the
+      end (``chunk.next_offset`` reached the record's byte count).
+    - Raises ``JobOutputTruncatedError`` when a log read's record shows that
+      either stream dropped output.
+    - ``Retry-After`` (``read.retry_after``; a parked sandbox): that long.
+    - An answer that came back in less than half the requested wait without
+      progress pauses ``poll_seconds`` (at least 0.05 s): such a server does
+      not hold reads. For a status read, no progress means the cursor equals
+      ``after``, or the server sent no cursor (``cursor_from_server`` is false:
+      a gateway before 0.9.72, whose answers come at once even while output
+      grows). For a log read, it means no data or, from an older gateway, data
+      that ended at the end of the log (``eof``) of a job still running.
+    - Otherwise 0: the server held the read until something changed.
     """
+    early = elapsed_seconds < requested_seconds / 2
+    poll = max(0.05, poll_seconds)
+    if isinstance(read, SandboxJobRecord):
+        if record is not None:
+            raise TypeError("record is only for log reads")
+        if read.terminal:
+            return None
+        if read.retry_after is not None:
+            return read.retry_after
+        unchanged = read.cursor == after or not read.cursor_from_server
+        return poll if early and unchanged else 0.0
+    if not isinstance(read, SandboxJobLogChunk):
+        raise TypeError("read must be a SandboxJobRecord or SandboxJobLogChunk")
+    if after is not None:
+        raise TypeError("after is only for status reads")
+    current = read.job if read.job is not None else record
+    if current is not None:
+        if current.stdout_truncated or current.stderr_truncated:
+            raise JobOutputTruncatedError(current)
+        if current.terminal and read.next_offset >= _job_stream_bytes(
+            current, read.stream
+        ):
+            return None
     if read.retry_after is not None:
         return read.retry_after
-    if _answered_early(elapsed, requested) and (
-        read.record.cursor == after or not read.server_cursor
-    ):
-        return max(0.05, poll_seconds)
-    return 0.0
-
-
-def _job_follow_delay(
-    chunk: SandboxJobLogChunk,
-    record: SandboxJobRecord | None,
-    retry_after: float | None,
-    *,
-    stream: str,
-    offset: int,
-    limit: int,
-    requested: float,
-    elapsed: float,
-    poll_seconds: float,
-) -> float | None:
-    """After a log read at ``offset`` (the next offset to read), None when the
-    follow is complete, else the pause before the next read. ``record`` is the
-    record carried by the chunk or, from an older gateway, a status read."""
-    if record is not None:
-        if record.stdout_truncated or record.stderr_truncated:
-            raise JobOutputTruncatedError(record)
-        if record.terminal and offset >= _job_stream_bytes(record, stream):
-            return None
-    if retry_after is not None:
-        return retry_after
-    if chunk.job is not None:
-        progressed = bool(chunk.data)
+    if read.job is not None:
+        progressed = bool(read.data)
     else:
-        # An older gateway answers at once: keep reading only a full page, or
-        # the rest of a job that has ended.
-        progressed = len(chunk.data) >= limit or (
-            bool(chunk.data) and record is not None and record.terminal
+        progressed = bool(read.data) and (
+            not read.eof or (current is not None and current.terminal)
         )
-    if not progressed and _answered_early(elapsed, requested):
-        return max(0.05, poll_seconds)
-    return 0.0
+    return poll if early and not progressed else 0.0
 
 
 def _build_context_limiter() -> asyncio.Semaphore:

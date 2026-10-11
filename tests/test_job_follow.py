@@ -8,6 +8,7 @@ import asyncio
 import base64
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+from dataclasses import replace
 from threading import Condition, Thread, Timer
 import time
 from typing import Any
@@ -25,6 +26,7 @@ from ucloud_sandboxes_sdk import (
     SandboxClient,
     SandboxJobLogChunk,
     SandboxJobRecord,
+    job_read_delay,
 )
 
 SANDBOX = "agent-1"
@@ -315,6 +317,142 @@ class JobRecordWireTests(unittest.TestCase):
             client = SandboxClient(gateway.base_url)
             with self.assertRaisesRegex(SandboxApiError, "another sandbox job"):
                 client.read_job_logs(SANDBOX.upper(), JOB)
+
+
+class JobRetryAfterTests(unittest.TestCase):
+    def test_public_reads_carry_retry_after(self) -> None:
+        with _JobGateway() as gateway:
+            gateway.write("stdout", b"abc")
+            client = SandboxClient(gateway.base_url)
+            fresh = client.get_job(SANDBOX, JOB)
+            chunk = client.read_job_logs(SANDBOX, JOB)
+            self.assertIsNone(fresh.retry_after)
+            self.assertIsNone(chunk.retry_after)
+            self.assertIsNone(chunk.job.retry_after)
+            gateway.retry_after = "1"
+            parked = client.get_job(SANDBOX, JOB, wait_seconds=5)
+            parked_chunk = client.read_job_logs(SANDBOX, JOB, offset=3, wait_seconds=5)
+        self.assertEqual(parked.retry_after, 1.0)
+        self.assertEqual(parked_chunk.retry_after, 1.0)
+        self.assertEqual(parked_chunk.job.retry_after, 1.0)
+        # Transport metadata is not part of the record's value.
+        self.assertEqual(parked, fresh)
+        self.assertEqual(parked.cursor, fresh.cursor)
+        self.assertTrue(parked.cursor_from_server)
+
+    def test_async_public_reads_carry_retry_after(self) -> None:
+        async def scenario(gateway: _JobGateway) -> tuple[Any, Any]:
+            async with AsyncSandboxClient(gateway.base_url) as client:
+                return (
+                    await client.get_job(SANDBOX, JOB, wait_seconds=5),
+                    await client.read_job_logs(SANDBOX, JOB, wait_seconds=5),
+                )
+
+        with _JobGateway() as gateway:
+            gateway.retry_after = "2"
+            record, chunk = asyncio.run(scenario(gateway))
+        self.assertEqual(record.retry_after, 2.0)
+        self.assertEqual(chunk.retry_after, 2.0)
+
+        with _JobGateway(holds=False) as old:
+            old.write("stdout", b"x")
+            record, chunk = asyncio.run(scenario(old))
+        self.assertIsNone(record.retry_after)
+        self.assertFalse(record.cursor_from_server)
+        self.assertIsNone(chunk.retry_after)
+        self.assertIsNone(chunk.job)
+
+
+def _record(**changes: Any) -> SandboxJobRecord:
+    payload = _JobGateway.record(_bare_gateway(holds=True))
+    payload.update(changes)
+    return SandboxJobRecord.from_payload(payload)
+
+
+def _chunk(
+    data: bytes = b"",
+    *,
+    offset: int = 0,
+    job: SandboxJobRecord | None = None,
+    eof: bool = True,
+    retry_after: float | None = None,
+    stream: str = "stdout",
+) -> SandboxJobLogChunk:
+    return SandboxJobLogChunk(
+        stream=stream,
+        offset=offset,
+        next_offset=offset + len(data),
+        data=data,
+        eof=eof,
+        job=job,
+        retry_after=retry_after,
+    )
+
+
+class JobReadDelayTests(unittest.TestCase):
+    def delay(self, read: Any, **kwargs: Any) -> float | None:
+        timing = {"requested_seconds": 20.0, "elapsed_seconds": 0.1, "poll_seconds": 3.0}
+        timing.update(kwargs)
+        return job_read_delay(read, **timing)
+
+    def test_status_reads(self) -> None:
+        running = _record()
+        self.assertTrue(running.cursor_from_server)
+        self.assertIsNone(self.delay(_record(state="exited", exit_code=0)))
+        parked = replace(running, retry_after=1.0)
+        self.assertEqual(self.delay(parked, after=running.cursor), 1.0)
+        # Early and unchanged: the server did not hold the read.
+        self.assertEqual(self.delay(running, after=running.cursor), 3.0)
+        # Early and changed: held until the change.
+        self.assertEqual(self.delay(running, after="0.0.0"), 0.0)
+        # Unchanged after the full wait: loop at once.
+        self.assertEqual(
+            self.delay(running, after=running.cursor, elapsed_seconds=20.0), 0.0
+        )
+        # No server cursor (an older gateway): even changed answers are paced.
+        old = replace(running, cursor_from_server=False)
+        self.assertEqual(self.delay(old, after="0.0.0"), 3.0)
+        self.assertEqual(
+            self.delay(running, after=running.cursor, poll_seconds=0), 0.05
+        )
+
+    def test_log_reads_with_a_carried_record(self) -> None:
+        running = _record(stdout_bytes=4)
+        self.assertEqual(self.delay(_chunk(b"abcd", job=running)), 0.0)
+        self.assertEqual(self.delay(_chunk(job=running)), 3.0)
+        self.assertEqual(self.delay(_chunk(job=running), elapsed_seconds=20.0), 0.0)
+        self.assertEqual(self.delay(_chunk(job=running, retry_after=1.0)), 1.0)
+        ended = _record(state="exited", exit_code=0, stdout_bytes=6, stderr_bytes=1)
+        self.assertEqual(self.delay(_chunk(b"abcd", job=ended)), 0.0)
+        self.assertIsNone(self.delay(_chunk(b"ef", offset=4, job=ended)))
+        self.assertIsNone(
+            self.delay(_chunk(b"e", job=ended, stream="stderr"))
+        )
+        # A terminal job whose bytes are not served is paced, never spun.
+        self.assertEqual(self.delay(_chunk(offset=4, job=ended)), 3.0)
+        with self.assertRaises(JobOutputTruncatedError):
+            self.delay(_chunk(b"abcd", job=_record(stderr_truncated=True)))
+
+    def test_log_reads_from_older_gateways(self) -> None:
+        running = replace(_record(stdout_bytes=8), cursor_from_server=False)
+        # More retained output: read on at once, no status needed.
+        self.assertEqual(self.delay(_chunk(b"abcd", eof=False)), 0.0)
+        # Read to the end of the log of a running job: poll.
+        self.assertEqual(self.delay(_chunk(b"abcd"), record=running), 3.0)
+        self.assertEqual(self.delay(_chunk(), record=running), 3.0)
+        ended = replace(running, state="exited", exit_code=0)
+        self.assertEqual(self.delay(_chunk(b"abcd"), record=ended), 0.0)
+        self.assertIsNone(self.delay(_chunk(b"abcd", offset=4), record=ended))
+        with self.assertRaises(JobOutputTruncatedError):
+            self.delay(_chunk(), record=replace(running, stdout_truncated=True))
+
+    def test_misuse_is_refused(self) -> None:
+        with self.assertRaises(TypeError):
+            self.delay(_record(), record=_record())
+        with self.assertRaises(TypeError):
+            self.delay(_chunk(), after="1.0.0")
+        with self.assertRaises(TypeError):
+            self.delay({"job": {}})
 
 
 def _bare_gateway(*, holds: bool) -> _JobGateway:

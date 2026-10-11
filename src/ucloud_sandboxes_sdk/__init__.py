@@ -30,6 +30,7 @@ from .client import (
     SandboxSpec,
     SandboxSshSpec,
     SandboxSshTarget,
+    job_read_delay,
     sandbox_auth_headers,
 )
 from .relay import (
@@ -79,6 +80,7 @@ __all__ = [
     "SandboxSpec",
     "SandboxSshSpec",
     "SandboxSshTarget",
+    "job_read_delay",
     "sandbox_auth_headers",
     "RelayApiError",
     "RelayPollResult",

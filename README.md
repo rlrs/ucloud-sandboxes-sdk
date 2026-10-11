@@ -230,7 +230,34 @@ the job's bounded log dropped output; resume after an error with
 `follow(stream, offset=<bytes already read>)`. For single reads,
 `get_job(sandbox_id, job_id, wait_seconds=..., after=record.cursor)` and
 `read_job_logs(..., wait_seconds=...)` wait the same way, and a log chunk
-carries the job's record as `chunk.job` (None from older gateways).
+carries the job's record as `chunk.job` (None from older gateways). Both
+answers expose `retry_after`.
+
+A custom follower, for example one that follows stdout and reads stderr
+whenever the carried record's `stderr_bytes` passes its offset, paces itself
+with `job_read_delay`, the rule `wait()` and `follow()` use:
+
+```python
+import time
+
+from ucloud_sandboxes_sdk import job_read_delay
+
+offset = 0
+while True:
+    started = time.monotonic()
+    chunk = client.read_job_logs(sandbox_id, job_id, offset=offset, wait_seconds=20)
+    elapsed = time.monotonic() - started
+    handle(chunk.data)
+    offset = chunk.next_offset
+    record = chunk.job
+    if record is None and (not chunk.data or chunk.eof):
+        record = client.get_job(sandbox_id, job_id)  # an older gateway
+    delay = job_read_delay(chunk, requested_seconds=20, elapsed_seconds=elapsed,
+                           poll_seconds=1.0, record=record)
+    if delay is None:
+        break  # terminal and fully read
+    time.sleep(delay)
+```
 
 Bind the rollout with `register_agent_rollout(rollout_id, agent_sandbox)`.
 Generic `register_rollout()` deliberately rejects sandbox identity metadata;

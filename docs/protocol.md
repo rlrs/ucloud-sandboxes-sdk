@@ -264,14 +264,24 @@ to 0..25000:
   `Retry-After: 1`.
 
 The SDK gives a waiting read a request timeout of the client's timeout plus
-the wait. `JobHandle.wait()` long-polls the status with `after=<cursor>`, and
-`JobHandle.follow()` long-polls the logs. Both follow `Retry-After`; an answer
-that comes back much sooner than asked without a change (an older gateway,
-which ignores `wait_ms`) is followed by a `poll_seconds` pause. `follow()`
-reads the status after a partial page from an older gateway, whose log reads
-carry no record. It ends once the record is terminal and its offset equals the
-stream's byte count, and raises `JobOutputTruncatedError` when the record shows
-either stream truncated.
+the wait, and exposes `Retry-After` as `retry_after` on the record
+(`get_job`) and the chunk (`read_job_logs`). `JobHandle.wait()` long-polls the
+status with `after=<cursor>`, and `JobHandle.follow()` long-polls the logs.
+Both pace with the public `job_read_delay()`:
+
+- None: the job is terminal and, for a log read, the stream is read to the
+  record's byte count;
+- `Retry-After`, when the answer has one;
+- `poll_seconds` when the answer came back in less than half the requested
+  wait without progress: a status read whose cursor equals `after` or that
+  carries no server cursor (`cursor_from_server` false, an older gateway); a
+  log read with no data or, from an older gateway, data up to the end of the
+  log (`eof`) of a running job;
+- otherwise 0.
+
+It raises `JobOutputTruncatedError` for a log read whose record shows either
+stream truncated. An older gateway's log reads carry no record, so `follow()`
+reads the status once a read reaches the end of the log.
 
 ## File Transfer
 

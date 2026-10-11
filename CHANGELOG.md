@@ -11,11 +11,19 @@
     beyond `offset` or the job ends (`&wait_ms=`). `SandboxJobLogChunk.job` is
     the job's record as of the read (None from older gateways).
   - `SandboxJobRecord.cursor`: `"<sequence>.<stdout_bytes>.<stderr_bytes>"`,
-    the server's value or computed locally.
+    the server's value or computed locally; `cursor_from_server` says which.
+  - `SandboxJobRecord.retry_after` and `SandboxJobLogChunk.retry_after`: the
+    answer's `Retry-After` in seconds (a parked sandbox), else None. Neither
+    these nor `cursor_from_server` take part in equality.
+  - New `job_read_delay(read, *, requested_seconds, elapsed_seconds,
+    poll_seconds=1.0, after=None, record=None) -> float | None` paces a custom
+    follower (for example one driving stdout and stderr together): None when
+    the job is terminal and the stream read, `Retry-After` when set,
+    `poll_seconds` after an early answer without progress (or a status answer
+    without a server cursor), else 0. Raises `JobOutputTruncatedError` for a
+    log read whose record shows truncation. `wait()` and `follow()` use it.
   - `JobHandle.wait()` / `AsyncJobHandle.wait()` long-poll the status with
-    `after=<cursor>`, follow `Retry-After` (a parked sandbox), and pause
-    `poll_seconds` after an early answer without a change or from a gateway
-    that sends no cursor.
+    `after=<cursor>`, paced by `job_read_delay`.
   - New `JobHandle.follow(stream="stdout", offset=0, *, limit=1 MiB,
     poll_seconds=1.0)` (a generator; an async iterator on `AsyncJobHandle`)
     yields output through log long-polls. It ends when the carried record is
