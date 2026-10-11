@@ -21,6 +21,10 @@ with `src/ucloud_sandboxes_sdk/client.py` when endpoints are added.
 - `GET /v1/exec/<session-id>/events?after=<n>&limit=<n>&wait_seconds=<s>`
 - `POST /v1/exec/<session-id>/stdin`
 - `POST /v1/exec/<session-id>/close-stdin`
+- `POST /v1/sandboxes/<sandbox-id>/jobs`
+- `GET /v1/sandboxes/<sandbox-id>/jobs/<job-id>?wait_ms=<ms>&after=<cursor>`
+- `GET /v1/sandboxes/<sandbox-id>/jobs/<job-id>/logs/<stdout|stderr>?offset=<n>&limit=<n>&wait_ms=<ms>`
+- `POST /v1/sandboxes/<sandbox-id>/jobs/<job-id>/signal`
 - `GET /v1/images`
 - `POST /v1/images/build`
 - `GET /v1/image-contexts/<sha256-digest>`
@@ -235,6 +239,39 @@ Interactive exec sessions additionally support stdin and signals:
 - `POST /v1/exec/<session>/signal` with `{"signal": 15}`
 
 The signal endpoint is idempotent after the exec session becomes terminal.
+
+## Managed Jobs
+
+A managed-process sandbox runs one primary job (`start_agent()`), whose
+record and bounded stdout/stderr logs survive park, wake and migration.
+
+The job record carries `cursor`, `"<sequence>.<stdout_bytes>.<stderr_bytes>"`
+(gateway 0.9.72). `SandboxJobRecord.cursor` is that value, or the same computed
+locally from an older gateway's record.
+
+Both reads can wait for a change (gateway 0.9.72). The server clamps `wait_ms`
+to 0..25000:
+
+- `GET .../jobs/<job>?wait_ms=W&after=C` answers when the record's cursor
+  differs from `C`, the job is terminal, or `W` passes (then with the current,
+  unchanged record).
+- `GET .../jobs/<job>/logs/<stream>?offset=O&limit=L&wait_ms=W` answers when
+  the stream has bytes beyond `O`, the job is terminal, or `W` passes (then
+  with no data). The response carries the job's record as `job`
+  (`SandboxJobLogChunk.job`; None from older gateways). `limit` is capped at
+  1 MiB; an `O` beyond the retained log is a 400.
+- A parked sandbox's reads are answered at once from the gateway's cache, with
+  `Retry-After: 1`.
+
+The SDK gives a waiting read a request timeout of the client's timeout plus
+the wait. `JobHandle.wait()` long-polls the status with `after=<cursor>`, and
+`JobHandle.follow()` long-polls the logs. Both follow `Retry-After`; an answer
+that comes back much sooner than asked without a change (an older gateway,
+which ignores `wait_ms`) is followed by a `poll_seconds` pause. `follow()`
+reads the status after a partial page from an older gateway, whose log reads
+carry no record. It ends once the record is terminal and its offset equals the
+stream's byte count, and raises `JobOutputTruncatedError` when the record shows
+either stream truncated.
 
 ## File Transfer
 

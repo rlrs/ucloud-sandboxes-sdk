@@ -12,6 +12,7 @@ from .client import (
     Image,
     ImageRecipe,
     JobHandle,
+    JobOutputTruncatedError,
     SandboxApiError,
     SandboxClient,
     SandboxExecResult,
@@ -44,7 +45,7 @@ from .relay import (
     model_relay_env,
 )
 
-__version__ = "0.4.38"
+__version__ = "0.4.39"
 
 __all__ = [
     "AsyncExecHandle",
@@ -59,6 +60,7 @@ __all__ = [
     "Image",
     "ImageRecipe",
     "JobHandle",
+    "JobOutputTruncatedError",
     "SandboxApiError",
     "SandboxClient",
     "SandboxExecResult",

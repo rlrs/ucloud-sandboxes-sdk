@@ -206,6 +206,32 @@ is why a primary agent must use `start_agent()` rather than an attached exec.
 Use the returned job handle to wait, inspect status, or read the bounded stdout
 and stderr ledger after a wake or migration.
 
+`follow()` yields a stream's output as the agent writes it, and ends once the
+job has ended and its output is read:
+
+```python
+for data in agent.follow("stdout"):
+    print(data.decode(errors="replace"), end="")
+record = agent.wait()
+```
+
+```python
+# A job from AsyncSandboxHandle.start_agent():
+async for data in agent.follow("stderr", offset=0):
+    ...
+```
+
+Both `wait()` and `follow()` hold one request at the gateway until something
+changes (up to 20 s per request) instead of polling. A parked sandbox is not
+woken: its reads answer at once with `Retry-After`, which the SDK follows.
+Gateways before 0.9.72 answer at once, and the SDK then polls every
+`poll_seconds` (default 1 s). `follow()` raises `JobOutputTruncatedError` if
+the job's bounded log dropped output; resume after an error with
+`follow(stream, offset=<bytes already read>)`. For single reads,
+`get_job(sandbox_id, job_id, wait_seconds=..., after=record.cursor)` and
+`read_job_logs(..., wait_seconds=...)` wait the same way, and a log chunk
+carries the job's record as `chunk.job` (None from older gateways).
+
 Bind the rollout with `register_agent_rollout(rollout_id, agent_sandbox)`.
 Generic `register_rollout()` deliberately rejects sandbox identity metadata;
 the managed helper is the one supported path for lifecycle-aware parking.

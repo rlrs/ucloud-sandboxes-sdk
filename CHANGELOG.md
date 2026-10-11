@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.4.39 - 2026-10-11
+
+- Follow managed jobs with held reads instead of polling (gateway 0.9.72
+  serves job reads from the node without entering the guest):
+  - `get_job(sandbox_id, job_id, *, wait_seconds=None, after=None)` waits (at
+    most 25 s) until the record's cursor differs from `after` or the job ends
+    (`?wait_ms=&after=`).
+  - `read_job_logs(..., wait_seconds=None)` waits until the stream has bytes
+    beyond `offset` or the job ends (`&wait_ms=`). `SandboxJobLogChunk.job` is
+    the job's record as of the read (None from older gateways).
+  - `SandboxJobRecord.cursor`: `"<sequence>.<stdout_bytes>.<stderr_bytes>"`,
+    the server's value or computed locally.
+  - `JobHandle.wait()` / `AsyncJobHandle.wait()` long-poll the status with
+    `after=<cursor>`, follow `Retry-After` (a parked sandbox), and pause
+    `poll_seconds` after an early answer without a change or from a gateway
+    that sends no cursor.
+  - New `JobHandle.follow(stream="stdout", offset=0, *, limit=1 MiB,
+    poll_seconds=1.0)` (a generator; an async iterator on `AsyncJobHandle`)
+    yields output through log long-polls. It ends when the carried record is
+    terminal and the offset equals the stream's byte count, and raises the new
+    `JobOutputTruncatedError` (a `SandboxApiError`) when either stream was
+    truncated.
+  - A waiting read's request timeout is the client timeout plus the wait.
+  Older gateways ignore `wait_ms` and are polled every `poll_seconds`, as
+  before.
+
 ## 0.4.38 - 2026-10-10
 
 - Add the gateway's image index (the training image names it serves) to both
